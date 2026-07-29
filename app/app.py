@@ -3,38 +3,26 @@ import duckdb
 import plotly.express as px
 import os
 
-# Set a wide layout for our dashboards side-by-side
 st.set_page_config(layout="wide", page_title="Spatial Transcriptomics Atlas")
-
 st.title("🧬 Spatial Transcriptomics Tissue Explorer")
 st.markdown("---")
 
 db_path = "spatial_atlas.db"
 
-# Check if the database file exists yet
 if not os.path.exists(db_path):
-    st.error(f"⚠️ Database file `{db_path}` not found! Please run your Nextflow pipeline or R script first to generate it.")
+    st.error(f"⚠️ Database file `{db_path}` not found!")
 else:
-    # 1. Connect to the shared built-in DuckDB file (Read-Only)
     con = duckdb.connect(database=db_path, read_only=True)
-
-    # 2. Sidebar configuration and data fetching
     st.sidebar.header("📊 Visualization Settings")
     
-    # Get a list of unique genes stored in the database for the dropdown
     genes_df = con.execute("SELECT DISTINCT gene FROM gene_expression ORDER BY gene").df()
     gene_list = genes_df['gene'].tolist()
-    
     selected_gene = st.sidebar.selectbox("Select a marker gene to visualize:", gene_list)
 
-    # 3. Execute two independent, optimized SQL queries
-    # Query A: Get all spatial spots and their clusters (unfiltered by gene)
-    cluster_df = con.execute("""
-        SELECT spot_id, imagecol, imagerow, seurat_clusters 
-        FROM spatial_metadata
-    """).df()
+    # Cluster configuration query
+    cluster_df = con.execute("SELECT spot_id, imagecol, imagerow, seurat_clusters FROM spatial_metadata").df()
 
-    # Query B: Get expression coordinates ONLY for the chosen gene
+    # Expression layout query
     expr_query = f"""
         SELECT m.spot_id, m.imagecol, m.imagerow, e.expression
         FROM spatial_metadata m
@@ -44,31 +32,21 @@ else:
     expr_df = con.execute(expr_query).df()
     con.close()
 
-    # 4. Display layouts using columns
-    col1, col2 = st.columns(2)
+    # 📊 NEW SUMMARY METRICS ROWS START HERE 📊
+    total_spots = len(cluster_df)
+    total_clusters = cluster_df['seurat_clusters'].nunique()
+    avg_expression = round(expr_df['expression'].mean(), 2)
+    max_expression = round(expr_df['expression'].max(), 2)
 
-    with col1:
-        st.subheader("📍 Tissue Clusters")
-        st.caption("Complete structural anatomical zones calculated by your pipeline.")
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    with m_col1:
+        st.metric(label="Total Tissue Spots Indexed", value=f"{total_spots:,}")
+    with m_col2:
+        st.metric(label="Identified Tissue Clusters", value=total_clusters)
+    with m_col3:
+        st.metric(label=f"Average {selected_gene} Intensity", value=avg_expression)
+    with m_col4:
+        st.metric(label=f"Peak {selected_gene} Value", value=max_expression)
         
-        fig_clusters = px.scatter(
-            cluster_df, x="imagecol", y="imagerow", color="seurat_clusters",
-            labels={"imagecol": "X Pixel", "imagerow": "Y Pixel", "seurat_clusters": "Cluster"},
-            hover_data=["spot_id"],
-            color_discrete_sequence=px.colors.qualitative.Safe
-        )
-        fig_clusters.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_clusters, use_container_width=True)
-
-    with col2:
-        st.subheader(f"✨ Expression: {selected_gene}")
-        st.caption(f"Continuous expression heatmap layout across the tissue slide for {selected_gene}.")
-        
-        fig_expr = px.scatter(
-            expr_df, x="imagecol", y="imagerow", color="expression",
-            labels={"imagecol": "X Pixel", "imagerow": "Y Pixel", "expression": "Level"},
-            hover_data=["spot_id"],
-            color_continuous_scale="Viridis"
-        )
-        fig_expr.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_expr, use_container_width=True)
+    st.markdown("---")
+    # 📊 NEW SUMMARY METRICS ROWS END HERE 📊
