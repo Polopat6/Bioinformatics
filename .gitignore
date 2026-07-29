@@ -1,0 +1,14 @@
+.nextflow/
+.nextflow.*
+work/
+*.db
+*.db.wal
+data/raw/
+venv/
+env/
+__pycache__/
+*.pyc
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user
