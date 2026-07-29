@@ -14,13 +14,24 @@ This project intentionally leverages the unique strengths of both the **R** and 
 
 ## ⚙️ How to Run the Project Locally
 
-### 1. Execute the Pipeline
-Run the Nextflow script to trigger the R data processor and generate the relational database file (`spatial_atlas.db`):
+## ⚙️ How to Run the Project Locally
+
+### 1. Download the 10x Genomics Dataset
+Run these commands from the project root to fetch the authentic Adult Mouse Brain (FFPE) spatial layout matrices:
+```bash
+cd data/
+curl -O https://10xgenomics.com
+tar -xf Visium_FFPE_Mouse_Brain_spatial.tar.gz
+cd ..
+```
+
+### 2. Execute the Pipeline
+Run the Nextflow script to trigger the data processor and generate the database:
 ```bash
 nextflow run main.nf
 ```
 
-### 2. Launch the Application
+### 3. Launch the Application
 Install the UI layout dependencies and fire up the web interface server:
 ```bash
 python3 -m pip install -r requirements.txt
