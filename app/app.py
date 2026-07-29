@@ -51,7 +51,7 @@ else:
             color_discrete_sequence=px.colors.qualitative.Safe
         )
         # Flip Y-axis to match standard biological tissue coordinates orientation
-        fig_clusters.update_yaxes(autorange="reverse")
+        fig_clusters.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_clusters, use_container_width=True)
 
     with col2:
@@ -64,5 +64,5 @@ else:
             hover_data=["spot_id"],
             color_continuous_scale="Viridis"
         )
-        fig_expr.update_yaxes(autorange="reverse")
+        fig_expr.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_expr, use_container_width=True)
