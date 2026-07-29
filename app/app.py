@@ -32,7 +32,7 @@ else:
     expr_df = con.execute(expr_query).df()
     con.close()
 
-    # 📊 NEW SUMMARY METRICS ROWS START HERE 📊
+    # 📊 SUMMARY METRICS ROWS
     total_spots = len(cluster_df)
     total_clusters = cluster_df['seurat_clusters'].nunique()
     avg_expression = round(expr_df['expression'].mean(), 2)
@@ -49,4 +49,32 @@ else:
         st.metric(label=f"Peak {selected_gene} Value", value=max_expression)
         
     st.markdown("---")
-    # 📊 NEW SUMMARY METRICS ROWS END HERE 📊
+
+    # 📈 DUAL GRAPHS COLUMNS
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📍 Tissue Clusters")
+        st.caption("Complete structural anatomical zones calculated by your pipeline.")
+        
+        fig_clusters = px.scatter(
+            cluster_df, x="imagecol", y="imagerow", color="seurat_clusters",
+            labels={"imagecol": "X Pixel", "imagerow": "Y Pixel", "seurat_clusters": "Cluster"},
+            hover_data=["spot_id"],
+            color_discrete_sequence=px.colors.qualitative.Safe
+        )
+        fig_clusters.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_clusters, use_container_width=True)
+
+    with col2:
+        st.subheader(f"✨ Expression: {selected_gene}")
+        st.caption(f"Continuous expression heatmap layout across the tissue slide for {selected_gene}.")
+        
+        fig_expr = px.scatter(
+            expr_df, x="imagecol", y="imagerow", color="expression",
+            labels={"imagecol": "X Pixel", "imagerow": "Y Pixel", "expression": "Level"},
+            hover_data=["spot_id"],
+            color_continuous_scale="Viridis"
+        )
+        fig_expr.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_expr, use_container_width=True)
