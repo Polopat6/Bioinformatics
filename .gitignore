@@ -12,3 +12,68 @@ __pycache__/
 .RData
 .Ruserdata
 .Rproj.user
+# --- macOS junk ---
+.DS_Store
+**/.DS_Store
+
+# --- Nextflow runtime artifacts ---
+work/
+.nextflow/
+.nextflow.log*
+trace-*.txt
+timeline-*.html
+report-*.html
+dag-*.html
+.nf-test/
+
+# --- User/dummy test data & downloaded references ---
+data/
+raw_data/
+test_data/
+reference/
+references/
+*.fasta
+*.fa
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bam.bai
+*.sam
+*.gtf
+*.gff
+*.gff3
+
+# --- Aligner / quantifier indices (large, regenerable) ---
+salmon_index/
+STAR_index/
+*_index/
+*.idx
+
+# --- 10x Genomics / Space Ranger / Visium output artifacts ---
+detected_tissue_image.jpg
+tissue_lowres_image.png
+tissue_hires_image.png
+scalefactors_json.json
+spatial/
+filtered_feature_bc_matrix/
+raw_feature_bc_matrix/
+
+# --- General large/generated output ---
+*.h5
+*.h5ad
+*.rds
+*.RData
+results/
+output/
+outputs/
+
+# --- Docs build artifacts (keep source, ignore generated) ---
+docs/_build/
+docs/site/
+
+# --- Python / conda environment cruft (optional, uncomment if desired) ---
+# __pycache__/
+# *.pyc
+# .ipynb_checkpoints/
