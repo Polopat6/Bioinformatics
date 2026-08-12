@@ -195,6 +195,71 @@ def _get_tx2gene_mapping(project, reference_dir):
     return None, None
 
 
+def _get_gene_symbol_mapping(project, reference_dir, method):
+    """
+    Attempt to build a gene_id -> gene_symbol mapping for this project's
+    reference, auto-detecting the correct source based on how the
+    reference was obtained -- mirrors _get_tx2gene_mapping's source
+    detection above, but for human-readable gene symbols rather than
+    transcript-to-gene collapsing:
+      - Preset Ensembl species (human/mouse/yeast/Drosophila/
+        C. elegans/zebrafish): parsed directly from the cDNA FASTA's
+        "gene_symbol:" header field when that FASTA is already on disk
+        (from the Salmon path); falls back to the downloaded genome GTF's
+        "gene_name" attribute if only the STAR path was used and no cDNA
+        FASTA was ever downloaded for this project.
+      - Preset no-intron species (E. coli): identity mapping (gene_id
+        used as its own symbol), since these organisms are identified by
+        locus tag rather than a separate common name.
+      - Custom uploads: parsed from the uploaded GTF/GFF3's "gene_name"
+        attribute; falls back to identity mapping if no GTF is present
+        or no gene_name attributes were found.
+
+    Returns (gene_symbol_dict_or_None, source_description_str). A None
+    mapping means no symbol source was available for this reference --
+    the caller should skip saving a mapping file in that case, and the
+    Differential Expression workspace will fall back to showing raw
+    gene IDs.
+    """
+    species_key, is_custom = pm.get_reference_choice(project)
+
+    if not is_custom and species_key:
+        entry = rm.REFERENCE_CATALOG.get(species_key, {})
+        cdna_path = os.path.join(reference_dir, f"{species_key}.cdna.fa")
+        gtf_path = os.path.join(reference_dir, f"{species_key}.annotation.gtf")
+
+        if entry.get("no_introns"):
+            if os.path.exists(cdna_path):
+                return rm.build_identity_tx2gene(cdna_path), "identity mapping (no-intron organism)"
+        elif os.path.exists(cdna_path):
+            gene_symbol = rm.extract_gene_symbol_map_from_ensembl_fasta(cdna_path)
+            if gene_symbol:
+                return gene_symbol, "parsed from Ensembl cDNA FASTA headers"
+        if os.path.exists(gtf_path):
+            gene_symbol = rm.extract_gene_symbol_map_from_gtf(gtf_path)
+            if gene_symbol:
+                return gene_symbol, "parsed from downloaded genome annotation (GTF)"
+
+        return None, None
+
+    # Custom species path
+    custom_gtf_path = os.path.join(reference_dir, "custom_input.gtf")
+    extracted_fasta_path = os.path.join(reference_dir, "custom_extracted_transcripts.fa")
+    custom_fasta_path = os.path.join(reference_dir, "custom_input.fa")
+
+    if os.path.exists(custom_gtf_path):
+        gene_symbol = rm.extract_gene_symbol_map_from_gtf(custom_gtf_path)
+        if gene_symbol:
+            return gene_symbol, "parsed from your uploaded GTF/GFF3 annotation"
+
+    if os.path.exists(extracted_fasta_path):
+        return rm.build_identity_tx2gene(extracted_fasta_path), "identity mapping (no gene_name found)"
+    if os.path.exists(custom_fasta_path):
+        return rm.build_identity_tx2gene(custom_fasta_path), "identity mapping (no gene_name found)"
+
+    return None, None
+
+
 def _render_counts_matrix_step(project, method, samplesheet_df):
     """
     Step 4 UI: merge per-sample quantification output (Salmon quant.sf
@@ -365,6 +430,22 @@ def _render_counts_matrix_step(project, method, samplesheet_df):
             matrix_df.to_csv(counts_matrix_path, index=False)
             pm.mark_step_complete(project, "counts_matrix_complete")
 
+            # Auto-build a gene_id -> gene_symbol mapping for this
+            # project's reference/species, so the Differential Expression
+            # workspace's volcano plot and results tables show readable
+            # gene symbols automatically -- no manual upload required.
+            # This is best-effort: if no symbol source is available
+            # (e.g. a custom reference with no gene_name in its GTF), no
+            # mapping file is written and DE falls back to raw gene IDs.
+            gene_symbol_map, gene_symbol_source = _get_gene_symbol_mapping(project, reference_dir, method)
+            if gene_symbol_map:
+                rm.save_gene_symbol_map_csv(gene_symbol_map, pm.gene_symbol_map_path(project))
+                pm.save_gene_id_mapping_meta(project, {
+                    "source": "auto_parse",
+                    "detail": gene_symbol_source,
+                })
+                st.caption(f"🏷️ Gene symbol mapping ready ({gene_symbol_source}) -- will be used automatically in Differential Expression. For genes that fall back to their raw reference ID, the Differential Expression workspace can convert them via a proper annotation database lookup.")
+
             n_genes = len(matrix_df)
             n_samples = len(matrix_df.columns) - 1  # minus the gene_id column
             st.success(f"✅ Counts matrix built: {n_genes:,} gene(s) × {n_samples} sample(s).")
@@ -396,12 +477,34 @@ def _render_counts_matrix_step(project, method, samplesheet_df):
             key="download_existing_matrix_btn",
         )
 
+        # Backfill the gene symbol mapping for projects whose counts
+        # matrix was built before this feature existed, so reopening an
+        # older project doesn't require rebuilding the matrix just to
+        # get gene symbols in Differential Expression.
+        if not os.path.exists(pm.gene_symbol_map_path(project)):
+            gene_symbol_map, gene_symbol_source = _get_gene_symbol_mapping(project, reference_dir, method)
+            if gene_symbol_map:
+                rm.save_gene_symbol_map_csv(gene_symbol_map, pm.gene_symbol_map_path(project))
+                pm.save_gene_id_mapping_meta(project, {
+                    "source": "auto_parse",
+                    "detail": gene_symbol_source,
+                })
+                st.caption(f"🏷️ Gene symbol mapping ready ({gene_symbol_source}) -- will be used automatically in Differential Expression. For genes that fall back to their raw reference ID, the Differential Expression workspace can convert them via a proper annotation database lookup.")
+
     if os.path.exists(counts_matrix_path):
         st.markdown("---")
         st.success(
             f"🎉 Project `{project}` now has a combined gene counts "
             "matrix, ready for differential expression analysis."
         )
+
+        if st.button("➡️ Proceed to Differential Expression", type="primary", key="align_proceed_de_btn"):
+            # Same nav_request indirection used by the other "Proceed to X"
+            # buttons in this app (see bulk_rnaseq_workspace.py and app.py's
+            # module docstring for why a plain session key is used here
+            # instead of directly setting st.session_state["assay_choice_radio"]).
+            st.session_state["nav_request"] = "🌋 Differential Expression"
+            st.rerun()
 
 # Reuse the same workspace_key as the other Bulk RNA-Seq pipeline stages
 # so the active project selection is shared automatically across pages.

@@ -118,12 +118,50 @@ def counts_matrix_path(project_name):
     """The final combined gene-level counts matrix (all samples, one row per gene)."""
     return os.path.join(project_dir(project_name), "quant", "gene_counts_matrix.csv")
 
+
+def gene_symbol_map_path(project_name):
+    """
+    Where this project's auto-built gene_id -> gene_symbol mapping is
+    saved (columns: gene_id, gene_name), built automatically from the
+    project's reference (see alignment_workspace.py's
+    _get_gene_symbol_mapping) once the counts matrix step completes.
+    The Differential Expression workspace reads this directly so users
+    get readable gene symbols on the volcano plot and results tables
+    without needing to upload their own mapping file.
+    """
+    return os.path.join(reference_dir(project_name), "gene_symbol_map.csv")
+
+
+def gene_id_mapping_work_dir(project_name):
+    """Scratch directory for gene_id_mapper.py's temp R script + job spec
+    JSON (bitr()-based ID conversion), separate from the DESeq2 work dir."""
+    return os.path.join(reference_dir(project_name), "bitr_work")
+
+
+def save_gene_id_mapping_meta(project_name, meta):
+    """
+    Remember which ID conversion is currently active for this project's
+    gene_symbol_map.csv (from_type, to_type, species_key/orgdb_package,
+    n_converted, n_total, and source -- "auto_parse" for the fast
+    FASTA/GTF-derived mapping vs. "bitr" for a Bioconductor-converted
+    one), so re-opening the project shows the right status message and
+    pre-fills the manual override picker with the last-used choice
+    instead of resetting to defaults every time.
+    """
+    info = load_info(project_name)
+    info["gene_id_mapping_meta"] = meta
+    save_info(project_name, info)
+
+
+def get_gene_id_mapping_meta(project_name):
+    info = load_info(project_name)
+    return info.get("gene_id_mapping_meta")
+
 # --- Additions needed in project_manager.py for the Differential Expression workspace ---
 # Add these functions alongside the existing path helpers (e.g. near counts_matrix_path).
 # --- Addition for project_manager.py ---
 # Add this function alongside the other shared utility functions (not
 # project-specific, so it doesn't need a project_name argument).
-
 
 
 def get_recommended_thread_count(reserve_cores=1, max_default=8):

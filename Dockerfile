@@ -51,19 +51,48 @@ RUN conda install -y -c bioconda -c conda-forge \
 #    - DBI/duckdb/tidyr: existing spatial pipeline dependencies (tidyr
 #      kept installed just in case any script still references it, even
 #      though it was found to be unused in the cleaned-up version)
-#    - tximport: imports Salmon quant.sf output into R (future step)
-#    - DESeq2: differential expression analysis (future step, from
-#      Bioconductor)
-RUN R -e "install.packages(c('DBI', 'duckdb', 'tidyr', 'BiocManager'), repos='https://r-project.org')" \
-    && R -e "BiocManager::install(c('tximport', 'DESeq2'), update = FALSE, ask = FALSE)"
+#    - jsonlite: reads the job-spec JSON file passed into the DESeq2
+#      Rscript (deseq2_manager.py's _DESEQ2_R_SCRIPT) -- required
+#      explicitly since it is NOT a guaranteed transitive dependency of
+#      DESeq2/tximport and the script hard-fails without it.
+#    - tximport: imports Salmon quant.sf output into R
+#    - DESeq2: differential expression analysis (Bioconductor)
+#    - limma: provides removeBatchEffect(), used by the DESeq2 R script
+#      to build the batch-adjusted PCA view (visualization only) shown
+#      side-by-side with the raw PCA in the Differential Expression
+#      workspace whenever a batch column is selected -- previously
+#      missing here, which would hard-fail at runtime
+#      ("there is no package called 'limma'") for any project using a
+#      batch column, since the script does `library(limma)` directly.
+RUN R -e "install.packages(c('DBI', 'duckdb', 'tidyr', 'jsonlite', 'BiocManager'), repos='https://cran.r-project.org')" \
+    && R -e "BiocManager::install(c('tximport', 'DESeq2', 'limma'), update = FALSE, ask = FALSE)"
 
 # 6. Copy application dependency records
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
 # 7. Install Python packages inside the container
-#    (streamlit, duckdb, plotly, pandas, openpyxl — see requirements.txt)
-RUN pip3 install --no-cache-dir -r requirements.txt
+#    (streamlit, duckdb, plotly, pandas, openpyxl, kaleido — see
+#    requirements.txt). `kaleido` is pinned/verified explicitly here
+#    (in addition to whatever requirements.txt specifies) since it
+#    backs the "Save as PDF" plot export feature in the Differential
+#    Expression workspace, and its behavior differs meaningfully by
+#    version:
+#      - kaleido >= 1.0 no longer bundles Chromium; it downloads a
+#        Chrome binary on first use via `kaleido.get_chrome_sync()`.
+#        That download requires network access, so it's done here at
+#        BUILD time (when the image build has internet access) rather
+#        than left to happen at runtime, where the container may be
+#        deployed without outbound network access and PDF export would
+#        silently fail on its first real use.
+#      - kaleido 0.2.1 (the old pin some deployments still use because
+#        it bundles Chromium directly, avoiding the download above) is
+#        already past Plotly's own deprecation cutoff (Sept 2025) --
+#        intentionally NOT used here in favor of a current kaleido
+#        release with the Chrome binary pre-fetched at build time.
+RUN pip3 install --no-cache-dir -r requirements.txt \
+    && pip3 install --no-cache-dir "kaleido>=1.0.0" \
+    && python3 -c "import kaleido; kaleido.get_chrome_sync()"
 
 # 8. Copy the rest of the project files into the container
 COPY . /app

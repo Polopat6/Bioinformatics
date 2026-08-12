@@ -9,6 +9,8 @@ in its own module:
     - bulk_rnaseq_workspace.py   -> Bulk RNA-Seq Pipeline (upload, matching, QC)
     - trimming_workspace.py      -> Adapter Trimming & Post-Trim QC
     - alignment_workspace.py     -> RNA Alignment & Counts (Salmon quantification)
+    - differential_expression_workspace.py -> Differential Expression (DESeq2)
+    - ontology_workspace.py      -> Ontology Analysis (GO/pathway enrichment)
 
 Keeping workspaces in separate files means work on one pipeline (e.g. Bulk
 RNA-Seq) can never accidentally break another (e.g. Spatial Transcriptomics).
@@ -32,6 +34,7 @@ import bulk_rnaseq_workspace
 import trimming_workspace
 import alignment_workspace
 import differential_expression_workspace
+import ontology_workspace
 
 # 1. Global Setup Layout
 st.set_page_config(layout="wide", page_title="Multi-Omics Bioinformatics Portal")
@@ -56,6 +59,7 @@ assay_choice = st.sidebar.radio(
         "🧪 Trimming & Post-Trim QC",
         "🧮 RNA Alignment & Counts",
         "🌋 Differential Expression",
+        "🧬 Ontology Analysis",
     ],
     key="assay_choice_radio",
 )
@@ -106,4 +110,10 @@ elif assay_choice == "🧮 RNA Alignment & Counts":
 # =========================================
 elif assay_choice == "🌋 Differential Expression":
     differential_expression_workspace.render()
+
+# =========================================
+# 🧬 WORKSPACE 7: ONTOLOGY ANALYSIS
+# =========================================
+elif assay_choice == "🧬 Ontology Analysis":
+    ontology_workspace.render()
 

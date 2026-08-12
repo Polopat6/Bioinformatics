@@ -672,5 +672,15 @@ def render():
         st.markdown("---")
         st.success(
             f"🎉 Project `{project}` now has trimmed reads and post-"
-            "trimming quality results saved."
+            "trimming quality results saved. This project is ready "
+            "for the next step: RNA alignment and gene counting."
         )
+
+        if st.button("➡️ Proceed to RNA Alignment & Counts", type="primary", key="trim_proceed_align_btn"):
+            # Same nav_request indirection used by the other "Proceed
+            # to X" buttons in this app (see bulk_rnaseq_workspace.py
+            # and app.py's module docstring for why a plain session
+            # key is used here instead of directly setting
+            # st.session_state["assay_choice_radio"]).
+            st.session_state["nav_request"] = "🧮 RNA Alignment & Counts"
+            st.rerun()

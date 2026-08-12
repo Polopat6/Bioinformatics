@@ -12,13 +12,14 @@ logically distinct from the Streamlit UI/workflow code.
 
 --- Reference sources used ---
 
-Human, Mouse, Yeast, Drosophila, C. elegans: Ensembl's main FTP site,
-using its "current_fasta" and "current_gtf" symlink directories. These
-always point to the latest Ensembl release for that species, so URLs
-here don't go stale as new Ensembl releases come out. The exact filename
-within that directory still includes a release number that changes over
-time (e.g. "Homo_sapiens.GRCh38.113.gtf.gz"), so we fetch the directory
-listing and pattern-match the correct filename rather than hardcoding it.
+Human, Mouse, Yeast, Drosophila, C. elegans, Zebrafish: Ensembl's main
+FTP site, using its "current_fasta" and "current_gtf" symlink
+directories. These always point to the latest Ensembl release for that
+species, so URLs here don't go stale as new Ensembl releases come out.
+The exact filename within that directory still includes a release number
+that changes over time (e.g. "Homo_sapiens.GRCh38.113.gtf.gz"), so we
+fetch the directory listing and pattern-match the correct filename
+rather than hardcoding it.
 
 E. coli: Ensembl's bacterial genome FTP structure is organized
 differently (collection-based, less predictable), so instead we use
@@ -125,6 +126,19 @@ REFERENCE_CATALOG = {
         "genome_fasta_pattern": r"Caenorhabditis_elegans\.WBcel235\.dna\.toplevel\.fa\.gz",
         "cdna_fasta_pattern": r"Caenorhabditis_elegans\.WBcel235\.cdna\.all\.fa\.gz",
         "gtf_pattern": r"Caenorhabditis_elegans\.WBcel235\.\d+\.gtf\.gz",
+    },
+    "zebrafish": {
+        "label": "Zebrafish (Danio rerio, GRCz11)",
+        "source": "ensembl",
+        "species_dir": "danio_rerio",
+        "species_name": "Danio_rerio",
+        "assembly": "GRCz11",
+        # Zebrafish has a chromosome-level assembly like human/mouse, so
+        # it's distributed as "primary_assembly" (not "toplevel", which
+        # is used for the smaller/less-finished genomes above).
+        "genome_fasta_pattern": r"Danio_rerio\.GRCz11\.dna\.primary_assembly\.fa\.gz",
+        "cdna_fasta_pattern": r"Danio_rerio\.GRCz11\.cdna\.all\.fa\.gz",
+        "gtf_pattern": r"Danio_rerio\.GRCz11\.\d+\.gtf\.gz",
     },
     "ecoli": {
         "label": "E. coli (K-12 MG1655)",
@@ -642,6 +656,117 @@ def extract_tx2gene_from_ensembl_fasta(fasta_path):
             if match:
                 tx2gene[tx_id] = match.group(1)
     return tx2gene
+
+
+def extract_gene_symbol_map_from_ensembl_fasta(fasta_path):
+    """
+    Parse a gene_id -> gene_symbol mapping directly from an Ensembl-style
+    cDNA FASTA's header lines -- the same file already downloaded for
+    Salmon and already parsed for tx2gene by
+    extract_tx2gene_from_ensembl_fasta, so no extra download is needed
+    just to get gene symbols for preset (human/mouse/yeast/Drosophila/
+    C. elegans/zebrafish) references.
+
+    Ensembl's cDNA headers embed both the parent gene ID and (when
+    available) a human-readable symbol, e.g.:
+
+        >ENST00000456328.2 cdna chromosome:GRCh38:1:11869:14409:1
+        gene:ENSG00000223972.5 gene_biotype:lncRNA transcript_biotype:...
+        gene_symbol:DDX11L1 description:...
+
+    Not every gene has a populated "gene_symbol" field -- this is common
+    for well-curated model organisms like human/mouse/zebrafish, but
+    many genes even in those species (and more so in less-studied
+    organisms) only have a systematic/locus identifier and no separate
+    symbol. For any gene_id with no gene_symbol found on any of its
+    transcripts, the gene_id itself is used as the "symbol" so every
+    gene still gets a usable, human-facing label in the volcano plot
+    and gene tables rather than being silently dropped from the
+    mapping.
+
+    Returns a dict {gene_id: gene_symbol}. Returns an empty dict if no
+    headers matched the expected "gene:" pattern at all (e.g. a
+    non-Ensembl FASTA was passed in) -- callers should treat an empty
+    result as "mapping not available" rather than assuming success.
+    """
+    gene_symbol = {}
+    gene_ids_seen = set()
+    with open(fasta_path, "r", errors="ignore") as f:
+        for line in f:
+            if not line.startswith(">"):
+                continue
+            header = line[1:].strip()
+            gene_match = re.search(r"gene:(\S+)", header)
+            if not gene_match:
+                continue
+            gene_id = gene_match.group(1)
+            gene_ids_seen.add(gene_id)
+            symbol_match = re.search(r"gene_symbol:(\S+)", header)
+            if symbol_match:
+                gene_symbol[gene_id] = symbol_match.group(1)
+    for gene_id in gene_ids_seen:
+        gene_symbol.setdefault(gene_id, gene_id)
+    return gene_symbol
+
+
+def extract_gene_symbol_map_from_gtf(gtf_path):
+    """
+    Parse a gene_id -> gene_symbol mapping from a GTF file's feature
+    lines, using the "gene_name" attribute -- the conventional GTF field
+    for a gene's human-readable symbol (e.g. "TP53"), separate from its
+    stable "gene_id" (e.g. "ENSG00000141510"). Used for custom
+    eukaryotic reference uploads, where a GTF/GFF3 annotation is
+    available but no Ensembl-style "gene_symbol:" FASTA header field
+    exists (see extract_gene_symbol_map_from_ensembl_fasta for that
+    preset-species path).
+
+    Falls back to the gene_id itself for any gene whose GTF entry has
+    no gene_name attribute (common for less-annotated or non-model
+    organisms), so every gene still gets a usable label.
+
+    Returns a dict {gene_id: gene_symbol}. Returns an empty dict if no
+    'gene_id' attributes were found at all (e.g. a malformed or
+    unexpected annotation format).
+    """
+    gene_symbol = {}
+    gene_ids_seen = set()
+    with open(gtf_path, "r", errors="ignore") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9:
+                continue
+            attributes = fields[8]
+            gene_id = _parse_gtf_attribute(attributes, "gene_id")
+            if not gene_id:
+                continue
+            gene_ids_seen.add(gene_id)
+            gene_name = _parse_gtf_attribute(attributes, "gene_name")
+            if gene_name:
+                gene_symbol[gene_id] = gene_name
+    for gene_id in gene_ids_seen:
+        gene_symbol.setdefault(gene_id, gene_id)
+    return gene_symbol
+
+
+def save_gene_symbol_map_csv(gene_symbol_map, dest_path):
+    """
+    Write a gene_id -> gene_symbol mapping dict to a CSV with columns
+    "gene_id", "gene_name" -- matching the exact column names the
+    Differential Expression workspace's gene-name-mapping loader already
+    expects (see differential_expression_workspace.py's gene ID -> gene
+    name CSV format), so this file can be read straight back in without
+    any renaming step.
+    """
+    import csv
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    with open(dest_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["gene_id", "gene_name"])
+        for gene_id, gene_name in sorted(gene_symbol_map.items()):
+            writer.writerow([gene_id, gene_name])
+    return dest_path
 
 
 def extract_tx2gene_from_gtf(gtf_path):
