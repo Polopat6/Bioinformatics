@@ -46,6 +46,135 @@ import gene_id_mapper as gim
 WORKSPACE_KEY = "bulk_rnaseq"
 
 # ---------------------------------------------------------------------------
+# Cached disk reads
+# ---------------------------------------------------------------------------
+#
+# Streamlit reruns this entire script top-to-bottom on EVERY widget
+# interaction (moving a slider, checking a box, typing a character) --
+# this is fundamental to how Streamlit works, not something specific to
+# this file. Without caching, that means every one of this workspace's
+# CSV reads (counts matrix, metadata, PCA coordinates, sample distance
+# matrix, dispersion estimates, size factors, per-contrast results,
+# normalized counts) gets re-read from disk and re-parsed by pandas on
+# every single interaction, even ones that only affect a completely
+# unrelated widget elsewhere on the page (e.g. moving the volcano
+# plot's font-size slider still re-reads the sample distance matrix).
+# For a small project this is unnoticeable; for a larger one (many
+# thousands of genes and/or many samples) these repeated reads/parses
+# are the most likely source of any perceptible lag -- see
+# https://docs.streamlit.io/develop/concepts/architecture/caching.
+#
+# Each wrapper below is keyed on the underlying file's modification
+# time (mtime) IN ADDITION to its normal arguments, so Streamlit's
+# cache is used on every interaction EXCEPT when the file has actually
+# changed on disk (e.g. after re-running DESeq2 overwrites it) --
+# there's no need to manually clear the cache or worry about serving
+# stale results after a re-run. If a file doesn't exist yet, mtime is
+# None, which is still a perfectly valid (if unchanging) cache key.
+def _mtime_or_none(path):
+    "Get a file's modification time for use as an automatic cache-invalidation key, or None if it doesn't exist."
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+#
+# IMPORTANT: none of the cache-key parameters below (mtime, coords_mtime,
+# var_mtime) may start with a leading underscore. Streamlit's
+# @st.cache_data specifically treats a leading-underscore parameter name
+# as "do NOT hash this / do NOT use it as part of the cache key" (that
+# convention exists so unhashable objects, like a DB connection, can
+# still be passed through a cached function safely). Since the entire
+# point of passing an mtime here is to have it INCLUDED in the cache
+# key so a changed file correctly invalidates the cache, these
+# parameters must be named WITHOUT a leading underscore.
+@st.cache_data(show_spinner=False)
+def _cached_read_csv(path, mtime):
+    "Cached pd.read_csv, invalidated automatically whenever the file's mtime changes."
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_pca_coordinates(deseq2_out_dir, batch_adjusted, coords_mtime, var_mtime):
+    return dm.read_pca_coordinates(deseq2_out_dir, batch_adjusted=batch_adjusted)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_sample_distance_matrix(deseq2_out_dir, mtime):
+    return dm.read_sample_distance_matrix(deseq2_out_dir)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_dispersion_estimates(deseq2_out_dir, mtime):
+    return dm.read_dispersion_estimates(deseq2_out_dir)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_size_factors(deseq2_out_dir, mtime):
+    return dm.read_size_factors(deseq2_out_dir)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_contrast_results(deseq2_out_dir, contrast_name, mtime):
+    return dm.read_contrast_results(deseq2_out_dir, contrast_name)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_normalized_counts(deseq2_out_dir, mtime):
+    return dm.read_normalized_counts(deseq2_out_dir)
+
+
+def _load_counts_df(counts_matrix_path):
+    "Cached read of the project's gene counts matrix CSV."
+    return _cached_read_csv(counts_matrix_path, _mtime_or_none(counts_matrix_path))
+
+
+def _load_meta_df(metadata_path):
+    "Cached read of the project's metadata CSV."
+    return _cached_read_csv(metadata_path, _mtime_or_none(metadata_path))
+
+
+def _load_pca_coordinates(deseq2_out_dir, batch_adjusted=False):
+    "Cached wrapper for dm.read_pca_coordinates, auto-invalidated when the underlying CSV/txt files change."
+    suffix = "_batch_adjusted" if batch_adjusted else ""
+    coords_path = os.path.join(deseq2_out_dir, f"pca_coordinates{suffix}.csv")
+    var_path = os.path.join(deseq2_out_dir, f"pca_percent_variance{suffix}.txt")
+    return _cached_read_pca_coordinates(
+        deseq2_out_dir, batch_adjusted, _mtime_or_none(coords_path), _mtime_or_none(var_path),
+    )
+
+
+def _load_sample_distance_matrix(deseq2_out_dir):
+    "Cached wrapper for dm.read_sample_distance_matrix, auto-invalidated when the underlying CSV changes."
+    path = os.path.join(deseq2_out_dir, "sample_distance_matrix.csv")
+    return _cached_read_sample_distance_matrix(deseq2_out_dir, _mtime_or_none(path))
+
+
+def _load_dispersion_estimates(deseq2_out_dir):
+    "Cached wrapper for dm.read_dispersion_estimates, auto-invalidated when the underlying CSV changes."
+    path = os.path.join(deseq2_out_dir, "dispersion_estimates.csv")
+    return _cached_read_dispersion_estimates(deseq2_out_dir, _mtime_or_none(path))
+
+
+def _load_size_factors(deseq2_out_dir):
+    "Cached wrapper for dm.read_size_factors, auto-invalidated when the underlying CSV changes."
+    path = os.path.join(deseq2_out_dir, "size_factors.csv")
+    return _cached_read_size_factors(deseq2_out_dir, _mtime_or_none(path))
+
+
+def _load_contrast_results(deseq2_out_dir, contrast_name):
+    "Cached wrapper for dm.read_contrast_results, auto-invalidated when that contrast's CSV changes."
+    path = os.path.join(deseq2_out_dir, f"results_{contrast_name}.csv")
+    return _cached_read_contrast_results(deseq2_out_dir, contrast_name, _mtime_or_none(path))
+
+
+def _load_normalized_counts(deseq2_out_dir):
+    "Cached wrapper for dm.read_normalized_counts, auto-invalidated when the underlying CSV changes."
+    path = os.path.join(deseq2_out_dir, "normalized_counts.csv")
+    return _cached_read_normalized_counts(deseq2_out_dir, _mtime_or_none(path))
+
+# ---------------------------------------------------------------------------
 # Plot customization + export helpers
 # ---------------------------------------------------------------------------
 #
@@ -208,7 +337,7 @@ def _render_plot_style_controls(key_prefix, group_values=None, default_colors=No
             st.markdown("**Legend placement**")
             legend_position = st.selectbox(
                 "Starting legend position:",
-                options=["Right (default)", "Top", "Bottom", "Left"],
+                options=["Right (default)", "Top", "Bottom", "Left", "Bottom-right (inside plot)"],
                 key=f"{key_prefix}_legend_pos",
             )
             st.caption(
@@ -279,6 +408,17 @@ def _apply_plot_style(fig, style, default_title="", default_x_label=None,
         legend_layout = dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
     elif pos == "Left":
         legend_layout = dict(yanchor="middle", y=0.5, xanchor="right", x=-0.25)
+    elif pos == "Bottom-right (inside plot)":
+        # Anchored INSIDE the plot area's bottom-right corner, rather
+        # than off to the right of the whole figure (Plotly's default)
+        # -- useful for plots that already have a colorbar occupying
+        # the space just outside the right edge (e.g. the heatmaps in
+        # this workspace), where the default right-side legend would
+        # otherwise render directly beneath/overlapping the colorbar.
+        legend_layout = dict(
+            yanchor="bottom", y=0.01, xanchor="right", x=0.99,
+            bgcolor="rgba(255,255,255,0.7)", bordercolor="rgba(0,0,0,0.2)", borderwidth=1,
+        )
 
     font_family = style.get("font_family", "Arial")
     font_size = style.get("font_size", 13)
@@ -462,17 +602,204 @@ def _render_pdf_export(fig, key_prefix, filename_base):
             )
 
 
+_CONFIDENCE_LEVEL_OPTIONS = {"90%": 0.90, "95%": 0.95, "99%": 0.99}
+
+
+def _render_confidence_ellipse_controls(key_prefix):
+    """
+    Render a "Show confidence ellipses around groups" checkbox and (if
+    checked) a confidence-level selector, for a PCA plot.
+
+    Returns (show_ellipse: bool, confidence_level: float) -- pass these
+    directly as _plot_pca's show_confidence_ellipse/confidence_level
+    arguments.
+    """
+    col_toggle, col_level = st.columns([2, 1])
+    with col_toggle:
+        show_ellipse = st.checkbox(
+            "🔵 Show confidence ellipses around groups",
+            value=False,
+            key=f"{key_prefix}_show_ellipse",
+            help="Draws a dashed ellipse around each group's samples, sized to the selected confidence level (assumes each group's samples are roughly bivariate-normal on PC1/PC2). Groups with fewer than 3 samples are skipped.",
+        )
+    confidence_level = 0.95
+    if show_ellipse:
+        with col_level:
+            level_choice = st.selectbox(
+                "Confidence level:",
+                options=list(_CONFIDENCE_LEVEL_OPTIONS.keys()),
+                index=1,
+                key=f"{key_prefix}_ellipse_confidence",
+                label_visibility="collapsed",
+            )
+            confidence_level = _CONFIDENCE_LEVEL_OPTIONS[level_choice]
+    return show_ellipse, confidence_level
+
+
+def _render_ellipse_stats(ellipse_stats, key_prefix):
+    """
+    Display a small stats table for the confidence ellipses drawn on a
+    PCA plot (see _compute_confidence_ellipse) -- one row per group,
+    with its sample count, confidence level, semi-major/semi-minor axis
+    lengths, rotation angle, and enclosed area -- plus a CSV download of
+    the same table. Renders nothing if ellipse_stats is empty (e.g. the
+    user hasn't enabled ellipses, or every group had too few samples).
+    """
+    if not ellipse_stats:
+        return
+    rows = [
+        {
+            "Group": s["group"],
+            "N Samples": s["n_samples"],
+            "Confidence Level": f"{int(s['confidence'] * 100)}%",
+            "Semi-Major Axis": round(s["semi_major_axis"], 3),
+            "Semi-Minor Axis": round(s["semi_minor_axis"], 3),
+            "Angle (degrees)": round(s["angle_degrees"], 1),
+            "Area": round(s["area"], 3),
+        }
+        for s in ellipse_stats
+    ]
+    stats_df = pd.DataFrame(rows)
+    st.caption(
+        "📐 Confidence ellipse statistics per group (PC1/PC2 units -- "
+        "semi-major/semi-minor axis lengths, rotation angle, and "
+        "enclosed area of each dashed ellipse above):"
+    )
+    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    _render_csv_download(
+        stats_df, f"{key_prefix}_confidence_ellipse_stats", f"{key_prefix}_ellipse_stats",
+        expander_label="⬇️ Download Confidence Ellipse Statistics (.csv)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
 
-def _plot_pca(pca_df, pct_variance, color_by):
-    "Build a PC1 vs PC2 scatter plot, colored by the given metadata column."
+# Chi-square critical values for 2 degrees of freedom, at the confidence
+# levels offered in the PCA plot's "Show confidence ellipses" control --
+# this is the standard way to size a 2D confidence ellipse from a
+# covariance matrix (the ellipse boundary is the set of points at
+# Mahalanobis distance sqrt(chi2_critical_value) from the group's
+# centroid). Hardcoded here (rather than computed via scipy.stats.chi2)
+# so this feature works even in an environment without scipy installed,
+# matching this workspace's existing "graceful without scipy" approach
+# for hierarchical clustering.
+_CHI2_CRITICAL_VALUES_2DOF = {
+    0.90: 4.605,
+    0.95: 5.991,
+    0.99: 9.210,
+}
+
+
+def _compute_confidence_ellipse(x_vals, y_vals, confidence=0.95, n_points=100):
+    """
+    Compute the boundary points of a 2D confidence ellipse for a set of
+    (x, y) points, assuming an underlying bivariate normal distribution
+    -- the standard "confidence ellipse" construction used across
+    statistical plotting tools (e.g. matplotlib/seaborn's
+    confidence_ellipse recipes, R's stat_ellipse): the ellipse is
+    centered at the group's centroid, oriented along the eigenvectors
+    of its covariance matrix, with semi-axis lengths scaled by the
+    chi-square critical value for 2 degrees of freedom at the requested
+    confidence level (see _CHI2_CRITICAL_VALUES_2DOF).
+
+    Requires at least 3 points to compute a meaningful (non-degenerate)
+    covariance matrix -- returns None for smaller groups rather than
+    drawing a misleading ellipse from too little data.
+
+    Returns a dict:
+        {
+            "ellipse_x": [...], "ellipse_y": [...],  # boundary points, for plotting
+            "center_x": float, "center_y": float,      # centroid (also the ellipse's own center)
+            "semi_major_axis": float, "semi_minor_axis": float,
+            "angle_degrees": float,   # rotation of the semi-major axis from the x-axis
+            "area": float,
+            "n_samples": int,
+            "confidence": float,
+        }
+    or None if there aren't enough points.
+    """
+    import numpy as np
+
+    x_arr = np.asarray(x_vals, dtype=float)
+    y_arr = np.asarray(y_vals, dtype=float)
+    n = len(x_arr)
+    if n < 3:
+        return None
+
+    center_x, center_y = x_arr.mean(), y_arr.mean()
+    cov = np.cov(x_arr, y_arr)
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    # np.linalg.eigh returns eigenvalues in ASCENDING order -- reverse so
+    # index 0 is the largest (major axis), matching the semi_major/
+    # semi_minor naming below.
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+
+    # Guard against a degenerate (zero-variance) direction -- e.g. every
+    # sample in this group happens to share an identical PC value on one
+    # axis -- which would otherwise produce a zero-width ellipse or a
+    # math domain error taking its square root.
+    eigenvalues = np.clip(eigenvalues, a_min=1e-10, a_max=None)
+
+    chi2_val = _CHI2_CRITICAL_VALUES_2DOF.get(confidence, 5.991)
+    semi_major = float(np.sqrt(eigenvalues[0] * chi2_val))
+    semi_minor = float(np.sqrt(eigenvalues[1] * chi2_val))
+    angle_rad = float(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+
+    theta = np.linspace(0, 2 * np.pi, n_points)
+    ellipse_local_x = semi_major * np.cos(theta)
+    ellipse_local_y = semi_minor * np.sin(theta)
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    ellipse_x = center_x + ellipse_local_x * cos_a - ellipse_local_y * sin_a
+    ellipse_y = center_y + ellipse_local_x * sin_a + ellipse_local_y * cos_a
+
+    return {
+        "ellipse_x": ellipse_x.tolist(),
+        "ellipse_y": ellipse_y.tolist(),
+        "center_x": center_x,
+        "center_y": center_y,
+        "semi_major_axis": semi_major,
+        "semi_minor_axis": semi_minor,
+        "angle_degrees": float(np.degrees(angle_rad)),
+        "area": float(math.pi * semi_major * semi_minor),
+        "n_samples": n,
+        "confidence": confidence,
+    }
+
+
+def _plot_pca(pca_df, pct_variance, color_by, show_confidence_ellipse=False, confidence_level=0.95):
+    """
+    Build a PC1 vs PC2 scatter plot, colored by the given metadata
+    column.
+
+    show_confidence_ellipse, confidence_level: if show_confidence_ellipse
+        is True, draws a dashed confidence ellipse (see
+        _compute_confidence_ellipse) around each group's samples,
+        colored to match that group's markers (using this workspace's
+        default color palette, matched by index in the same order the
+        marker traces are built -- if the user later recolors a group
+        via the style panel, _apply_plot_style's color_map recoloring
+        picks up the ellipse trace too, since it shares its group's
+        exact trace "name"). Groups with fewer than 3 samples are
+        skipped (too little data for a meaningful ellipse) rather than
+        causing an error.
+
+    Returns (fig, ellipse_stats) -- the figure, and a list of per-group
+    ellipse statistics dicts (see _compute_confidence_ellipse) for
+    display below the plot, or an empty list if
+    show_confidence_ellipse is False or no group had enough samples.
+    """
     pc1_label = f"PC1 ({pct_variance[0]}% variance)" if pct_variance else "PC1"
     pc2_label = f"PC2 ({pct_variance[1]}% variance)" if pct_variance else "PC2"
 
     fig = go.Figure()
-    for group_value in sorted(pca_df[color_by].astype(str).unique()):
+    ellipse_stats = []
+    group_labels = sorted(pca_df[color_by].astype(str).unique())
+    for i, group_value in enumerate(group_labels):
         subset = pca_df[pca_df[color_by].astype(str) == group_value]
         fig.add_trace(go.Scatter(
             x=subset["PC1"], y=subset["PC2"],
@@ -482,13 +809,28 @@ def _plot_pca(pca_df, pct_variance, color_by):
             name=group_value,
             marker=dict(size=12),
         ))
+
+        if show_confidence_ellipse:
+            ellipse = _compute_confidence_ellipse(subset["PC1"], subset["PC2"], confidence=confidence_level)
+            if ellipse is not None:
+                ellipse_color = _DEFAULT_COLOR_PALETTE[i % len(_DEFAULT_COLOR_PALETTE)]
+                fig.add_trace(go.Scatter(
+                    x=ellipse["ellipse_x"], y=ellipse["ellipse_y"],
+                    mode="lines",
+                    line=dict(color=ellipse_color, dash="dot", width=2),
+                    name=group_value,
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+                ellipse_stats.append(dict(ellipse, group=group_value))
+
     fig.update_layout(
         xaxis_title=pc1_label,
         yaxis_title=pc2_label,
         height=500,
         legend_title=color_by,
     )
-    return fig
+    return fig, ellipse_stats
 
 
 def _plot_volcano(results_df, padj_threshold=0.05, lfc_threshold=1.0, gene_name_map=None):
@@ -660,6 +1002,9 @@ def _render_gene_label_controls(contrast_key, volcano_df, gene_name_map=None):
         up/down-regulated gene to the label set; unchecking removes
         only the ones that were added this way, leaving any
         individually clicked genes alone)
+      - a search box to find and label ANY gene by its ID or
+        human-readable symbol, regardless of where it falls on the
+        plot or whether it's significant (see _render_gene_search)
       - an expander listing every currently labeled gene, each with
         its own font family, font size, bold checkbox, color picker,
         and a remove button
@@ -705,6 +1050,8 @@ def _render_gene_label_controls(contrast_key, volcano_df, gene_name_map=None):
             labeled_genes.pop(gid, None)
         auto_added.clear()
 
+    _render_gene_search(contrast_key, volcano_df, labeled_genes, gene_name_map=gene_name_map)
+
     if labeled_genes:
         gene_name_map = gene_name_map or {}
         with st.expander(f"🎨 Manage Gene Labels ({len(labeled_genes)} labeled)"):
@@ -749,6 +1096,109 @@ def _render_gene_label_controls(contrast_key, volcano_df, gene_name_map=None):
                         st.rerun()
 
     return labeled_genes, sig_gene_ids
+
+
+def _render_gene_search(contrast_key, volcano_df, labeled_genes, gene_name_map=None):
+    """
+    Render a "search for a gene" box that lets the user find and label
+    ANY gene on the volcano plot by typing either its reference ID
+    (e.g. "ENSG00000141510", version suffix optional) or its
+    human-readable symbol (e.g. "TP53", if a gene name mapping is
+    active -- see _render_gene_id_mapping_panel), regardless of where
+    that gene falls on the plot (deep in "Not significant", visually
+    overlapping other points, off in a crowded cluster, etc.) or
+    whether it happens to be significant.
+
+    Matching is substring-based and case-insensitive, checked against
+    both the raw gene_id AND its mapped display name (if any), so a
+    partial symbol (e.g. "tp53") or a partial/unversioned ID still
+    finds the right gene. If more than one gene matches (e.g. an
+    ambiguous partial symbol shared by a gene family), every match is
+    shown in a follow-up picker so the user can disambiguate rather
+    than a guess being made on their behalf.
+
+    Adds a match directly into `labeled_genes` (the same dict used by
+    click-to-label and "Label All" -- see _render_gene_label_controls),
+    so a gene found this way gets identical treatment: it shows up in
+    the "Manage Gene Labels" panel, can be restyled or removed there,
+    and its label can be dragged on the chart like any other.
+    """
+    gene_name_map = gene_name_map or {}
+
+    st.markdown("**🔎 Find a specific gene**")
+    search_col, button_col = st.columns([3, 1])
+    with search_col:
+        search_term = st.text_input(
+            "Search by gene ID or symbol:",
+            key=f"gene_search_input_{contrast_key}",
+            placeholder="e.g. TP53 or ENSG00000141510",
+            label_visibility="collapsed",
+            help="Finds and labels a gene anywhere on the plot, even if it's not significant or is hard to click precisely.",
+        )
+    with button_col:
+        search_clicked = st.button("Find", key=f"gene_search_btn_{contrast_key}", use_container_width=True)
+
+    if not search_term or not search_term.strip():
+        return
+
+    term = search_term.strip().lower()
+    all_gene_ids = volcano_df["gene_id"].astype(str)
+
+    # Match against BOTH the raw gene_id and its mapped display name
+    # (if a gene name mapping is active), so the user can search by
+    # whichever one they happen to know -- e.g. typing "tp53" finds a
+    # gene whose gene_id is "ENSG00000141510" via its mapped symbol,
+    # and typing an (optionally versioned) Ensembl ID finds it directly
+    # even if a mapping never resolved a name for it.
+    def _matches(gid):
+        gid_str = str(gid)
+        if term in gid_str.lower():
+            return True
+        display_name = gene_name_map.get(gid_str, "")
+        return bool(display_name) and term in display_name.lower()
+
+    matching_ids = [gid for gid in all_gene_ids if _matches(gid)]
+    # Preserve first-seen order but drop duplicates (a gene_id should
+    # already be unique in volcano_df, but this is a cheap safeguard).
+    seen = set()
+    matching_ids = [gid for gid in matching_ids if not (gid in seen or seen.add(gid))]
+
+    if not matching_ids:
+        st.warning(f"⚠️ No gene found matching \"{search_term}\". Check the spelling, or try just part of the ID/symbol.")
+        return
+
+    if len(matching_ids) == 1:
+        gid_to_add = matching_ids[0]
+        display_name = gene_name_map.get(gid_to_add, gid_to_add)
+        already_labeled = gid_to_add in labeled_genes
+        st.caption(f"✅ Found **{display_name}** (`{gid_to_add}`)" + (" -- already labeled." if already_labeled else "."))
+        if search_clicked and not already_labeled:
+            labeled_genes[gid_to_add] = dict(_DEFAULT_GENE_LABEL_STYLE)
+            st.success(f"🏷️ Labeled **{display_name}** on the plot below.")
+            st.rerun()
+        elif search_clicked and already_labeled:
+            st.info(f"**{display_name}** is already labeled -- adjust it in \"Manage Gene Labels\" below.")
+    else:
+        st.caption(f"Found **{len(matching_ids)}** genes matching \"{search_term}\" -- pick one:")
+        options_map = {
+            f"{gene_name_map.get(gid, gid)} ({gid})": gid for gid in matching_ids
+        }
+        picked_label = st.selectbox(
+            "Select the gene you meant:",
+            options=list(options_map.keys()),
+            key=f"gene_search_disambiguate_{contrast_key}",
+            label_visibility="collapsed",
+        )
+        gid_to_add = options_map[picked_label]
+        already_labeled = gid_to_add in labeled_genes
+        if st.button(
+            "🏷️ Label this gene" if not already_labeled else "Already labeled",
+            key=f"gene_search_confirm_{contrast_key}",
+            disabled=already_labeled,
+        ):
+            labeled_genes[gid_to_add] = dict(_DEFAULT_GENE_LABEL_STYLE)
+            st.success(f"🏷️ Labeled **{gene_name_map.get(gid_to_add, gid_to_add)}** on the plot below.")
+            st.rerun()
 
 
 # Standard 2-circle and 3-circle Venn layout coordinates (unit circles at
@@ -814,6 +1264,583 @@ def _plot_venn(counts, names):
     fig.update_yaxes(visible=False, range=[-1.4, 1.3], scaleanchor="x", scaleratio=1)
     fig.update_layout(height=500, showlegend=False, plot_bgcolor="white")
     return fig
+
+
+# ---------------------------------------------------------------------------
+# QC diagnostic plots
+# ---------------------------------------------------------------------------
+#
+# These plots surface data DESeq2 already computes internally as part of
+# a normal run (dispersion estimates, size factors, sample distances,
+# p-values, mean expression) -- see deseq2_manager.py's module docstring
+# ("QC/diagnostics additions") for what the R script now exports and why.
+# Each one pairs with a plain-language classification/flag from
+# deseq2_manager.py (assess_dispersion_fit, classify_pvalue_histogram_shape,
+# classify_ma_bias, flag_size_factor_outliers, detect_sample_clustering_mismatch)
+# so the user gets an informed read on the plot, not just the raw chart.
+
+def _cluster_order_from_distance_matrix(distance_df):
+    """
+    Compute a hierarchical-clustering leaf order for a square sample
+    distance matrix, for use as the row/column order of the sample
+    distance heatmap -- grouping similar samples adjacently makes any
+    clustering pattern (or lack thereof) far easier to read at a glance
+    than an arbitrary/alphabetical ordering.
+
+    Uses scipy's hierarchical clustering (average linkage) if
+    available; gracefully falls back to the distance matrix's existing
+    (alphabetical) sample order if scipy isn't installed, so this
+    optional enhancement never blocks the heatmap itself from
+    rendering.
+
+    Returns a list of sample names in clustered order.
+    """
+    samples = list(distance_df.index)
+    if len(samples) < 3:
+        return samples
+    try:
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.spatial.distance import squareform
+        # squareform requires a symmetric matrix with an exact-zero
+        # diagonal -- guard against tiny floating-point asymmetry from
+        # R's dist()/CSV round-trip by symmetrizing explicitly first.
+        matrix = distance_df.values
+        matrix = (matrix + matrix.T) / 2
+        import numpy as np
+        np.fill_diagonal(matrix, 0.0)
+        condensed = squareform(matrix, checks=False)
+        Z = linkage(condensed, method="average")
+        order = leaves_list(Z)
+        return [samples[i] for i in order]
+    except Exception:
+        return samples
+
+
+def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, show_group_annotation=True):
+    """
+    Build a sample-to-sample distance heatmap (Euclidean distance on
+    VST-transformed counts), with rows/columns ordered by hierarchical
+    clustering -- the standard companion QC view to PCA, since PCA's
+    first 2-4 components can sometimes miss an outlier or mislabeled
+    sample that a full pairwise distance comparison catches. Darker
+    (lower-distance) cells indicate more similar samples.
+
+    meta_df, group_column: if given (a metadata DataFrame with a
+        "sample" column, and the name of the column to group by), each
+        axis tick label is augmented with that sample's group value
+        (e.g. "sample1 (control)") and a slim color-coded annotation
+        strip is drawn directly above the heatmap, one colored cell per
+        sample, so which samples belong to which group is visible at a
+        glance from color alone -- without the user needing to already
+        recognize every sample name. If either argument is omitted,
+        falls back to plain sample-name-only labels (the original
+        behavior), so this enhancement is fully optional.
+    show_group_annotation: set False to suppress the color-coded strip,
+        legend, and label augmentation entirely -- even if meta_df/
+        group_column are provided -- falling back to plain sample-name
+        labels, same as if those arguments were omitted. This is
+        separate from whether group_column itself is set, so a caller
+        (see render()'s "Hide grouping bar and legend" checkbox) can
+        keep group_column selected for OTHER purposes (e.g. the
+        clustering-mismatch smart flag below the heatmap) while still
+        hiding the visual annotation on the plot itself.
+    """
+    order = _cluster_order_from_distance_matrix(distance_df)
+    ordered_df = distance_df.loc[order, order]
+
+    sample_to_group = {}
+    if show_group_annotation and meta_df is not None and group_column and group_column in meta_df.columns:
+        sample_to_group = dict(
+            zip(meta_df["sample"].astype(str), meta_df[group_column].astype(str))
+        )
+
+    # Build display labels that include each sample's group (when
+    # available), e.g. "sample1 (control)" -- shown on both axes and in
+    # the hover text, so groupings are readable even without the color
+    # strip (colorblind-safe fallback, and useful in the PDF export
+    # where hover text isn't available).
+    if sample_to_group:
+        display_labels = [
+            f"{s} ({sample_to_group.get(s, '?')})" for s in ordered_df.index
+        ]
+    else:
+        display_labels = list(ordered_df.index)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=ordered_df.values,
+        x=display_labels,
+        y=display_labels,
+        colorscale="Blues_r",
+        colorbar=dict(title="Distance", x=1.02),
+        hovertemplate="%{y} vs %{x}<br>Distance: %{z:.1f}<extra></extra>",
+    ))
+
+    if sample_to_group:
+        # --- Color-coded group annotation strip ---
+        # A slim second heatmap trace, one column wide, positioned via
+        # its own x-axis (xaxis2) directly to the right of the main
+        # heatmap -- one colored cell per sample (in the same clustered
+        # order), so which samples share a group is visible purely from
+        # color, at a glance, without reading every label. This mirrors
+        # the standard "annotation sidebar" convention used by
+        # heatmap tools like pheatmap/ComplexHeatmap for exactly this
+        # purpose.
+        groups_in_order = [sample_to_group.get(s, "?") for s in ordered_df.index]
+        unique_groups = sorted(set(groups_in_order))
+        group_to_code = {g: i for i, g in enumerate(unique_groups)}
+        z_strip = [[group_to_code[g]] for g in groups_in_order]
+
+        n_groups = max(len(unique_groups), 1)
+        strip_colors = [
+            _DEFAULT_COLOR_PALETTE[i % len(_DEFAULT_COLOR_PALETTE)] for i in range(n_groups)
+        ]
+        # Build a discrete colorscale (Plotly heatmaps only support
+        # continuous colorscales natively) by giving each integer group
+        # code a hard-edged color band rather than a smooth gradient.
+        if n_groups == 1:
+            colorscale = [[0, strip_colors[0]], [1, strip_colors[0]]]
+        else:
+            colorscale = []
+            for i, color in enumerate(strip_colors):
+                colorscale.append([i / n_groups, color])
+                colorscale.append([(i + 1) / n_groups, color])
+
+        fig.add_trace(go.Heatmap(
+            z=z_strip,
+            x=["Group"],
+            y=display_labels,
+            xaxis="x2",
+            colorscale=colorscale,
+            zmin=0, zmax=n_groups,
+            showscale=False,
+            text=[[g] for g in groups_in_order],
+            hovertemplate="%{y}<br>Group: %{text}<extra></extra>",
+        ))
+
+        fig.update_layout(
+            xaxis=dict(domain=[0, 0.94], tickangle=-45),
+            xaxis2=dict(domain=[0.96, 1.0], side="top"),
+        )
+
+        # Manual legend (since the annotation strip's own colorbar is
+        # hidden above via showscale=False -- a discrete legend reads
+        # far more clearly here than a continuous color axis for a
+        # handful of category labels) -- one invisible-marker scatter
+        # trace per group, purely so its name/color shows up in the
+        # figure's standard legend. Positioned INSIDE the plot area's
+        # bottom-right corner by default (rather than Plotly's default
+        # right-of-figure placement), since the main heatmap's colorbar
+        # already occupies that space just outside the right edge --
+        # stacking a right-side legend directly under/beside it there
+        # looked crowded. The user's own style panel choice (see
+        # _apply_plot_style's "legend_position" handling) still
+        # overrides this if they pick something else.
+        fig.update_layout(legend=dict(
+            yanchor="bottom", y=0.01, xanchor="right", x=0.99,
+            bgcolor="rgba(255,255,255,0.7)", bordercolor="rgba(0,0,0,0.2)", borderwidth=1,
+        ))
+        for group_name, color in zip(unique_groups, strip_colors):
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers",
+                marker=dict(size=10, color=color),
+                name=str(group_name),
+                showlegend=True,
+            ))
+    else:
+        fig.update_layout(xaxis=dict(tickangle=-45))
+
+    fig.update_layout(height=550)
+    return fig
+
+
+def _plot_dispersion(dispersion_df):
+    """
+    Build DESeq2's standard dispersion diagnostic plot (equivalent to
+    plotDispEsts in R): each gene's raw gene-wise dispersion estimate
+    (light gray points) plotted against its mean expression, the fitted
+    mean-dispersion trend line DESeq2 estimated across all genes (solid
+    line), and the final shrunken dispersion value actually used in the
+    statistical test (colored points) -- so the user can see both how
+    much shrinkage was applied and whether the overall trend looks like
+    a reasonable fit for this dataset.
+
+    Both axes are log-scaled, matching the standard convention for this
+    plot (dispersion and mean expression both span several orders of
+    magnitude).
+    """
+    df = dispersion_df.dropna(subset=["baseMean"]).copy()
+    df = df[df["baseMean"] > 0]
+
+    fig = go.Figure()
+
+    gene_est = df.dropna(subset=["dispGeneEst"])
+    gene_est = gene_est[gene_est["dispGeneEst"] > 0]
+    fig.add_trace(go.Scatter(
+        x=gene_est["baseMean"], y=gene_est["dispGeneEst"],
+        mode="markers", name="Gene-wise estimate",
+        marker=dict(size=4, color="#B0B0B0", opacity=0.5),
+        text=gene_est["gene_id"],
+        hovertemplate="%{text}<br>Mean expression: %{x:.1f}<br>Gene-wise dispersion: %{y:.4f}<extra></extra>",
+    ))
+
+    fitted = df.dropna(subset=["dispFit"]).sort_values("baseMean")
+    fitted = fitted[fitted["dispFit"] > 0]
+    fig.add_trace(go.Scatter(
+        x=fitted["baseMean"], y=fitted["dispFit"],
+        mode="lines", name="Fitted trend",
+        line=dict(color="#d62728", width=2),
+    ))
+
+    final = df.dropna(subset=["dispersion"])
+    final = final[final["dispersion"] > 0]
+    fig.add_trace(go.Scatter(
+        x=final["baseMean"], y=final["dispersion"],
+        mode="markers", name="Final (shrunk) estimate",
+        marker=dict(size=4, color="#1f77b4", opacity=0.6),
+        text=final["gene_id"],
+        hovertemplate="%{text}<br>Mean expression: %{x:.1f}<br>Final dispersion: %{y:.4f}<extra></extra>",
+    ))
+
+    fig.update_xaxes(title_text="Mean of normalized counts", type="log")
+    fig.update_yaxes(title_text="Dispersion", type="log")
+    fig.update_layout(height=500)
+    return fig
+
+
+def _plot_pvalue_histogram(pvalue_shape_result, bar_color="#636EFA"):
+    """
+    Build a bar-chart histogram of a contrast's p-value distribution,
+    using the same bin counts/edges already computed by
+    deseq2_manager.classify_pvalue_histogram_shape() -- so the plotted
+    chart and its accompanying plain-language classification/flag are
+    guaranteed to describe the exact same data.
+
+    bar_color: the bars' fill color. The trace is given the name
+        "P-values" specifically so _apply_plot_style's color_map
+        (matched by trace name -- see _render_plot_style_controls'
+        per-group color pickers) can recolor it like any other plot in
+        this workspace, even though a histogram only has a single
+        "group" rather than multiple colored series.
+    """
+    counts = pvalue_shape_result["counts"]
+    bin_edges = pvalue_shape_result["bin_edges"]
+    bin_centers = [(bin_edges[i] + bin_edges[i + 1]) / 2 for i in range(len(counts))]
+    bin_width = bin_edges[1] - bin_edges[0] if len(bin_edges) > 1 else 0.05
+
+    fig = go.Figure(data=go.Bar(
+        x=bin_centers, y=counts, width=bin_width * 0.95,
+        name="P-values",
+        marker=dict(color=bar_color),
+        hovertemplate="p-value: %{x:.2f}<br>Gene count: %{y}<extra></extra>",
+    ))
+    fig.update_xaxes(title_text="p-value", range=[0, 1])
+    fig.update_yaxes(title_text="Number of genes")
+    fig.update_layout(height=400, showlegend=False)
+    return fig
+
+
+def _plot_ma(results_df, padj_threshold=0.05, lfc_threshold=1.0, gene_name_map=None):
+    """
+    Build an MA plot (mean expression vs. log2 fold change), using the
+    exact same up/down/not-significant classification and color scheme
+    as the volcano plot (via dm.classify_regulation), so the two plots'
+    legends/colors always agree with each other. Where the volcano plot
+    answers "which genes changed and by how much", the MA plot is the
+    correct diagnostic for whether normalization worked: a healthy MA
+    plot is roughly symmetric around log2FoldChange = 0 across the full
+    range of expression -- systematic drift specifically among
+    low-expression genes usually indicates a normalization or
+    compositional issue that the volcano plot alone can't reveal (see
+    deseq2_manager.classify_ma_bias for the accompanying plain-language
+    check).
+
+    Mean expression (baseMean) is shown on a log-scaled x-axis, the
+    standard convention for this plot.
+
+    Returns the figure only (no separate "df" return value needed here,
+    since this reuses results_df directly rather than building its own
+    filtered/derived copy the way _plot_volcano does for gene labeling).
+    """
+    df = results_df.dropna(subset=["baseMean", "log2FoldChange"]).copy()
+    df = df[df["baseMean"] > 0]
+    df["direction"] = dm.classify_regulation(df, padj_threshold, lfc_threshold)
+
+    gene_name_map = gene_name_map or {}
+    df["display_name"] = df["gene_id"].astype(str).map(lambda g: gene_name_map.get(g, g))
+
+    fig = go.Figure()
+    for label, color in [
+        ("Up-regulated", "#d62728"),
+        ("Down-regulated", "#1f77b4"),
+        ("Not significant", "#7f7f7f"),
+    ]:
+        subset = df[df["direction"] == label]
+        fig.add_trace(go.Scatter(
+            x=subset["baseMean"], y=subset["log2FoldChange"],
+            mode="markers",
+            name=label,
+            marker=dict(size=5, color=color, opacity=0.5),
+            text=subset["display_name"],
+            hovertemplate="%{text}<br>Mean expression: %{x:.1f}<br>log2FC: %{y:.2f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+
+    fig.update_xaxes(title_text="Mean of normalized counts", type="log")
+    fig.update_yaxes(title_text="log2 Fold Change")
+    fig.update_layout(height=500)
+    return fig
+
+
+def _cluster_order_generic(matrix_df, axis=0):
+    """
+    Compute a hierarchical-clustering leaf order for either the rows
+    (axis=0) or columns (axis=1) of an arbitrary numeric DataFrame,
+    using average-linkage on Euclidean distance -- the same clustering
+    approach as _cluster_order_from_distance_matrix, generalized to a
+    non-square matrix (e.g. genes x samples) rather than requiring a
+    pre-computed square distance matrix.
+
+    Gracefully falls back to the existing (unclustered) order if scipy
+    isn't installed or clustering otherwise fails, so this is always
+    safe to call.
+
+    Returns a list of labels (row or column names) in clustered order.
+    """
+    labels = list(matrix_df.index) if axis == 0 else list(matrix_df.columns)
+    if len(labels) < 3:
+        return labels
+    try:
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        data = matrix_df.values if axis == 0 else matrix_df.values.T
+        Z = linkage(data, method="average", metric="euclidean")
+        order = leaves_list(Z)
+        return [labels[i] for i in order]
+    except Exception:
+        return labels
+
+
+def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_top=25,
+                             meta_df=None, group_column=None, group_samples=True):
+    """
+    Build a z-scored expression heatmap of the top N most significant
+    genes (by adjusted p-value) from the current contrast, across every
+    sample in the project -- the third of the standard "big three"
+    RNA-seq QC/results plots (alongside the volcano and MA plots).
+    Where the volcano/MA plots show WHICH genes are significant and by
+    how much, this shows what those genes' ACTUAL expression pattern
+    looks like across every sample -- a genuine sanity check that the
+    statistical hits correspond to a believable biological pattern
+    (e.g. do they separate samples the way you'd expect?), and a chance
+    to spot subgroups or residual structure the model didn't fully
+    absorb.
+
+    Values are log2(x+1) transformed, then each gene (row) is z-scored
+    -- mean 0, unit variance -- ACROSS SAMPLES, so genes with very
+    different absolute expression levels sit on a comparable color
+    scale (standard practice for this type of heatmap; otherwise a
+    handful of very highly expressed genes would visually dominate the
+    whole plot regardless of how interesting their pattern actually
+    is). Rows (genes) are always reordered by hierarchical clustering,
+    so genes with similar patterns end up adjacent to each other.
+
+    norm_counts_df: the project's full normalized counts table (see
+        deseq2_manager.read_normalized_counts) -- columns: gene_id,
+        then one column per sample.
+    results_df: the current contrast's results table (needs gene_id
+        and padj columns) -- used only to rank/select which genes are
+        "top".
+    n_top: how many top genes (by smallest padj) to include.
+
+    meta_df, group_column: if given (a metadata DataFrame with a
+        "sample" column, and the name of the column to group by), each
+        sample's group is appended to its column label (e.g. "sample1
+        (control)"), and a color-coded annotation strip is drawn just
+        above the sample columns -- the same convention already used
+        by _plot_sample_distance_heatmap -- so it's visually obvious
+        which samples belong to which group without needing to
+        recognize every sample name.
+    group_samples: if True (the default) AND a group_column is given,
+        samples are physically ordered by group FIRST (grouped
+        together, in the group's first-seen order in meta_df), with
+        hierarchical clustering only used to order samples WITHIN each
+        group -- directly answering "do my top genes actually separate
+        my experimental groups?" by literally placing each group's
+        samples together rather than letting pure expression
+        similarity potentially interleave them. Set False to instead
+        order every sample by pure expression-similarity clustering
+        across the whole dataset, ignoring group membership entirely
+        (useful if you specifically want to check whether clustering
+        recovers your groups on its own, without them being forced
+        together).
+
+    Returns (fig, z_df) -- the figure AND the z-scored matrix itself
+    (genes x samples, in the final displayed order, gene_id as the
+    index) so the caller can offer it as a downloadable CSV.
+    """
+    import numpy as np
+
+    ranked = results_df.dropna(subset=["padj"]).sort_values("padj")
+    top_gene_ids = ranked["gene_id"].astype(str).head(n_top).tolist()
+
+    norm_counts_indexed = norm_counts_df.set_index(norm_counts_df["gene_id"].astype(str))
+    sample_cols = [c for c in norm_counts_df.columns if c != "gene_id"]
+
+    available_ids = [g for g in top_gene_ids if g in norm_counts_indexed.index]
+    subset = norm_counts_indexed.loc[available_ids, sample_cols].astype(float)
+
+    log_subset = np.log2(subset + 1)
+    row_mean = log_subset.mean(axis=1)
+    row_std = log_subset.std(axis=1).replace(0, 1)  # avoid divide-by-zero for a rare constant-expression gene
+    z_df = log_subset.sub(row_mean, axis=0).div(row_std, axis=0)
+
+    gene_order = _cluster_order_generic(z_df, axis=0)
+
+    # sample_to_group is only built when group_samples is True -- when the
+    # user checks "Ignore grouping" (group_samples=False), this stays empty
+    # on purpose, so every "if sample_to_group:" block below (display
+    # labels, the color-coded annotation strip, and its legend) correctly
+    # skips rendering entirely. Showing a group-colored strip/legend next
+    # to samples that were explicitly ordered WITHOUT regard to group
+    # membership would be misleading (the colors would appear scattered
+    # rather than blocked, since that's the whole point of this mode).
+    sample_to_group = {}
+    if group_samples and meta_df is not None and group_column and group_column in meta_df.columns:
+        sample_to_group = dict(
+            zip(meta_df["sample"].astype(str), meta_df[group_column].astype(str))
+        )
+
+    if sample_to_group and group_samples:
+        # --- Group samples together, cluster only WITHIN each group ---
+        # Groups are ordered by first appearance in meta_df (usually
+        # matches the order the user entered/uploaded their metadata,
+        # e.g. control before treated) rather than alphabetically,
+        # which can otherwise produce a counter-intuitive order (e.g.
+        # "treated" before "control" alphabetically).
+        seen_groups = []
+        for s in z_df.columns:
+            g = sample_to_group.get(s)
+            if g is not None and g not in seen_groups:
+                seen_groups.append(g)
+
+        sample_order = []
+        for g in seen_groups:
+            members = [s for s in z_df.columns if sample_to_group.get(s) == g]
+            if len(members) >= 3:
+                sub_order = _cluster_order_generic(z_df[members], axis=1)
+            else:
+                sub_order = members
+            sample_order.extend(sub_order)
+        # Any sample with no group mapping (shouldn't normally happen)
+        # is appended at the end rather than silently dropped.
+        ungrouped = [s for s in z_df.columns if s not in sample_order]
+        sample_order.extend(ungrouped)
+    else:
+        # No group column available, or the user opted for pure
+        # expression-based clustering across the whole dataset.
+        sample_order = _cluster_order_generic(z_df, axis=1)
+
+    z_df = z_df.loc[gene_order, sample_order]
+
+    gene_name_map = gene_name_map or {}
+    display_gene_labels = [gene_name_map.get(g, g) for g in z_df.index]
+
+    if sample_to_group:
+        display_sample_labels = [
+            f"{s} ({sample_to_group.get(s, '?')})" for s in z_df.columns
+        ]
+    else:
+        display_sample_labels = list(z_df.columns)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z_df.values,
+        x=display_sample_labels,
+        y=display_gene_labels,
+        colorscale="RdBu_r",
+        zmid=0,
+        colorbar=dict(title="Z-score", x=1.08),
+        hovertemplate="Gene: %{y}<br>Sample: %{x}<br>Z-score: %{z:.2f}<extra></extra>",
+    ))
+
+    n_genes = len(z_df.index)
+    fig_height = max(400, 22 * n_genes)
+
+    if sample_to_group:
+        # --- Color-coded group annotation strip, above the columns ---
+        # A slim second heatmap trace spanning one row, positioned via
+        # its own y-axis (yaxis2) directly above the main heatmap --
+        # one colored cell per sample (in the same group-then-cluster
+        # order as the main heatmap), so which samples share a group is
+        # visible purely from color, at a glance. Mirrors the same
+        # "annotation sidebar" convention already used by
+        # _plot_sample_distance_heatmap, just rotated 90 degrees since
+        # here the samples are COLUMNS rather than rows.
+        groups_in_order = [sample_to_group.get(s, "?") for s in z_df.columns]
+        unique_groups = seen_groups if (sample_to_group and group_samples) else sorted(set(groups_in_order))
+        group_to_code = {g: i for i, g in enumerate(unique_groups)}
+        z_strip = [[group_to_code.get(g, 0) for g in groups_in_order]]
+
+        n_groups = max(len(unique_groups), 1)
+        strip_colors = [
+            _DEFAULT_COLOR_PALETTE[i % len(_DEFAULT_COLOR_PALETTE)] for i in range(n_groups)
+        ]
+        if n_groups == 1:
+            colorscale = [[0, strip_colors[0]], [1, strip_colors[0]]]
+        else:
+            colorscale = []
+            for i, color in enumerate(strip_colors):
+                colorscale.append([i / n_groups, color])
+                colorscale.append([(i + 1) / n_groups, color])
+
+        fig.add_trace(go.Heatmap(
+            z=z_strip,
+            x=display_sample_labels,
+            y=["Group"],
+            yaxis="y2",
+            colorscale=colorscale,
+            zmin=0, zmax=n_groups,
+            showscale=False,
+            text=[groups_in_order],
+            hovertemplate="%{x}<br>Group: %{text}<extra></extra>",
+        ))
+
+        # Reserve a slim band at the top of the figure for the strip
+        # (yaxis2, above) and give the main heatmap the rest (yaxis,
+        # below) -- domains are fractions of the TOTAL figure height,
+        # so a fixed ~30px-equivalent band works reasonably regardless
+        # of how many genes are shown.
+        strip_fraction = min(0.12, 30 / fig_height)
+        fig.update_layout(
+            yaxis=dict(domain=[0, 1 - strip_fraction - 0.02]),
+            yaxis2=dict(domain=[1 - strip_fraction, 1], showticklabels=True),
+            xaxis=dict(tickangle=-45),
+        )
+
+        # Manual legend (discrete group labels read more clearly here
+        # than the strip's own hidden color axis) -- one invisible-
+        # marker scatter trace per group, purely so its name/color
+        # shows up in the figure's standard legend. Positioned INSIDE
+        # the main heatmap's bottom-right corner by default (rather
+        # than Plotly's default right-of-figure placement, which sits
+        # directly under/beside the colorbar occupying that space
+        # already) -- the user's own style panel choice still overrides
+        # this if they pick something else (see _apply_plot_style).
+        fig.update_layout(legend=dict(
+            yanchor="bottom", y=0.01, xanchor="right", x=0.99,
+            bgcolor="rgba(255,255,255,0.7)", bordercolor="rgba(0,0,0,0.2)", borderwidth=1,
+        ))
+        for group_name, color in zip(unique_groups, strip_colors):
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers",
+                marker=dict(size=10, color=color),
+                name=str(group_name),
+                showlegend=True,
+            ))
+    else:
+        fig.update_layout(xaxis=dict(tickangle=-45))
+
+    fig.update_layout(height=fig_height)
+    return fig, z_df
 
 
 # ---------------------------------------------------------------------------
@@ -1664,8 +2691,8 @@ def render():
         st.error("⚠️ Could not find the counts matrix or metadata file for this project.")
         return
 
-    counts_df = pd.read_csv(counts_matrix_path)
-    meta_df = pd.read_csv(metadata_path)
+    counts_df = _load_counts_df(counts_matrix_path)
+    meta_df = _load_meta_df(metadata_path)
 
     st.success(f"✅ Using counts matrix ({len(counts_df):,} genes) and metadata ({len(meta_df)} samples) from project `{project}`.")
 
@@ -1777,7 +2804,7 @@ def render():
             "statistically in your results, via the design formula)."
         )
 
-    pca_df, pct_var = dm.read_pca_coordinates(deseq2_out_dir)
+    pca_df, pct_var = _load_pca_coordinates(deseq2_out_dir)
     if pca_df is not None:
         color_options = [c for c in pca_df.columns if c not in ("PC1", "PC2", "PC3", "PC4", "sample")]
         color_by = st.selectbox("Color points by:", options=color_options, key="pca_color_select")
@@ -1785,7 +2812,7 @@ def render():
 
         pca_adj_df, pct_var_adj = (None, None)
         if batch_column:
-            pca_adj_df, pct_var_adj = dm.read_pca_coordinates(deseq2_out_dir, batch_adjusted=True)
+            pca_adj_df, pct_var_adj = _load_pca_coordinates(deseq2_out_dir, batch_adjusted=True)
 
         if pca_adj_df is not None:
             st.info(
@@ -1802,37 +2829,52 @@ def render():
                 "either one (e.g. drop \"(Visualization Only)\") if you "
                 "prefer."
             )
-            col_before, col_after = st.columns(2)
-            with col_before:
-                st.markdown("#### 🔹 Before Batch Correction")
-                fig_before = _plot_pca(pca_df, pct_var, color_by)
-                pca_before_style = _render_plot_style_controls("pca_before", group_values=group_values)
-                _apply_plot_style(
-                    fig_before, pca_before_style,
-                    default_title="PCA: Sample Similarity — Before Batch Correction",
-                )
-                _render_plotly_chart(fig_before)
-                _render_pdf_export(fig_before, "pca_before", "pca_before_batch_correction")
-                _render_csv_download(
-                    pca_df, "pca_coordinates_before_batch_correction", "pca_before",
-                    expander_label="⬇️ Download PCA Coordinates (Before).csv",
-                    help_text="Every sample's PC1-PC4 coordinates plus every metadata column available for coloring. Percent variance explained and batch-effect size are in the QC summary download below.",
-                )
-            with col_after:
-                st.markdown("#### 🔸 After Batch Correction")
-                fig_after = _plot_pca(pca_adj_df, pct_var_adj, color_by)
-                pca_after_style = _render_plot_style_controls("pca_after", group_values=group_values)
-                _apply_plot_style(
-                    fig_after, pca_after_style,
-                    default_title="PCA: Sample Similarity — After Batch Correction (Visualization Only)",
-                )
-                _render_plotly_chart(fig_after)
-                _render_pdf_export(fig_after, "pca_after", "pca_after_batch_correction")
-                _render_csv_download(
-                    pca_adj_df, "pca_coordinates_after_batch_correction", "pca_after",
-                    expander_label="⬇️ Download PCA Coordinates (After).csv",
-                    help_text="Every sample's batch-adjusted PC1-PC4 coordinates (visualization only) plus every metadata column available for coloring.",
-                )
+            # Stacked vertically (rather than side-by-side columns) so
+            # each PCA plot has full width to breathe -- two narrow
+            # half-width plots side by side made both harder to read,
+            # especially once group labels/legends/confidence ellipses
+            # are added.
+            st.markdown("#### 🔹 Before Batch Correction")
+            show_ellipse_before, confidence_before = _render_confidence_ellipse_controls("pca_before")
+            fig_before, ellipse_stats_before = _plot_pca(
+                pca_df, pct_var, color_by,
+                show_confidence_ellipse=show_ellipse_before, confidence_level=confidence_before,
+            )
+            pca_before_style = _render_plot_style_controls("pca_before", group_values=group_values)
+            _apply_plot_style(
+                fig_before, pca_before_style,
+                default_title="PCA: Sample Similarity — Before Batch Correction",
+            )
+            _render_plotly_chart(fig_before)
+            _render_ellipse_stats(ellipse_stats_before, "pca_before")
+            _render_pdf_export(fig_before, "pca_before", "pca_before_batch_correction")
+            _render_csv_download(
+                pca_df, "pca_coordinates_before_batch_correction", "pca_before",
+                expander_label="⬇️ Download PCA Coordinates (Before).csv",
+                help_text="Every sample's PC1-PC4 coordinates plus every metadata column available for coloring. Percent variance explained and batch-effect size are in the QC summary download below.",
+            )
+
+            st.markdown("---")
+
+            st.markdown("#### 🔸 After Batch Correction")
+            show_ellipse_after, confidence_after = _render_confidence_ellipse_controls("pca_after")
+            fig_after, ellipse_stats_after = _plot_pca(
+                pca_adj_df, pct_var_adj, color_by,
+                show_confidence_ellipse=show_ellipse_after, confidence_level=confidence_after,
+            )
+            pca_after_style = _render_plot_style_controls("pca_after", group_values=group_values)
+            _apply_plot_style(
+                fig_after, pca_after_style,
+                default_title="PCA: Sample Similarity — After Batch Correction (Visualization Only)",
+            )
+            _render_plotly_chart(fig_after)
+            _render_ellipse_stats(ellipse_stats_after, "pca_after")
+            _render_pdf_export(fig_after, "pca_after", "pca_after_batch_correction")
+            _render_csv_download(
+                pca_adj_df, "pca_coordinates_after_batch_correction", "pca_after",
+                expander_label="⬇️ Download PCA Coordinates (After).csv",
+                help_text="Every sample's batch-adjusted PC1-PC4 coordinates (visualization only) plus every metadata column available for coloring.",
+            )
 
             # --- Additional QC insights from the batch correction ---
             st.markdown("##### 📐 Batch-Correction QC Insights")
@@ -1884,10 +2926,15 @@ def render():
                 )
         else:
             st.markdown("#### PCA: Sample Similarity")
-            fig_single = _plot_pca(pca_df, pct_var, color_by)
+            show_ellipse_single, confidence_single = _render_confidence_ellipse_controls("pca_single")
+            fig_single, ellipse_stats_single = _plot_pca(
+                pca_df, pct_var, color_by,
+                show_confidence_ellipse=show_ellipse_single, confidence_level=confidence_single,
+            )
             pca_single_style = _render_plot_style_controls("pca_single", group_values=group_values)
             _apply_plot_style(fig_single, pca_single_style, default_title="PCA: Sample Similarity")
             _render_plotly_chart(fig_single)
+            _render_ellipse_stats(ellipse_stats_single, "pca_single")
             _render_pdf_export(fig_single, "pca_single", "pca_sample_similarity")
 
             single_qc_rows = [
@@ -1910,15 +2957,188 @@ def render():
 
     st.markdown("---")
 
+    # --- Sample-to-sample distance heatmap (companion QC view to PCA) ---
+    st.subheader("🌡️ Sample Distance Heatmap")
+    with st.expander("ℹ️ How to read this plot"):
+        st.markdown(
+            "This is the standard companion view to the PCA plot above: "
+            "every pair of samples is compared directly (using the same "
+            "variance-stabilized data as PCA), rather than only looking "
+            "at the first few principal components. Samples are grouped "
+            "by similarity (hierarchical clustering) so any expected -- "
+            "or unexpected -- grouping is easy to spot at a glance. "
+            "Darker cells mean more similar samples. Each sample's group "
+            "(picked below) is also shown as a colored strip alongside "
+            "the heatmap and appended to its label, so groupings are "
+            "readable even without recognizing every sample name."
+        )
+
+    distance_df = _load_sample_distance_matrix(deseq2_out_dir)
+    if distance_df is not None:
+        # --- Pick which metadata column to color/label samples by ---
+        # Shown BEFORE building the heatmap figure (rather than after,
+        # like the clustering-mismatch check below) since this same
+        # selection now drives the heatmap's own color strip and axis
+        # labels, not just the mismatch check.
+        heatmap_group_columns = [c for c in meta_df.columns if c != "sample"]
+        default_group_index = 0
+        if saved_config.get("design_columns") and saved_config["design_columns"][0] in heatmap_group_columns:
+            default_group_index = heatmap_group_columns.index(saved_config["design_columns"][0])
+        heatmap_group_column = None
+        heatmap_show_group_annotation = True
+        if heatmap_group_columns:
+            col_group_select, col_hide_annotation = st.columns([2, 1.2])
+            with col_group_select:
+                heatmap_group_column = st.selectbox(
+                    "Color/label samples by which metadata column?",
+                    options=heatmap_group_columns,
+                    index=default_group_index,
+                    key="sample_dist_check_column",
+                    help="Colors a strip alongside the heatmap and appends this column's value to each sample's label, so groupings are visible at a glance -- also used below to flag any sample whose closest match is in a different group.",
+                )
+            with col_hide_annotation:
+                heatmap_show_group_annotation = not st.checkbox(
+                    "Hide grouping bar and legend",
+                    value=False,
+                    key="sample_dist_hide_group_annotation",
+                    help="Removes the color-coded strip and legend from the plot below, showing plain sample names instead -- the metadata column selected above is still used for the clustering-mismatch check further down.",
+                )
+
+        dist_fig = _plot_sample_distance_heatmap(
+            distance_df, meta_df=meta_df, group_column=heatmap_group_column,
+            show_group_annotation=heatmap_show_group_annotation,
+        )
+        dist_style = _render_plot_style_controls("sample_dist", group_values=None, show_legend_controls=False)
+        _apply_plot_style(dist_fig, dist_style, default_title="Sample-to-Sample Distance")
+        _render_plotly_chart(dist_fig)
+        _render_pdf_export(dist_fig, "sample_dist", "sample_distance_heatmap")
+
+        # --- Smart flag: does any sample's nearest neighbor belong to a different group? ---
+        if heatmap_group_column:
+            mismatches = dm.detect_sample_clustering_mismatch(distance_df, meta_df, heatmap_group_column)
+            if mismatches:
+                mismatch_lines = "\n".join(
+                    f"- **{m['sample']}** (`{heatmap_group_column}` = {m['own_group']}) is most similar to "
+                    f"**{m['nearest_neighbor']}** (`{heatmap_group_column}` = {m['neighbor_group']})"
+                    for m in mismatches
+                )
+                st.warning(
+                    f"⚠️ **{len(mismatches)} sample(s)** cluster more closely with a "
+                    f"*different* `{heatmap_group_column}` group than their own:\n\n{mismatch_lines}\n\n"
+                    "This doesn't necessarily mean something is wrong -- but it's "
+                    "worth double-checking these samples' labeling, or considering "
+                    "whether they should be excluded, especially if this doesn't "
+                    "match your experimental expectations."
+                )
+            else:
+                st.success(f"✅ Every sample's closest match shares its own `{heatmap_group_column}` group -- no clustering surprises.")
+
+        _render_csv_download(
+            distance_df.reset_index(), "sample_distance_matrix", "sample_dist",
+            expander_label="⬇️ Download Sample Distance Matrix (.csv)",
+            help_text="The full sample x sample Euclidean distance matrix (computed on variance-stabilized counts).",
+        )
+    else:
+        st.info("Sample distance data isn't available for this project yet -- re-run DESeq2 above to generate it.")
+
+    st.markdown("---")
+
+    # --- Model-fit diagnostics: dispersion plot + size factor QC ---
+    st.subheader("🔧 Model Fit Diagnostics")
+
+    dispersion_df = _load_dispersion_estimates(deseq2_out_dir)
+    if dispersion_df is not None:
+        with st.expander("ℹ️ How to read this plot"):
+            st.markdown(
+                "DESeq2 estimates how much each gene's counts vary "
+                "across your samples beyond simple random (Poisson) "
+                "noise -- this is its **dispersion**. Because per-gene "
+                "estimates (gray points) are unreliable with typical "
+                "sample sizes, DESeq2 shrinks them toward a fitted trend "
+                "(red line) shared across all genes, producing the final "
+                "values (blue points) actually used in the statistical "
+                "test. Most genes scattering loosely around the trend is "
+                "completely normal -- this plot (and the flag below) is "
+                "only meant to catch an unusually poor overall fit."
+            )
+        disp_fig = _plot_dispersion(dispersion_df)
+        disp_style = _render_plot_style_controls("dispersion", group_values=None, show_legend_controls=True)
+        _apply_plot_style(disp_fig, disp_style, default_title="Dispersion Estimates")
+        _render_plotly_chart(disp_fig)
+        _render_pdf_export(disp_fig, "dispersion", "dispersion_estimates")
+
+        fit_assessment = dm.assess_dispersion_fit(dispersion_df)
+        if fit_assessment["flagged"]:
+            st.warning(fit_assessment["message"])
+        else:
+            st.success(fit_assessment["message"])
+
+        _render_csv_download(
+            dispersion_df, "dispersion_estimates", "dispersion",
+            expander_label="⬇️ Download Dispersion Estimates (.csv)",
+            help_text="Per-gene mean expression, gene-wise dispersion estimate, fitted trend value, and final (shrunk) dispersion used in the statistical test.",
+        )
+    else:
+        st.info("Dispersion data isn't available for this project yet -- re-run DESeq2 above to generate it.")
+
+    size_factor_df = _load_size_factors(deseq2_out_dir)
+    if size_factor_df is not None:
+        st.markdown("##### ⚖️ Size Factors (Normalization QC)")
+        st.caption(
+            "DESeq2's per-sample normalization factors -- these correct "
+            "for differences in sequencing depth/composition between "
+            "samples before any comparison is made. A size factor far "
+            "from the others can indicate a failed, degraded, or "
+            "unusually composed library."
+        )
+        st.dataframe(size_factor_df, use_container_width=True, hide_index=True)
+
+        sf_outliers = dm.flag_size_factor_outliers(size_factor_df)
+        if sf_outliers["flagged_samples"]:
+            outlier_lines = "\n".join(
+                f"- **{o['sample']}**: size factor {o['size_factor']} "
+                f"({o['ratio_to_median']}x the median of {sf_outliers['median_size_factor']})"
+                for o in sf_outliers["flagged_samples"]
+            )
+            st.warning(
+                f"⚠️ **{len(sf_outliers['flagged_samples'])} sample(s)** have "
+                f"a size factor notably different from the rest:\n\n{outlier_lines}\n\n"
+                "Consider double-checking these samples' sequencing depth "
+                "and library quality."
+            )
+        else:
+            st.success("✅ All samples' size factors are within a reasonable range of each other.")
+
+        _render_csv_download(
+            size_factor_df, "size_factors", "size_factors",
+            expander_label="⬇️ Download Size Factors (.csv)",
+        )
+    else:
+        st.info("Size factor data isn't available for this project yet -- re-run DESeq2 above to generate it.")
+
+    st.markdown("---")
+
     # --- Per-contrast results + volcano ---
     st.subheader("📊 Results by Contrast")
 
-    gene_name_map = _render_gene_id_mapping_panel(project, counts_df)
-
     selected_contrast = st.selectbox("Select a contrast to view:", options=available_contrasts, key="view_contrast_select")
 
-    results_df = dm.read_contrast_results(deseq2_out_dir, selected_contrast)
+    results_df = _load_contrast_results(deseq2_out_dir, selected_contrast)
     if results_df is not None:
+        # --- Gene ID -> Gene Name Mapping + significance/fold-change
+        # thresholds, placed directly together right above the volcano
+        # plot -- both of these most directly shape what the volcano plot
+        # actually shows (readable gene names in hover/labels, and the
+        # dashed threshold lines + up/down/not-significant coloring), so
+        # they live right next to it rather than further up the page.
+        gene_name_map = _render_gene_id_mapping_panel(project, counts_df)
+
+        st.caption(
+            "The two thresholds below set the volcano plot's dashed "
+            "threshold lines and coloring (and are also reused further "
+            "down for the MA plot's coloring and the results table's "
+            "Regulation column)."
+        )
         padj_cutoff = st.slider("Significance threshold (adjusted p-value):", 0.01, 0.20, 0.05, step=0.01, key="padj_slider")
         lfc_cutoff = st.slider("Minimum |log2 fold change|:", 0.0, 4.0, 1.0, step=0.1, key="lfc_slider")
 
@@ -1940,16 +3160,17 @@ def render():
             default_title=f"Volcano Plot: {selected_contrast}",
         )
 
-        # --- Gene labeling: "Label All" + per-gene style controls ---
+        # --- Gene labeling: "Label All" + search + per-gene style controls ---
         # Built (and its resulting annotations attached to volcano_fig)
         # BEFORE the chart is rendered below, so labels added on a
-        # previous run/rerun show up immediately. Newly CLICKED genes
-        # are handled just after rendering (see the on_select handling
-        # below it), since a click's result is only available as
-        # st.plotly_chart's return value -- that discovery triggers one
-        # extra st.rerun() so the clicked gene's label appears using
-        # the same code path as everything else, keeping this logic in
-        # one place rather than duplicated.
+        # previous run/rerun (including via the search box inside
+        # _render_gene_label_controls) show up immediately. Newly
+        # CLICKED genes are handled just after rendering (see the
+        # on_select handling below it), since a click's result is only
+        # available as st.plotly_chart's return value -- that discovery
+        # triggers one extra st.rerun() so the clicked gene's label
+        # appears using the same code path as everything else, keeping
+        # this logic in one place rather than duplicated.
         labeled_genes, sig_gene_ids = _render_gene_label_controls(
             selected_contrast, volcano_df, gene_name_map=gene_name_map,
         )
@@ -1959,8 +3180,10 @@ def render():
 
         st.caption(
             "💡 Tip: click any point on the chart below to add a label "
-            "for that gene. Drag any label to reposition it -- its "
-            "arrow will keep pointing at the correct dot."
+            "for that gene, or use the search box above to find and "
+            "label a gene by ID/symbol regardless of where it falls on "
+            "the plot. Drag any label to reposition it -- its arrow "
+            "will keep pointing at the correct dot."
         )
         selection_event = st.plotly_chart(
             volcano_fig, use_container_width=True, config=_PLOTLY_CHART_CONFIG,
@@ -1988,6 +3211,204 @@ def render():
             st.rerun()
 
         _render_pdf_export(volcano_fig, f"volcano_{selected_contrast}", f"volcano_{selected_contrast}")
+
+        st.markdown("---")
+
+        # --- MA plot: the correct diagnostic for normalization issues ---
+        # Reuses the exact same padj_cutoff/lfc_cutoff (and gene_name_map)
+        # already set above via the sliders next to the volcano plot, so
+        # this plot's coloring/hover names always match your current
+        # selection with no separate controls needed here.
+        st.markdown("##### 📉 MA Plot")
+        with st.expander("ℹ️ How to read this plot, and why it's different from the volcano plot"):
+            st.markdown(
+                "The volcano plot above answers "
+                "**\"which genes changed, and by how much?\"**. This plot "
+                "answers a different question: **\"did normalization work "
+                "correctly across the full range of expression levels?\"** "
+                "A healthy MA plot is roughly symmetric around "
+                "log2FoldChange = 0 at every expression level (x-axis). "
+                "Genes systematically drifting away from zero "
+                "specifically at LOW expression levels usually signals a "
+                "normalization or compositional issue that the volcano "
+                "plot alone can't reveal."
+            )
+        ma_fig = _plot_ma(results_df, padj_cutoff, lfc_cutoff, gene_name_map=gene_name_map)
+        ma_style = _render_plot_style_controls(
+            f"ma_{selected_contrast}",
+            group_values=["Up-regulated", "Down-regulated", "Not significant"],
+            default_colors={
+                "Up-regulated": "#d62728",
+                "Down-regulated": "#1f77b4",
+                "Not significant": "#7f7f7f",
+            },
+        )
+        _apply_plot_style(ma_fig, ma_style, default_title=f"MA Plot: {selected_contrast}")
+        _render_plotly_chart(ma_fig)
+        _render_pdf_export(ma_fig, f"ma_{selected_contrast}", f"ma_plot_{selected_contrast}")
+
+        ma_bias = dm.classify_ma_bias(results_df)
+        if ma_bias["flagged"]:
+            st.warning(ma_bias["message"])
+        else:
+            st.success(ma_bias["message"])
+
+        st.markdown("---")
+
+        # --- P-value histogram: a cheap, high-value sanity check ---
+        # Independent of any significance/fold-change threshold -- this
+        # looks at the raw p-value distribution itself, so it doesn't
+        # depend on the sliders above at all.
+        st.markdown("##### 📊 P-value Distribution")
+        with st.expander("ℹ️ How to read this plot"):
+            st.markdown(
+                "One of the simplest, most informative sanity checks "
+                "after any differential expression test. A **healthy** "
+                "result usually shows a spike of small p-values near 0 "
+                "(genuine differential signal) sitting on top of a "
+                "roughly flat background elsewhere (non-differential "
+                "genes, which are uniformly distributed by definition). "
+                "Other shapes -- a flat distribution with no spike, an "
+                "elevated hump in the middle, or a spike near 1 -- each "
+                "point to a specific, well-known issue, explained below."
+            )
+        pvalue_shape = dm.classify_pvalue_histogram_shape(results_df)
+        if pvalue_shape["counts"]:
+            pval_fig = _plot_pvalue_histogram(pvalue_shape)
+            pval_style = _render_plot_style_controls(
+                f"pval_{selected_contrast}",
+                group_values=["P-values"],
+                default_colors={"P-values": "#636EFA"},
+                show_legend_controls=False,
+            )
+            _apply_plot_style(pval_fig, pval_style, default_title=f"P-value Distribution: {selected_contrast}")
+            _render_plotly_chart(pval_fig)
+            _render_pdf_export(pval_fig, f"pval_{selected_contrast}", f"pvalue_histogram_{selected_contrast}")
+
+            if pvalue_shape["shape"] in ("healthy",):
+                st.success(pvalue_shape["message"])
+            elif pvalue_shape["shape"] == "flat_uniform":
+                st.info(pvalue_shape["message"])
+            else:
+                st.warning(pvalue_shape["message"])
+        else:
+            st.info(pvalue_shape["message"])
+
+        st.markdown("---")
+
+        # --- Top Genes heatmap: what do the actual hits look like? ---
+        # The third of the standard "big three" RNA-seq plots (alongside
+        # the volcano and MA plots above) -- see _plot_top_genes_heatmap's
+        # docstring for the full rationale. Uses the project's full
+        # normalized counts table (already exported by the DESeq2 R
+        # script for other purposes -- see deseq2_manager.read_normalized_counts),
+        # so no extra computation is needed beyond what DESeq2 already
+        # produces during a normal run.
+        st.markdown("##### 🧬 Top Genes")
+        with st.expander("ℹ️ How to read this plot"):
+            st.markdown(
+                "The volcano and MA plots above tell you WHICH genes are "
+                "significant and by how much -- this plot shows what "
+                "those top genes' ACTUAL expression pattern looks like "
+                "across every sample. Each row is one gene, each column "
+                "is one sample, and color shows that gene's expression "
+                "relative to its own average (a **z-score**: red = "
+                "higher than usual for that gene, blue = lower), so "
+                "genes with very different absolute expression levels "
+                "are still shown on a comparable scale. Genes are "
+                "reordered by similarity (hierarchical clustering); by "
+                "default, samples are grouped together by the metadata "
+                "column you pick below (with a colored strip and label "
+                "showing each sample's group), so you can directly see "
+                "whether these top genes actually separate your "
+                "experimental groups the way you'd expect -- not just "
+                "cluster by generic expression similarity.\n\n"
+                "This is a genuine sanity check, not just a "
+                "restatement of the volcano plot: if a sample's "
+                "expression pattern doesn't match its group, or you "
+                "see an unexpected subgroup, that's worth investigating "
+                "further."
+            )
+
+        norm_counts_df = _load_normalized_counts(deseq2_out_dir)
+        if norm_counts_df is not None:
+            top_genes_group_columns = [c for c in meta_df.columns if c != "sample"]
+            top_genes_group_column = None
+            top_genes_group_samples = True
+            col_n, col_group, col_order = st.columns([1, 1.4, 1.4])
+            with col_n:
+                n_top_genes = st.number_input(
+                    "Number of top genes:", min_value=5, max_value=100, value=25, step=5,
+                    key=f"top_genes_n_{selected_contrast}",
+                    help="Genes are ranked by smallest adjusted p-value (padj) in this contrast.",
+                )
+            if top_genes_group_columns:
+                with col_group:
+                    default_tg_group_index = 0
+                    if saved_config.get("design_columns") and saved_config["design_columns"][0] in top_genes_group_columns:
+                        default_tg_group_index = top_genes_group_columns.index(saved_config["design_columns"][0])
+                    top_genes_group_column = st.selectbox(
+                        "Group/label samples by:",
+                        options=top_genes_group_columns,
+                        index=default_tg_group_index,
+                        key=f"top_genes_group_column_{selected_contrast}",
+                        help="Colors a strip above the sample columns and appends this column's value to each sample's label.",
+                    )
+                with col_order:
+                    top_genes_group_samples = not st.checkbox(
+                        "Ignore grouping (cluster samples purely by expression)",
+                        value=False,
+                        key=f"top_genes_pure_cluster_{selected_contrast}",
+                        help="By default, samples are physically grouped together by the column above, clustering only within each group. Check this to instead order every sample purely by expression similarity across the whole dataset, ignoring group membership.",
+                    )
+
+            top_genes_fig, top_genes_z_df = _plot_top_genes_heatmap(
+                norm_counts_df, results_df, gene_name_map=gene_name_map, n_top=n_top_genes,
+                meta_df=meta_df, group_column=top_genes_group_column, group_samples=top_genes_group_samples,
+            )
+            top_genes_style = _render_plot_style_controls(
+                f"top_genes_{selected_contrast}", group_values=None, show_legend_controls=False,
+            )
+            _apply_plot_style(top_genes_fig, top_genes_style, default_title=f"Top {n_top_genes} Genes: {selected_contrast}")
+            _render_plotly_chart(top_genes_fig)
+            _render_pdf_export(top_genes_fig, f"top_genes_{selected_contrast}", f"top_genes_heatmap_{selected_contrast}")
+
+            _render_csv_download(
+                top_genes_z_df.reset_index().rename(columns={"index": "gene_id"}),
+                f"top_{n_top_genes}_genes_zscores_{selected_contrast}", f"top_genes_{selected_contrast}",
+                expander_label=f"⬇️ Download Top {n_top_genes} Genes Z-Scores (.csv)",
+                help_text="Log2-transformed, per-gene z-scored expression values for the top genes shown above, across every sample.",
+            )
+        else:
+            st.info("Normalized counts aren't available for this project yet -- re-run DESeq2 above to generate them.")
+
+        st.markdown("---")
+
+        # --- Explain NA genes: Cook's-distance outliers + independent filtering ---
+        # These are two distinct, legitimate DESeq2 behaviors that silently
+        # produce NA values in the results table right below -- surfaced
+        # here explicitly (see deseq2_manager.summarize_na_genes) so the
+        # user understands WHY a gene is missing/blank rather than just
+        # seeing an unexplained NA. Placed here (using gene_name_map,
+        # already computed above for the volcano plot) rather than earlier
+        # on the page, since it explains the table that follows directly
+        # below.
+        na_summary = dm.summarize_na_genes(
+            results_df, filter_threshold=dm.read_filter_threshold(deseq2_out_dir, selected_contrast),
+        )
+        if na_summary["n_cooks_outliers"] or na_summary["n_low_count_filtered"]:
+            with st.expander(
+                f"ℹ️ Why do some genes show NA? ({na_summary['n_cooks_outliers'] + na_summary['n_low_count_filtered']} gene(s) affected)"
+            ):
+                st.markdown(na_summary["message"])
+                if na_summary["cooks_outlier_genes"]:
+                    display_genes = [gene_name_map.get(g, g) for g in na_summary["cooks_outlier_genes"]]
+                    st.caption(
+                        "Genes flagged as Cook's-distance outliers "
+                        f"(showing up to 20): {', '.join(display_genes)}"
+                    )
+
+        st.markdown("---")
 
         # Annotate a copy of the full (unfiltered, every gene) results
         # table with a "Regulation" column at the current threshold

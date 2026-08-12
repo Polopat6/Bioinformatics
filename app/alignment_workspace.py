@@ -163,7 +163,17 @@ def _get_tx2gene_mapping(project, reference_dir):
 
     if not is_custom and species_key:
         entry = rm.REFERENCE_CATALOG.get(species_key, {})
-        cdna_path = os.path.join(reference_dir, f"{species_key}.cdna.fa")
+        # Preset species' downloaded files live one level deeper than
+        # reference_dir itself, in a "cdna" subdirectory -- this is
+        # because reference_dir here is the SHARED, project-independent
+        # location (see project_manager.py's shared_reference_dir()),
+        # and reference_manager.py's ensure_shared_resource() manages
+        # that "cdna" subdirectory as one atomically-built-and-renamed
+        # unit (so a concurrent reader never sees a half-downloaded
+        # file). Custom (per-project) references have no such
+        # subdirectory -- their files sit flat directly in
+        # reference_dir, matching the original convention exactly.
+        cdna_path = os.path.join(reference_dir, "cdna", f"{species_key}.cdna.fa")
 
         if entry.get("no_introns"):
             if os.path.exists(cdna_path):
@@ -225,8 +235,11 @@ def _get_gene_symbol_mapping(project, reference_dir, method):
 
     if not is_custom and species_key:
         entry = rm.REFERENCE_CATALOG.get(species_key, {})
-        cdna_path = os.path.join(reference_dir, f"{species_key}.cdna.fa")
-        gtf_path = os.path.join(reference_dir, f"{species_key}.annotation.gtf")
+        # See _get_tx2gene_mapping's matching comment above for why
+        # preset species' files live in "cdna"/"genome" subdirectories
+        # of the shared reference_dir, rather than flat inside it.
+        cdna_path = os.path.join(reference_dir, "cdna", f"{species_key}.cdna.fa")
+        gtf_path = os.path.join(reference_dir, "genome", f"{species_key}.annotation.gtf")
 
         if entry.get("no_introns"):
             if os.path.exists(cdna_path):
@@ -260,11 +273,21 @@ def _get_gene_symbol_mapping(project, reference_dir, method):
     return None, None
 
 
-def _render_counts_matrix_step(project, method, samplesheet_df):
+def _render_counts_matrix_step(project, method, samplesheet_df, reference_dir):
     """
     Step 4 UI: merge per-sample quantification output (Salmon quant.sf
     or STAR ReadsPerGene.out.tab) into a single combined gene counts
     matrix, ready for differential expression.
+
+    reference_dir: the EFFECTIVE reference directory already resolved
+        by render() -- pm.shared_reference_dir(species_key) for a
+        preset organism, or pm.reference_dir(project) for a custom
+        upload. Passed in explicitly (rather than recomputed here)
+        so this function correctly uses the SHARED location for
+        preset species' tx2gene mapping/gene symbol mapping, instead
+        of always looking in this project's own private reference
+        folder (which would be empty/wrong for a preset species after
+        the shared-reference change).
     """
     st.header("Step 4: Combine Into a Gene Counts Matrix")
 
@@ -315,7 +338,9 @@ def _render_counts_matrix_step(project, method, samplesheet_df):
     use_tximport = False
     tx2gene = None
     tx2gene_source = None
-    reference_dir = pm.reference_dir(project)
+    # reference_dir is now a parameter passed in by render() (already
+    # correctly resolved to the shared or custom-per-project location)
+    # rather than recomputed here -- see this function's docstring.
 
     if method == "salmon":
         count_type = st.radio(
@@ -677,9 +702,6 @@ def render():
                 "needs to be done once per reference."
             )
 
-    reference_dir = pm.reference_dir(project)
-    os.makedirs(reference_dir, exist_ok=True)
-
     saved_species, saved_is_custom = pm.get_reference_choice(project)
 
     ref_source_options = ["🧬 Use a pre-loaded model organism", "📁 Upload my own reference (custom species)"]
@@ -712,16 +734,53 @@ def render():
 
         pm.save_reference_choice(project, species_key, is_custom=False)
 
+        # Preset species reuse a SHARED, project-independent reference
+        # location (see project_manager.py's shared_reference_dir() and
+        # reference_manager.py's ensure_shared_resource()) -- the first
+        # project to request a given species downloads/builds it once;
+        # every other project (including ones in other Streamlit
+        # sessions running at the same time) safely reuses the same
+        # files rather than each downloading/building their own
+        # separate, redundant copy. Custom uploads (the `else` branch
+        # further below) are NOT shared -- see reference_dir there.
+        reference_dir = pm.shared_reference_dir(species_key)
+        os.makedirs(reference_dir, exist_ok=True)
+
         if method == "salmon":
-            cdna_path = os.path.join(reference_dir, f"{species_key}.cdna.fa")
-            already_downloaded = os.path.exists(cdna_path)
+            shared_cdna_dir = pm.shared_cdna_fasta_dir(species_key)
+            already_downloaded = rm._resource_is_ready(shared_cdna_dir)
 
-            dl_label = "🔄 Re-download Reference" if already_downloaded else "⬇️ Download Reference"
-            if already_downloaded and not st.session_state.get("_ref_dl_clicked"):
-                st.success(f"✅ Reference already downloaded for **{species_labels[species_key]}**.")
+            if already_downloaded:
+                st.success(
+                    f"✅ Reference already available for **{species_labels[species_key]}** "
+                    "(shared across every project using this species)."
+                )
+            else:
+                st.info(
+                    f"ℹ️ No project has downloaded a reference for "
+                    f"**{species_labels[species_key]}** yet. The first "
+                    "download will be saved in a shared location and "
+                    "reused automatically by this and any other project "
+                    "using this species -- no need to re-download it "
+                    "again later."
+                )
 
-            if st.button(dl_label, key="download_cdna_btn"):
-                st.session_state["_ref_dl_clicked"] = True
+            dl_label = "⬇️ Download Reference" if not already_downloaded else None
+            force_dl = False
+            if already_downloaded:
+                with st.expander("🔁 Force a fresh re-download (advanced)"):
+                    st.caption(
+                        "⚠️ This reference is shared across every project "
+                        "using this species. Re-downloading replaces it "
+                        "for everyone -- only do this if you have a "
+                        "specific reason to believe the current copy is "
+                        "corrupted or out of date, and ideally not while "
+                        "another project may be actively using it."
+                    )
+                    force_dl = st.button("🔄 Re-download Reference for All Projects", key="download_cdna_force_btn")
+
+            if (dl_label and st.button(dl_label, key="download_cdna_btn")) or force_dl:
+                status_placeholder = st.empty()
                 progress_bar = st.progress(0, text="Starting download...")
 
                 def _update_progress(downloaded, total):
@@ -729,25 +788,49 @@ def render():
                         pct = min(downloaded / total, 1.0)
                         progress_bar.progress(pct, text=f"Downloading... {downloaded // (1024*1024)}MB / {total // (1024*1024)}MB")
 
-                success, fasta_path, message = rm.get_transcriptome_fasta_for_salmon(species_key, reference_dir, _update_progress)
+                def _wait_callback(elapsed):
+                    status_placeholder.info(
+                        f"⏳ Another project is currently preparing this "
+                        f"reference. Waiting for it to finish... "
+                        f"({int(elapsed)}s elapsed)"
+                    )
+
+                def _build_cdna_impl(temp_dir):
+                    success, fasta_path, message = rm.get_transcriptome_fasta_for_salmon(species_key, temp_dir, _update_progress)
+                    if success and not rm.validate_fasta_file(fasta_path):
+                        return False, "The downloaded file doesn't look like a valid FASTA file."
+                    return success, message
+
+                success, message, built = rm.ensure_shared_resource(
+                    shared_cdna_dir, _build_cdna_impl, wait_message_callback=_wait_callback, force=force_dl,
+                )
                 progress_bar.progress(1.0, text="Done.")
+                status_placeholder.empty()
 
                 if not success:
                     st.error(f"⚠️ {message}")
-                elif not rm.validate_fasta_file(fasta_path):
-                    st.error("⚠️ The downloaded file doesn't look like a valid FASTA file. Please try again.")
                 else:
                     st.success(f"✅ {message}")
                     pm.mark_step_complete(project, "reference_ready")
 
         else:  # STAR
-            genome_path = os.path.join(reference_dir, f"{species_key}.genome.fa")
-            gtf_path = os.path.join(reference_dir, f"{species_key}.annotation.gtf")
-            already_downloaded = os.path.exists(genome_path) and os.path.exists(gtf_path)
+            shared_genome_dir = pm.shared_genome_dir(species_key)
+            already_downloaded = rm._resource_is_ready(shared_genome_dir)
 
-            dl_label = "🔄 Re-download Reference" if already_downloaded else "⬇️ Download Genome + Annotation"
-            if already_downloaded and not st.session_state.get("_ref_dl_clicked"):
-                st.success(f"✅ Reference already downloaded for **{species_labels[species_key]}**.")
+            if already_downloaded:
+                st.success(
+                    f"✅ Reference already available for **{species_labels[species_key]}** "
+                    "(shared across every project using this species)."
+                )
+            else:
+                st.info(
+                    f"ℹ️ No project has downloaded a reference for "
+                    f"**{species_labels[species_key]}** yet. The first "
+                    "download will be saved in a shared location and "
+                    "reused automatically by this and any other project "
+                    "using this species -- no need to re-download it "
+                    "again later."
+                )
 
             st.caption(
                 "⏳ This download includes the full genome sequence and may "
@@ -755,8 +838,22 @@ def render():
                 "connection."
             )
 
-            if st.button(dl_label, key="download_genome_gtf_btn"):
-                st.session_state["_ref_dl_clicked"] = True
+            dl_label = "⬇️ Download Genome + Annotation" if not already_downloaded else None
+            force_dl = False
+            if already_downloaded:
+                with st.expander("🔁 Force a fresh re-download (advanced)"):
+                    st.caption(
+                        "⚠️ This reference is shared across every project "
+                        "using this species. Re-downloading replaces it "
+                        "for everyone -- only do this if you have a "
+                        "specific reason to believe the current copy is "
+                        "corrupted or out of date, and ideally not while "
+                        "another project may be actively using it."
+                    )
+                    force_dl = st.button("🔄 Re-download Reference for All Projects", key="download_genome_gtf_force_btn")
+
+            if (dl_label and st.button(dl_label, key="download_genome_gtf_btn")) or force_dl:
+                status_placeholder = st.empty()
                 progress_bar = st.progress(0, text="Starting download...")
 
                 def _update_progress(downloaded, total):
@@ -764,26 +861,50 @@ def render():
                         pct = min(downloaded / total, 1.0)
                         progress_bar.progress(pct, text=f"Downloading... {downloaded // (1024*1024)}MB / {total // (1024*1024)}MB")
 
-                success, paths, message = rm.download_genome_and_gtf(species_key, reference_dir, _update_progress)
+                def _wait_callback(elapsed):
+                    status_placeholder.info(
+                        f"⏳ Another project is currently preparing this "
+                        f"reference. Waiting for it to finish... "
+                        f"({int(elapsed)}s elapsed)"
+                    )
+
+                def _build_genome_impl(temp_dir):
+                    success, paths, message = rm.download_genome_and_gtf(species_key, temp_dir, _update_progress)
+                    if not success:
+                        return False, message
+                    genome_fa, gtf_file = paths
+                    if not rm.validate_fasta_file(genome_fa):
+                        return False, "The downloaded genome file doesn't look like a valid FASTA file."
+                    if not rm.validate_annotation_file(gtf_file):
+                        return False, "The downloaded annotation file doesn't look like a valid GTF file."
+                    return True, message
+
+                success, message, built = rm.ensure_shared_resource(
+                    shared_genome_dir, _build_genome_impl, wait_message_callback=_wait_callback, force=force_dl,
+                )
                 progress_bar.progress(1.0, text="Done.")
+                status_placeholder.empty()
 
                 if not success:
                     st.error(f"⚠️ {message}")
                 else:
-                    genome_fa, gtf_file = paths
-                    if not rm.validate_fasta_file(genome_fa):
-                        st.error("⚠️ The downloaded genome file doesn't look like a valid FASTA file.")
-                    elif not rm.validate_annotation_file(gtf_file):
-                        st.error("⚠️ The downloaded annotation file doesn't look like a valid GTF file.")
-                    else:
-                        st.success(f"✅ {message}")
-                        pm.mark_step_complete(project, "reference_ready")
+                    st.success(f"✅ {message}")
+                    pm.mark_step_complete(project, "reference_ready")
 
     # -------------------------------------------------------------
     # CUSTOM (NON-MODEL) SPECIES PATH
     # -------------------------------------------------------------
     else:
         pm.save_reference_choice(project, "custom", is_custom=True)
+
+        # Custom uploads are always scoped to THIS project's own
+        # private reference_dir -- never shared -- since two different
+        # projects' custom uploads have no guarantee of actually being
+        # the same organism/assembly even if they happen to look
+        # similar, so sharing them would risk silently mixing up
+        # unrelated references across projects.
+        reference_dir = pm.reference_dir(project)
+        os.makedirs(reference_dir, exist_ok=True)
 
         st.markdown(
             "Upload your own reference files below. You'll need a "
@@ -988,7 +1109,7 @@ def render():
     # -----------------------------------------------------------------
     # STEP 4: Combine Into a Gene Counts Matrix
     # -----------------------------------------------------------------
-    _render_counts_matrix_step(project, method, samplesheet_df)
+    _render_counts_matrix_step(project, method, samplesheet_df, reference_dir)
 
 
 def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest):
@@ -1006,7 +1127,10 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
     ]
     species_key, is_custom = pm.get_reference_choice(project)
     if not is_custom and species_key:
-        cdna_candidates.insert(0, os.path.join(reference_dir, f"{species_key}.cdna.fa"))
+        # Preset species' shared cDNA FASTA lives in a "cdna"
+        # subdirectory of reference_dir -- see _get_tx2gene_mapping's
+        # comment above for why.
+        cdna_candidates.insert(0, os.path.join(reference_dir, "cdna", f"{species_key}.cdna.fa"))
     else:
         cdna_candidates.insert(0, os.path.join(reference_dir, "custom_input.fa"))
 
@@ -1041,7 +1165,19 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
             "will work fine for those."
         )
 
-    index_dir = pm.salmon_index_dir(project)
+    # Preset species reuse a SHARED, project-independent Salmon index
+    # (built once per species, reused by every project) -- custom
+    # uploads keep their existing per-project index, since there's no
+    # guarantee two different projects' custom references are actually
+    # the same thing even if named similarly. See reference_manager.py's
+    # ensure_shared_resource() for how concurrent index-build requests
+    # across different projects/sessions are made safe.
+    index_is_shared = not is_custom and bool(species_key)
+    index_dir = pm.shared_salmon_index_dir(species_key) if index_is_shared else pm.salmon_index_dir(project)
+    # qm.salmon_index_exists just checks whether a valid-looking Salmon
+    # index is present at a given path -- this works identically
+    # whether that path happens to be the shared or per-project
+    # location, so the same check is used for both.
     index_ready = qm.salmon_index_exists(index_dir)
 
     index_threads = st.slider(
@@ -1056,14 +1192,51 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
         key="salmon_index_threads_slider",
     )
 
-    index_label = "🔄 Re-build Index" if index_ready else "🔧 Build Salmon Index"
-    if index_ready and not st.session_state.get("_salmon_index_clicked"):
-        st.success("✅ Salmon index already built for this project's reference.")
+    if index_ready:
+        st.success(
+            "✅ Salmon index already built "
+            + ("(shared across every project using this species)." if index_is_shared else "for this project's reference.")
+        )
 
-    if st.button(index_label, key="build_salmon_index_btn"):
-        st.session_state["_salmon_index_clicked"] = True
-        with st.spinner("Building Salmon index... this may take a few minutes."):
-            success, log = qm.build_salmon_index(transcriptome_fasta, index_dir, threads=index_threads)
+    build_clicked = False
+    force_index = False
+    if not index_ready:
+        build_clicked = st.button("🔧 Build Salmon Index", key="build_salmon_index_btn")
+    elif index_is_shared:
+        with st.expander("🔁 Force a fresh re-index (advanced)"):
+            st.caption(
+                "⚠️ This index is shared across every project using this "
+                "species. Rebuilding replaces it for everyone -- only do "
+                "this if you have a specific reason to believe the "
+                "current index is corrupted, and ideally not while "
+                "another project may be actively quantifying against it."
+            )
+            force_index = st.button("🔄 Re-build Index for All Projects", key="build_salmon_index_force_btn")
+    else:
+        build_clicked = st.button("🔄 Re-build Index", key="build_salmon_index_btn")
+
+    if build_clicked or force_index:
+        def _build_salmon_index_impl(temp_dir):
+            return qm.build_salmon_index(transcriptome_fasta, temp_dir, threads=index_threads)
+
+        if index_is_shared:
+            status_placeholder = st.empty()
+
+            def _wait_callback(elapsed):
+                status_placeholder.info(
+                    f"⏳ Another project is currently building this index. "
+                    f"Waiting for it to finish... ({int(elapsed)}s elapsed)"
+                )
+
+            with st.spinner("Building Salmon index... this may take a few minutes."):
+                success, log, built = rm.ensure_shared_resource(
+                    index_dir, _build_salmon_index_impl, wait_message_callback=_wait_callback, force=force_index,
+                )
+            status_placeholder.empty()
+        else:
+            with st.spinner("Building Salmon index... this may take a few minutes."):
+                success, log = qm.build_salmon_index(transcriptome_fasta, index_dir, threads=index_threads)
+
         if success:
             st.success("✅ Salmon index built successfully.")
             index_ready = True
@@ -1147,8 +1320,11 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
     species_key, is_custom = pm.get_reference_choice(project)
     if not is_custom and species_key:
-        genome_fasta = os.path.join(reference_dir, f"{species_key}.genome.fa")
-        gtf_path = os.path.join(reference_dir, f"{species_key}.annotation.gtf")
+        # Preset species' shared genome + GTF live in a "genome"
+        # subdirectory of reference_dir -- see _get_tx2gene_mapping's
+        # comment above for why.
+        genome_fasta = os.path.join(reference_dir, "genome", f"{species_key}.genome.fa")
+        gtf_path = os.path.join(reference_dir, "genome", f"{species_key}.annotation.gtf")
     else:
         genome_fasta = os.path.join(reference_dir, "custom_input.fa")
         gtf_path = os.path.join(reference_dir, "custom_input.gtf")
@@ -1187,7 +1363,10 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
             "normal and only happens once per reference."
         )
 
-    index_dir = pm.star_index_dir(project)
+    # Preset species reuse a SHARED, project-independent STAR index --
+    # same rationale as the Salmon index above.
+    index_is_shared = not is_custom and bool(species_key)
+    index_dir = pm.shared_star_index_dir(species_key) if index_is_shared else pm.star_index_dir(project)
     index_ready = qm.star_index_exists(index_dir)
 
     index_threads = st.slider(
@@ -1203,14 +1382,51 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
         key="star_index_threads_slider",
     )
 
-    index_label = "🔄 Re-build Index" if index_ready else "🔧 Build STAR Index"
-    if index_ready and not st.session_state.get("_star_index_clicked"):
-        st.success("✅ STAR genome index already built for this project's reference.")
+    if index_ready:
+        st.success(
+            "✅ STAR genome index already built "
+            + ("(shared across every project using this species)." if index_is_shared else "for this project's reference.")
+        )
 
-    if st.button(index_label, key="build_star_index_btn"):
-        st.session_state["_star_index_clicked"] = True
-        with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
-            success, log = qm.build_star_index(genome_fasta, gtf_path, index_dir, threads=index_threads)
+    build_clicked = False
+    force_index = False
+    if not index_ready:
+        build_clicked = st.button("🔧 Build STAR Index", key="build_star_index_btn")
+    elif index_is_shared:
+        with st.expander("🔁 Force a fresh re-index (advanced)"):
+            st.caption(
+                "⚠️ This index is shared across every project using this "
+                "species. Rebuilding replaces it for everyone -- only do "
+                "this if you have a specific reason to believe the "
+                "current index is corrupted, and ideally not while "
+                "another project may be actively aligning against it."
+            )
+            force_index = st.button("🔄 Re-build Index for All Projects", key="build_star_index_force_btn")
+    else:
+        build_clicked = st.button("🔄 Re-build Index", key="build_star_index_btn")
+
+    if build_clicked or force_index:
+        def _build_star_index_impl(temp_dir):
+            return qm.build_star_index(genome_fasta, gtf_path, temp_dir, threads=index_threads)
+
+        if index_is_shared:
+            status_placeholder = st.empty()
+
+            def _wait_callback(elapsed):
+                status_placeholder.info(
+                    f"⏳ Another project is currently building this index. "
+                    f"Waiting for it to finish... ({int(elapsed)}s elapsed)"
+                )
+
+            with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
+                success, log, built = rm.ensure_shared_resource(
+                    index_dir, _build_star_index_impl, wait_message_callback=_wait_callback, force=force_index,
+                )
+            status_placeholder.empty()
+        else:
+            with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
+                success, log = qm.build_star_index(genome_fasta, gtf_path, index_dir, threads=index_threads)
+
         if success:
             st.success("✅ STAR genome index built successfully.")
             index_ready = True

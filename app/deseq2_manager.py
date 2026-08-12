@@ -50,6 +50,42 @@ have the user decide, per value, whether it represents a real category
 or should cause those samples to be excluded -- rather than silently
 passing a real NaN into DESeq2 (which would error or misbehave) or
 guessing incorrectly on the user's behalf.
+
+--- QC/diagnostics additions ---
+
+Beyond the core DESeq2 fit + results, the R script also exports several
+model-fit and sample-level diagnostic files that the Differential
+Expression workspace surfaces as additional QC visuals (see
+"read_dispersion_estimates", "read_size_factors",
+"read_sample_distance_matrix", and the "summarize_*"/"classify_*"/
+"flag_*"/"detect_*" functions below):
+
+  - Dispersion estimates (gene-wise, fitted trend, and final/shrunk) --
+    DESeq2's own recommended diagnostic (plotDispEsts in R) for whether
+    the negative-binomial model fit reasonably to this dataset.
+  - Size factors -- DESeq2's per-sample normalization factors; a
+    sample whose size factor is a strong outlier relative to the others
+    often indicates a failed/degraded library.
+  - A full sample-to-sample distance matrix (computed on the same VST
+    data already used for PCA) -- the standard companion to PCA for
+    sample-level QC, since PCA alone only shows the first few
+    components and can miss an outlier/mislabeled sample that a full
+    distance-based comparison would catch.
+  - Per-contrast Cook's-distance outlier flagging and independent-
+    filtering status -- DESeq2 silently sets "pvalue" to NA for genes
+    whose result looks driven by a single outlier sample (Cook's
+    distance cutoff), and separately sets "padj" (but not "pvalue") to
+    NA for low-mean genes excluded by independent filtering to improve
+    power. These are two distinct, legitimate DESeq2 behaviors that are
+    otherwise easy to mistake for "missing data" -- the R script now
+    tags each with an explicit boolean column (and, for Cook's
+    outliers, which specific sample had the largest Cook's distance for
+    that gene) so the workspace can explain -- rather than just
+    silently show -- every NA row in the results table.
+
+None of this changes DESeq2's actual statistical test in any way -- it
+only extracts and exposes data that DESeq2 already computes internally
+as part of a normal run, the same way the existing PCA/VST export does.
 """
 import csv
 import os
@@ -416,6 +452,30 @@ cat(paste("Full design formula:", deparse(design_formula)), "\n")
 # tests).
 dds <- DESeqDataSetFromMatrix(countData = round(counts_df), colData = meta_df, design = design_formula)
 dds <- DESeq(dds)
+
+# --- Model-fit diagnostics: dispersion estimates + size factors ---
+# Exported once per project (from the primary Wald-fitted dds above, or
+# -- for an LRT-only run -- from the first LRT test's own fit below,
+# since dispersion estimation happens as part of every DESeq() call
+# regardless of test type). These let the UI show DESeq2's own
+# recommended dispersion-fit diagnostic (plotDispEsts in R) and a size-
+# factor QC table without requiring any extra R computation beyond what
+# DESeq2 already does internally as part of a normal run.
+disp_df <- data.frame(
+  gene_id = rownames(dds),
+  baseMean = mcols(dds)$baseMean,
+  dispGeneEst = mcols(dds)$dispGeneEst,
+  dispFit = mcols(dds)$dispFit,
+  dispersion = mcols(dds)$dispersion
+)
+write.csv(disp_df, file.path(job$output_dir, "dispersion_estimates.csv"), row.names = FALSE)
+
+size_factor_df <- data.frame(
+  sample = names(sizeFactors(dds)),
+  size_factor = as.numeric(sizeFactors(dds))
+)
+write.csv(size_factor_df, file.path(job$output_dir, "size_factors.csv"), row.names = FALSE)
+
 # --- Variance-stabilized data + PCA, for visualization ---
 vsd <- vst(dds, blind = TRUE)
 pca_input <- t(assay(vsd))
@@ -430,6 +490,22 @@ for (col in colnames(meta_df)) {
 }
 write.csv(pca_df, file.path(job$output_dir, "pca_coordinates.csv"), row.names = FALSE)
 writeLines(paste(pct_var, collapse = ","), file.path(job$output_dir, "pca_percent_variance.txt"))
+
+# --- Sample-to-sample distance matrix (sample-level QC, companion to PCA) ---
+# Computed on the SAME (non-batch-adjusted) VST data used for the "raw"
+# PCA view above -- this is the standard complementary QC view
+# recommended alongside PCA, since PCA's first 2-4 components can
+# sometimes miss an outlier/mislabeled sample that a full pairwise
+# distance comparison catches. Exported as a plain sample x sample
+# matrix (Euclidean distance on VST values); the UI performs
+# hierarchical clustering client-side for the heatmap's row/column
+# ordering, so this file only needs to carry the raw distances.
+sample_dist_matrix <- as.matrix(dist(t(assay(vsd))))
+sample_dist_df <- as.data.frame(sample_dist_matrix)
+sample_dist_df$sample <- rownames(sample_dist_df)
+sample_dist_df <- sample_dist_df[, c("sample", colnames(sample_dist_matrix))]
+write.csv(sample_dist_df, file.path(job$output_dir, "sample_distance_matrix.csv"), row.names = FALSE)
+
 # --- Optional batch-adjusted PCA view (visualization only) ---
 # This uses limma::removeBatchEffect purely to produce a second PCA view
 # where batch-driven variation is visually suppressed, so the user can
@@ -456,6 +532,28 @@ norm_counts <- as.data.frame(counts(dds, normalized = TRUE))
 norm_counts$gene_id <- rownames(norm_counts)
 norm_counts <- norm_counts[, c("gene_id", common_samples)]
 write.csv(norm_counts, file.path(job$output_dir, "normalized_counts.csv"), row.names = FALSE)
+
+# --- Helper: which sample had the largest Cook's distance for each gene ---
+# Used below to annotate outlier-flagged genes in the results tables
+# with WHICH specific sample's count value looks like it's driving that
+# gene's result -- much more actionable than just knowing a gene was
+# flagged. assays(dds_obj)[["cooks"]] is a genes x samples matrix of
+# per-gene, per-sample Cook's distances, populated by DESeq() as part
+# of its normal fitting process (same data DESeq2 itself uses
+# internally to decide whether to null out a gene's p-value).
+compute_max_cooks_sample <- function(dds_obj, gene_ids) {
+  cooks_mat <- tryCatch(assays(dds_obj)[["cooks"]], error = function(e) NULL)
+  if (is.null(cooks_mat)) {
+    return(rep(NA_character_, length(gene_ids)))
+  }
+  vapply(gene_ids, function(g) {
+    if (!(g %in% rownames(cooks_mat))) return(NA_character_)
+    row_vals <- cooks_mat[g, ]
+    if (all(is.na(row_vals))) return(NA_character_)
+    colnames(cooks_mat)[which.max(row_vals)]
+  }, character(1))
+}
+
 # --- Wald test: per-contrast pairwise results ---
 # job$contrasts is a list of {name, column, level1, level2} objects,
 # where level1 is the numerator (e.g. "treated") and level2 is the
@@ -486,12 +584,38 @@ if (job$test_type == "wald" && !is.null(job$contrasts) && length(job$contrasts$n
     contrast_column <- job$contrasts$column[i]
     contrast_level1 <- job$contrasts$level1[i]
     contrast_level2 <- job$contrasts$level2[i]
+    safe_name <- gsub("[^A-Za-z0-9_-]", "_", contrast_name)
+
     res <- results(dds, contrast = c(contrast_column, contrast_level1, contrast_level2))
     res_df <- as.data.frame(res)
     res_df$gene_id <- rownames(res_df)
-    res_df <- res_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+    # --- Distinguish the two legitimate DESeq2 causes of an NA result ---
+    # Cook's-distance outlier: DESeq2 sets "pvalue" itself to NA when a
+    # gene's result looks driven by a single outlier sample (detected
+    # via cooksCutoff, DESeq2's default behavior for results()).
+    # Independent filtering: DESeq2 separately sets "padj" (but leaves
+    # "pvalue" intact) to NA for low-mean genes it excludes from
+    # multiple-testing correction to improve power -- a completely
+    # different, unrelated reason for an NA. Tagging both explicitly
+    # here (rather than leaving a bare NA for the user to puzzle over)
+    # is what lets the workspace explain -- not just display -- every
+    # NA row.
+    res_df$cooks_outlier_flagged <- is.na(res_df$pvalue) & !is.na(res_df$baseMean) & res_df$baseMean > 0
+    res_df$low_count_filtered <- !is.na(res_df$pvalue) & is.na(res_df$padj)
+    res_df$max_cooks_sample <- compute_max_cooks_sample(dds, res_df$gene_id)
+
+    # Record the independent filtering threshold DESeq2 chose for this
+    # specific contrast (it's optimized per-results-call, so it can
+    # differ slightly between contrasts even from the same fitted dds).
+    filter_threshold <- metadata(res)$filterThreshold
+    if (!is.null(filter_threshold) && length(filter_threshold) > 0) {
+      writeLines(as.character(as.numeric(filter_threshold)), file.path(job$output_dir, paste0("filter_threshold_", safe_name, ".txt")))
+    }
+
+    res_df <- res_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj",
+                          "cooks_outlier_flagged", "low_count_filtered", "max_cooks_sample")]
     res_df <- res_df[order(res_df$padj), ]
-    safe_name <- gsub("[^A-Za-z0-9_-]", "_", contrast_name)
     write.csv(res_df, file.path(job$output_dir, paste0("results_", safe_name, ".csv")), row.names = FALSE)
     cat(paste("Contrast", contrast_name, "(Wald) - genes with padj < 0.05:", sum(res_df$padj < 0.05, na.rm = TRUE)), "\n")
   }
@@ -520,6 +644,7 @@ if (job$test_type == "lrt" && !is.null(job$lrt_tests) && length(job$lrt_tests$na
     # ambiguously when list-columns are present).
     test_name <- job$lrt_tests$name[i]
     reduced_terms <- job$lrt_tests$reduced_terms[[i]]
+    safe_name <- gsub("[^A-Za-z0-9_-]", "_", test_name)
     if (length(reduced_terms) == 0) {
       reduced_formula <- ~ 1
     } else {
@@ -530,9 +655,23 @@ if (job$test_type == "lrt" && !is.null(job$lrt_tests) && length(job$lrt_tests$na
     res <- results(dds_lrt)
     res_df <- as.data.frame(res)
     res_df$gene_id <- rownames(res_df)
-    res_df <- res_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+    # Same NA-cause tagging as the Wald branch above -- see the comment
+    # there for why these two columns exist. Uses dds_lrt's own Cook's
+    # matrix, since this is a separately-refit model (its own
+    # dispersion/Cook's distances, not shared with the Wald-fitted dds).
+    res_df$cooks_outlier_flagged <- is.na(res_df$pvalue) & !is.na(res_df$baseMean) & res_df$baseMean > 0
+    res_df$low_count_filtered <- !is.na(res_df$pvalue) & is.na(res_df$padj)
+    res_df$max_cooks_sample <- compute_max_cooks_sample(dds_lrt, res_df$gene_id)
+
+    filter_threshold <- metadata(res)$filterThreshold
+    if (!is.null(filter_threshold) && length(filter_threshold) > 0) {
+      writeLines(as.character(as.numeric(filter_threshold)), file.path(job$output_dir, paste0("filter_threshold_", safe_name, ".txt")))
+    }
+
+    res_df <- res_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj",
+                          "cooks_outlier_flagged", "low_count_filtered", "max_cooks_sample")]
     res_df <- res_df[order(res_df$padj), ]
-    safe_name <- gsub("[^A-Za-z0-9_-]", "_", test_name)
     write.csv(res_df, file.path(job$output_dir, paste0("results_", safe_name, ".csv")), row.names = FALSE)
     cat(paste("LRT test", test_name, "(reduced model:", deparse(reduced_formula), ") - genes with padj < 0.05:", sum(res_df$padj < 0.05, na.rm = TRUE)), "\n")
   }
@@ -795,49 +934,578 @@ def read_normalized_counts(output_dir):
     return pd.read_csv(path)
 
 
-def compute_batch_variance_metric(pca_df, batch_column, pcs=("PC1", "PC2")):
+def compute_batch_variance_metric(pca_df, batch_column):
     """
-    Compute a simple eta-squared-style QC metric per principal
-    component: the fraction of that PC's total variance explained by
-    batch group membership (between-batch sum of squares / total sum of
-    squares), expressed as a percentage.
+    For a single PCA coordinates DataFrame (either the raw or the
+    batch-adjusted view — see read_pca_coordinates), estimate what
+    share of each principal component's own variance is attributable
+    to the batch column, as a simple QC diagnostic for batch
+    correction (used to build the "before vs. after" comparison shown
+    in the Differential Expression workspace).
 
-    This is NOT a formal statistical test (no p-value, no correction
-    for other design factors) -- it's a lightweight, at-a-glance
-    indicator meant purely to help the user compare, side by side, how
-    much batch appears to be driving sample separation on each axis
-    *before* vs. *after* the visualization-only batch-adjusted PCA
-    view. The actual DESeq2 statistical test already accounts for
-    batch correctly via the design formula regardless of what this
-    metric shows.
+    For each available PC (up to PC4), this computes a one-way-ANOVA-
+    style effect size — the between-batch-group sum of squares divided
+    by the total sum of squares for that PC, expressed as a percentage
+    (0-100). This is 0% when every batch group has an identical mean
+    position on that PC (no batch effect along that axis), and
+    approaches 100% when a sample's position on that PC is almost
+    fully determined by which batch it's in.
 
-    pca_df: a PCA coordinates DataFrame as returned by
-        read_pca_coordinates() (must include the batch_column and each
-        column named in pcs).
-    batch_column: name of the metadata column identifying batch group
-        membership.
-    pcs: which PC columns to compute the metric for.
+    This is a simple descriptive/QC diagnostic, not a formal
+    significance test — it's meant to give an intuitive, comparable
+    "how much did this shrink after adjustment" number, not a p-value.
 
-    Returns a dict {pc_name: eta_squared_percentage}, or an empty dict
-    if batch_column isn't present in pca_df.
+    Returns a dict {"PC1": pct, "PC2": pct, ...}, or an empty dict if
+    pca_df is None/missing the batch column.
     """
-    results = {}
-    if pca_df is None or batch_column not in pca_df.columns:
-        return results
-    for pc in pcs:
-        if pc not in pca_df.columns:
+    if pca_df is None or not batch_column or batch_column not in pca_df.columns:
+        return {}
+
+    groups = pca_df[batch_column].astype(str)
+    pc_cols = [c for c in pca_df.columns if re.fullmatch(r"PC\d+", c)]
+
+    result = {}
+    for pc_col in sorted(pc_cols, key=lambda c: int(c[2:]))[:4]:
+        values = pca_df[pc_col].astype(float)
+        grand_mean = values.mean()
+        total_ss = ((values - grand_mean) ** 2).sum()
+        if total_ss == 0:
+            result[pc_col] = 0.0
             continue
-        grand_mean = pca_df[pc].mean()
-        ss_total = ((pca_df[pc] - grand_mean) ** 2).sum()
-        if ss_total == 0:
-            results[pc] = 0.0
+        between_ss = 0.0
+        for _, sub in values.groupby(groups):
+            n = len(sub)
+            group_mean = sub.mean()
+            between_ss += n * (group_mean - grand_mean) ** 2
+        result[pc_col] = round(float(100 * between_ss / total_ss), 1)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# QC diagnostics: dispersion, size factors, sample distances
+# ---------------------------------------------------------------------------
+
+def read_dispersion_estimates(output_dir):
+    """
+    Read the per-gene dispersion diagnostic table (gene-wise estimate,
+    fitted trend, and final/shrunk value) written by the R script,
+    for building the dispersion plot (DESeq2's own recommended
+    model-fit diagnostic, equivalent to plotDispEsts in R).
+
+    Returns a DataFrame, or None if this project's DESeq2 run predates
+    this file being written (older projects can simply re-run DESeq2
+    to generate it).
+    """
+    path = os.path.join(output_dir, "dispersion_estimates.csv")
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path)
+
+
+def assess_dispersion_fit(dispersion_df):
+    """
+    A simple, descriptive QC check on the dispersion plot: what
+    fraction of genes have a gene-wise dispersion estimate far above
+    the fitted trend line (in log-space), which -- in large numbers --
+    can indicate the fitted trend didn't capture the data well (e.g.
+    due to strong unmodeled heterogeneity, contamination, or a
+    sample-swap). A modest fraction of genes scattering above the
+    trend is completely normal and expected (this is exactly why
+    DESeq2 shrinks toward the trend in the first place) -- this check
+    is only meant to flag an unusually large fraction, not any
+    deviation at all.
+
+    Returns a dict:
+        {
+            "pct_far_above_trend": float,   # 0-100
+            "flagged": bool,                # True if this looks unusual
+            "message": str,                 # plain-language summary
+        }
+    or a dict with flagged=False and an explanatory message if the
+    dispersion data isn't usable (e.g. all-NaN).
+    """
+    if dispersion_df is None or dispersion_df.empty:
+        return {"pct_far_above_trend": 0.0, "flagged": False, "message": "No dispersion data available."}
+
+    valid = dispersion_df.dropna(subset=["dispGeneEst", "dispFit"])
+    valid = valid[(valid["dispGeneEst"] > 0) & (valid["dispFit"] > 0)]
+    if valid.empty:
+        return {"pct_far_above_trend": 0.0, "flagged": False, "message": "No valid dispersion estimates to assess."}
+
+    import math
+    log_ratio = valid["dispGeneEst"].apply(math.log2) - valid["dispFit"].apply(math.log2)
+    # "Far above" the trend: more than 2 log2-units (4x) higher than
+    # fitted -- a fairly generous margin, since scatter around the
+    # trend is expected; this only catches genes clearly detached from
+    # it.
+    far_above = (log_ratio > 2).sum()
+    pct = round(100 * far_above / len(valid), 1)
+
+    flagged = pct > 15.0
+    if flagged:
+        message = (
+            f"⚠️ {pct}% of genes have a dispersion estimate well above the "
+            "fitted trend line. This can happen with strong unmodeled "
+            "variability (e.g. an unaccounted-for batch effect, sample "
+            "contamination, or a mixed-condition sample) -- check the PCA "
+            "and sample distance heatmap above for any samples that don't "
+            "cluster as expected."
+        )
+    else:
+        message = (
+            f"✅ {pct}% of genes fall well above the fitted trend -- within "
+            "the normal range. The dispersion model looks like a "
+            "reasonable fit for this dataset."
+        )
+    return {"pct_far_above_trend": pct, "flagged": flagged, "message": message}
+
+
+def read_size_factors(output_dir):
+    """
+    Read the per-sample size factor table (DESeq2's median-of-ratios
+    normalization factors) written by the R script.
+
+    Returns a DataFrame with columns "sample", "size_factor", or None
+    if this project's DESeq2 run predates this file being written.
+    """
+    path = os.path.join(output_dir, "size_factors.csv")
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path)
+
+
+def flag_size_factor_outliers(size_factor_df, threshold_multiplier=2.0):
+    """
+    Flag any sample whose size factor is unusually far from the median
+    of all samples in this project -- often an early sign of a failed,
+    degraded, or contamination-affected library (very different total
+    sequencing depth/composition from its peers), worth double-checking
+    before trusting this sample's results.
+
+    threshold_multiplier: a sample is flagged if its size factor is
+        more than this many times higher OR lower than the median
+        (e.g. 2.0 = flagged if >2x or <0.5x the median). This is a
+        simple, descriptive heuristic (not a formal statistical test)
+        -- intentionally conservative so it only catches genuinely
+        large discrepancies rather than routine sample-to-sample
+        variation.
+
+    Returns a dict:
+        {
+            "median_size_factor": float,
+            "flagged_samples": [{"sample": str, "size_factor": float, "ratio_to_median": float}, ...],
+        }
+    """
+    if size_factor_df is None or size_factor_df.empty:
+        return {"median_size_factor": None, "flagged_samples": []}
+
+    median_sf = float(size_factor_df["size_factor"].median())
+    flagged = []
+    if median_sf > 0:
+        for _, row in size_factor_df.iterrows():
+            ratio = row["size_factor"] / median_sf
+            if ratio > threshold_multiplier or ratio < (1.0 / threshold_multiplier):
+                flagged.append({
+                    "sample": row["sample"],
+                    "size_factor": round(float(row["size_factor"]), 3),
+                    "ratio_to_median": round(float(ratio), 2),
+                })
+    return {"median_size_factor": round(median_sf, 3), "flagged_samples": flagged}
+
+
+def read_sample_distance_matrix(output_dir):
+    """
+    Read the full sample-to-sample Euclidean distance matrix (computed
+    on VST-transformed counts) written by the R script -- the standard
+    QC companion to PCA for sample-level quality control.
+
+    Returns a DataFrame indexed by sample name, with one column per
+    sample (a square matrix), or None if this project's DESeq2 run
+    predates this file being written.
+    """
+    path = os.path.join(output_dir, "sample_distance_matrix.csv")
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path)
+    df = df.set_index("sample")
+    return df
+
+
+def detect_sample_clustering_mismatch(distance_df, meta_df, group_column):
+    """
+    For each sample, check whether its single NEAREST neighbor (by the
+    sample-to-sample distance matrix) belongs to the same group_column
+    value as itself. A sample whose closest match is in a DIFFERENT
+    group is a concrete, specific reason to double-check that sample's
+    labeling or quality -- much more actionable than just eyeballing a
+    PCA plot or heatmap for anything that looks "off".
+
+    distance_df: square DataFrame from read_sample_distance_matrix
+        (index and columns both sample names).
+    meta_df: the project's metadata DataFrame (must have a "sample"
+        column and group_column).
+    group_column: which metadata column defines the "expected" grouping
+        to check against (e.g. the primary condition column).
+
+    Returns a list of dicts, one per mismatched sample:
+        [{"sample": str, "own_group": str, "nearest_neighbor": str,
+          "neighbor_group": str}, ...]
+    Empty list if every sample's nearest neighbor shares its own group,
+    or if inputs are missing/invalid.
+    """
+    if distance_df is None or meta_df is None or group_column not in meta_df.columns:
+        return []
+
+    sample_to_group = dict(zip(meta_df["sample"].astype(str), meta_df[group_column].astype(str)))
+    mismatches = []
+    for sample in distance_df.index:
+        if sample not in sample_to_group:
             continue
-        ss_between = 0.0
-        for _, group in pca_df.groupby(batch_column):
-            group_mean = group[pc].mean()
-            ss_between += len(group) * (group_mean - grand_mean) ** 2
-        results[pc] = round(100 * ss_between / ss_total, 1)
-    return results
+        own_group = sample_to_group[sample]
+        # Nearest neighbor = smallest distance excluding the sample
+        # itself (which is always 0 on the diagonal).
+        distances_to_others = distance_df.loc[sample].drop(labels=[sample], errors="ignore")
+        if distances_to_others.empty:
+            continue
+        nearest = distances_to_others.idxmin()
+        neighbor_group = sample_to_group.get(nearest, "?")
+        if neighbor_group != own_group:
+            mismatches.append({
+                "sample": sample,
+                "own_group": own_group,
+                "nearest_neighbor": nearest,
+                "neighbor_group": neighbor_group,
+            })
+    return mismatches
+
+
+# ---------------------------------------------------------------------------
+# QC diagnostics: p-value histogram shape + MA plot bias
+# ---------------------------------------------------------------------------
+
+def classify_pvalue_histogram_shape(results_df, n_bins=20):
+    """
+    Classify the overall shape of a contrast's p-value distribution --
+    one of the most commonly recommended, cheapest sanity checks after
+    any differential expression run, since specific shapes map to
+    specific, well-known problems:
+      - "healthy": a spike near 0 with an approximately flat/uniform
+        tail elsewhere -- the expected shape when there IS real
+        differential signal, mixed with a background of non-DE genes.
+      - "flat/uniform": no spike near 0 at all -- consistent with
+        little to no real differential expression signal in this
+        comparison (not necessarily a problem with the analysis
+        itself, but worth knowing before over-interpreting a small
+        number of "significant" hits, which may just be false
+        positives from multiple testing).
+      - "hump in the middle" or "anti-conservative" (more small
+        p-values than expected AND a hump away from 0/1): often
+        indicates an unmodeled covariate/batch effect distorting the
+        test.
+      - "spike near 1": often indicates overdispersion the model
+        underestimated, or a design/contrast specification issue.
+
+    This is a simple heuristic based on comparing the actual histogram
+    bin counts against what a uniform distribution would predict --
+    not a formal statistical test -- meant to give an immediate,
+    plain-language read rather than requiring the user to interpret
+    the shape themselves.
+
+    Returns a dict:
+        {
+            "shape": str,           # one of the categories above
+            "message": str,         # plain-language explanation
+            "counts": list[int],    # histogram bin counts, for plotting
+            "bin_edges": list[float],
+        }
+    """
+    pvalues = results_df["pvalue"].dropna()
+    if len(pvalues) < 10:
+        return {
+            "shape": "insufficient_data",
+            "message": "Not enough tested genes to assess the p-value distribution shape.",
+            "counts": [], "bin_edges": [],
+        }
+
+    counts, bin_edges = _histogram(pvalues.tolist(), n_bins, 0.0, 1.0)
+    n_total = len(pvalues)
+    expected_per_bin = n_total / n_bins
+
+    first_bin_count = counts[0]
+    last_bin_count = counts[-1]
+    # "Tail" bins exclude the first and last bin, used to judge whether
+    # the middle of the distribution is roughly flat (as expected for
+    # non-DE genes under the null) or itself elevated/humped. Both the
+    # AVERAGE across tail bins and the single MOST-elevated tail bin are
+    # checked (not just the average) -- a hump concentrated in just 1-2
+    # bins near the center (a classic batch-confounding signature) can
+    # otherwise be diluted into an unremarkable-looking average once
+    # spread across all ~18 tail bins, even though it's visually obvious
+    # and diagnostically meaningful.
+    tail_counts = counts[1:-1]
+    tail_mean = (sum(tail_counts) / len(tail_counts)) if tail_counts else 0
+    tail_max = max(tail_counts) if tail_counts else 0
+
+    # Checked in this specific order of precedence: a spike at either
+    # end (0 or 1) is checked FIRST and independently of the other, since
+    # a real spike at one end can coexist with an otherwise flat middle
+    # -- checking "is the middle flat" before "is there a spike at 1"
+    # would otherwise misclassify a genuine spike-near-1 pattern as
+    # merely "flat_uniform" (the middle bins alone do look flat; only
+    # the last bin is elevated). The "hump" check comes last since it
+    # specifically describes an elevated middle/background, which is a
+    # different, unrelated pattern from an end-spike.
+    if last_bin_count > expected_per_bin * 2 and first_bin_count <= expected_per_bin * 1.5:
+        shape = "spike_near_one"
+        message = (
+            "⚠️ There's an unusual spike near p = 1. This pattern often "
+            "shows up when the model has underestimated variability "
+            "(overdispersion) for some genes, or can indicate an issue "
+            "with how this contrast was specified -- worth double-"
+            "checking the design/contrast setup above."
+        )
+    elif first_bin_count > expected_per_bin * 2 and tail_mean <= expected_per_bin * 1.3:
+        shape = "healthy"
+        message = (
+            "✅ This looks like a healthy p-value distribution: a clear "
+            "spike near 0 (real differential signal) with a roughly flat "
+            "background elsewhere -- the expected pattern for a "
+            "comparison with genuine differentially expressed genes."
+        )
+    elif tail_mean > expected_per_bin * 1.5 or tail_max > expected_per_bin * 4:
+        shape = "hump_or_anticonservative"
+        message = (
+            "⚠️ The middle/background of this distribution looks elevated "
+            "rather than flat, which often points to an unmodeled source "
+            "of variation (like a batch effect not included in the design "
+            "formula) distorting the test. Check the PCA and sample "
+            "distance heatmap above for any structure not explained by "
+            "your design columns."
+        )
+    elif first_bin_count <= expected_per_bin * 1.3:
+        shape = "flat_uniform"
+        message = (
+            "ℹ️ This distribution looks roughly flat/uniform, with little "
+            "to no spike near 0 -- consistent with **little to no real "
+            "differential expression signal** in this comparison. Any "
+            "individually \"significant\" genes here may be more likely to "
+            "be false positives from multiple testing -- interpret with "
+            "extra caution."
+        )
+    else:
+        shape = "healthy"
+        message = (
+            "✅ This p-value distribution looks reasonable, with no major "
+            "red flags."
+        )
+
+    return {
+        "shape": shape,
+        "message": message,
+        "counts": counts,
+        "bin_edges": bin_edges,
+    }
+
+
+def _histogram(values, n_bins, lo, hi):
+    "Minimal dependency-free histogram, avoiding a numpy/scipy requirement for this one calculation."
+    width = (hi - lo) / n_bins
+    counts = [0] * n_bins
+    for v in values:
+        if v < lo or v > hi:
+            continue
+        idx = int((v - lo) / width)
+        if idx >= n_bins:
+            idx = n_bins - 1
+        counts[idx] += 1
+    bin_edges = [lo + i * width for i in range(n_bins + 1)]
+    return counts, bin_edges
+
+
+def classify_ma_bias(results_df, low_mean_percentile=25):
+    """
+    A simple, descriptive check for systematic bias in an MA plot: do
+    genes with a LOW mean expression show a meaningfully different
+    average fold-change direction/magnitude than genes with a HIGH mean
+    expression? A healthy MA plot is roughly symmetric around
+    log2FoldChange = 0 across the full range of expression -- a
+    systematic drift specifically among low-count genes is a classic
+    sign of a normalization problem or a strong compositional effect
+    (e.g. a small number of very highly expressed genes dominating the
+    size factor estimate).
+
+    low_mean_percentile: genes below this percentile of baseMean are
+        treated as "low-expression" for this comparison.
+
+    Returns a dict:
+        {
+            "low_mean_avg_lfc": float,
+            "high_mean_avg_lfc": float,
+            "flagged": bool,
+            "message": str,
+        }
+    """
+    valid = results_df.dropna(subset=["baseMean", "log2FoldChange"])
+    valid = valid[valid["baseMean"] > 0]
+    if len(valid) < 20:
+        return {
+            "low_mean_avg_lfc": None, "high_mean_avg_lfc": None,
+            "flagged": False,
+            "message": "Not enough genes with valid data to assess MA-plot bias.",
+        }
+
+    threshold = valid["baseMean"].quantile(low_mean_percentile / 100.0)
+    low_group = valid[valid["baseMean"] <= threshold]
+    high_group = valid[valid["baseMean"] > threshold]
+
+    low_avg = float(low_group["log2FoldChange"].mean())
+    high_avg = float(high_group["log2FoldChange"].mean())
+
+    # Flag if the low-expression group's average fold-change is both
+    # meaningfully non-zero AND clearly different from the
+    # high-expression group's average -- a modest asymmetry is normal,
+    # this threshold is set to only catch a fairly pronounced drift.
+    flagged = abs(low_avg) > 0.5 and abs(low_avg - high_avg) > 0.5
+
+    if flagged:
+        message = (
+            f"⚠️ Low-expression genes show a systematically different "
+            f"average fold-change ({low_avg:+.2f}) than high-expression "
+            f"genes ({high_avg:+.2f}). This pattern can indicate a "
+            "normalization issue or a strong compositional effect (e.g. a "
+            "few very highly expressed genes dominating size factor "
+            "estimation) -- check the size factor QC table above for any "
+            "outlier samples."
+        )
+    else:
+        message = (
+            f"✅ Low-expression genes ({low_avg:+.2f} average log2FC) and "
+            f"high-expression genes ({high_avg:+.2f} average log2FC) look "
+            "reasonably symmetric around zero -- no signs of a "
+            "normalization issue."
+        )
+    return {
+        "low_mean_avg_lfc": round(low_avg, 3),
+        "high_mean_avg_lfc": round(high_avg, 3),
+        "flagged": flagged,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# QC diagnostics: independent filtering + Cook's outlier explanations
+# ---------------------------------------------------------------------------
+
+def read_filter_threshold(output_dir, contrast_safe_name):
+    """
+    Read the independent-filtering mean-count threshold DESeq2 chose
+    for a specific contrast/LRT test (the baseMean cutoff below which
+    genes are excluded from multiple-testing correction, optimizing the
+    number of genes that pass at the target FDR).
+
+    Returns a float, or None if unavailable (e.g. an older project run
+    before this file was written, or independent filtering was not
+    applicable for this contrast).
+    """
+    path = os.path.join(output_dir, f"filter_threshold_{contrast_safe_name}.txt")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        content = f.read().strip()
+    try:
+        return float(content)
+    except ValueError:
+        return None
+
+
+def summarize_na_genes(results_df, filter_threshold=None):
+    """
+    Summarize the two distinct, legitimate reasons a gene can show NA
+    values in a DESeq2 results table, using the "cooks_outlier_flagged"
+    and "low_count_filtered" columns the R script now tags on every
+    results CSV (see _DESEQ2_R_SCRIPT) -- so the workspace can EXPLAIN
+    every NA row's cause in plain language rather than leaving the user
+    to wonder why a gene they expected to see is missing or blank.
+
+    filter_threshold: optional, the baseMean cutoff from
+        read_filter_threshold(), included in the message for context.
+
+    Returns a dict:
+        {
+            "n_cooks_outliers": int,
+            "n_low_count_filtered": int,
+            "cooks_outlier_genes": list[str],   # up to 20, for display
+            "cooks_outlier_sample_counts": {sample: count},  # which
+                samples are most often the outlier driving a flagged gene
+            "filter_threshold": float or None,
+            "message": str,
+        }
+    Gracefully handles older results files that predate these columns
+    (returns zeros with an explanatory message) rather than raising.
+    """
+    if "cooks_outlier_flagged" not in results_df.columns or "low_count_filtered" not in results_df.columns:
+        return {
+            "n_cooks_outliers": 0, "n_low_count_filtered": 0,
+            "cooks_outlier_genes": [], "cooks_outlier_sample_counts": {},
+            "filter_threshold": filter_threshold,
+            "message": (
+                "ℹ️ This project's results were generated before outlier/"
+                "filtering diagnostics were added -- re-run DESeq2 to see "
+                "this breakdown for future analyses."
+            ),
+        }
+
+    cooks_mask = results_df["cooks_outlier_flagged"].fillna(False)
+    filtered_mask = results_df["low_count_filtered"].fillna(False)
+
+    n_cooks = int(cooks_mask.sum())
+    n_filtered = int(filtered_mask.sum())
+
+    cooks_genes = results_df.loc[cooks_mask, "gene_id"].astype(str).tolist()
+
+    sample_counts = {}
+    if "max_cooks_sample" in results_df.columns:
+        sample_series = results_df.loc[cooks_mask, "max_cooks_sample"].dropna()
+        sample_counts = sample_series.value_counts().to_dict()
+
+    parts = []
+    if n_cooks:
+        top_sample_note = ""
+        if sample_counts:
+            top_sample, top_count = max(sample_counts.items(), key=lambda kv: kv[1])
+            top_sample_note = f" -- most often (**{top_count}** gene(s)) traced back to sample **{top_sample}**"
+        parts.append(
+            f"**{n_cooks:,} gene(s)** have their p-value set to NA because "
+            f"a single sample's count looks like it's driving the result "
+            f"(Cook's distance outlier){top_sample_note}. This is DESeq2's "
+            "own built-in protection against one unusual sample distorting "
+            "a gene's result."
+        )
+    if n_filtered:
+        threshold_note = f" (mean normalized count below ~{filter_threshold:.1f})" if filter_threshold else ""
+        parts.append(
+            f"**{n_filtered:,} gene(s)** have their adjusted p-value "
+            f"(padj) set to NA{threshold_note} because DESeq2's independent "
+            "filtering excluded them from multiple-testing correction -- "
+            "genes with very low average expression have little power to "
+            "ever reach significance, so excluding them improves detection "
+            "power for the genes that remain. Their raw p-value is still "
+            "shown."
+        )
+    if not parts:
+        message = "✅ No genes were flagged as Cook's-distance outliers or excluded by independent filtering in this contrast."
+    else:
+        message = " ".join(parts)
+
+    return {
+        "n_cooks_outliers": n_cooks,
+        "n_low_count_filtered": n_filtered,
+        "cooks_outlier_genes": cooks_genes[:20],
+        "cooks_outlier_sample_counts": sample_counts,
+        "filter_threshold": filter_threshold,
+        "message": message,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -915,54 +1583,6 @@ def compute_venn_regions(gene_sets):
 # ---------------------------------------------------------------------------
 # clusterProfiler export
 # ---------------------------------------------------------------------------
-
-def compute_batch_variance_metric(pca_df, batch_column):
-    """
-    For a single PCA coordinates DataFrame (either the raw or the
-    batch-adjusted view — see read_pca_coordinates), estimate what
-    share of each principal component's own variance is attributable
-    to the batch column, as a simple QC diagnostic for batch
-    correction (used to build the "before vs. after" comparison shown
-    in the Differential Expression workspace).
-
-    For each available PC (up to PC4), this computes a one-way-ANOVA-
-    style effect size — the between-batch-group sum of squares divided
-    by the total sum of squares for that PC, expressed as a percentage
-    (0-100). This is 0% when every batch group has an identical mean
-    position on that PC (no batch effect along that axis), and
-    approaches 100% when a sample's position on that PC is almost
-    fully determined by which batch it's in.
-
-    This is a simple descriptive/QC diagnostic, not a formal
-    significance test — it's meant to give an intuitive, comparable
-    "how much did this shrink after adjustment" number, not a p-value.
-
-    Returns a dict {"PC1": pct, "PC2": pct, ...}, or an empty dict if
-    pca_df is None/missing the batch column.
-    """
-    if pca_df is None or not batch_column or batch_column not in pca_df.columns:
-        return {}
-
-    groups = pca_df[batch_column].astype(str)
-    pc_cols = [c for c in pca_df.columns if re.fullmatch(r"PC\d+", c)]
-
-    result = {}
-    for pc_col in sorted(pc_cols, key=lambda c: int(c[2:]))[:4]:
-        values = pca_df[pc_col].astype(float)
-        grand_mean = values.mean()
-        total_ss = ((values - grand_mean) ** 2).sum()
-        if total_ss == 0:
-            result[pc_col] = 0.0
-            continue
-        between_ss = 0.0
-        for _, sub in values.groupby(groups):
-            n = len(sub)
-            group_mean = sub.mean()
-            between_ss += n * (group_mean - grand_mean) ** 2
-        result[pc_col] = round(float(100 * between_ss / total_ss), 1)
-
-    return result
-
 
 def classify_regulation(results_df, padj_threshold=0.05, lfc_threshold=1.0):
     """

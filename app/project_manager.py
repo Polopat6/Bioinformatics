@@ -90,8 +90,104 @@ def posttrim_multiqc_dir(project_name):
 
 
 def reference_dir(project_name):
-    """Where the downloaded/uploaded transcriptome reference + Salmon index live."""
+    """
+    Where a CUSTOM (non-preset/user-uploaded) reference's files +
+    index live -- scoped to this one project only.
+
+    This is deliberately project-specific rather than shared: two
+    different projects' custom uploads have no guarantee of actually
+    being the same organism/assembly even if a user happens to name
+    them similarly, so sharing them would risk silently mixing up
+    unrelated references across projects. Preset (catalog) species use
+    shared_reference_dir() below instead, which IS shared across every
+    project that selects that species.
+    """
     return os.path.join(project_dir(project_name), "reference")
+
+
+# ---------------------------------------------------------------------------
+# Shared, project-independent storage for PRESET model organism
+# references -- separate from reference_dir() above, which remains
+# project-specific and is used only for custom/non-preset uploads.
+# ---------------------------------------------------------------------------
+#
+# Rationale: every project that selects the same preset organism (e.g.
+# "human") needs the exact same reference FASTA/GTF and the exact same
+# Salmon/STAR index -- there's no reason for a second, third, fourth...
+# project to separately re-download and re-build the same multi-GB
+# files that an earlier project already prepared. Keying these paths
+# by species ONLY (not by project) lets every project reuse the same
+# on-disk copy once it exists.
+#
+# Concurrency: since multiple projects (in separate Streamlit sessions/
+# processes) can select the same preset species at close to the same
+# time, simply checking "does this shared path already exist" and
+# downloading/building if not would race -- two processes could both
+# see "not there yet" and both start writing into the same shared
+# directory simultaneously, corrupting each other's output. See
+# reference_manager.py's ensure_shared_resource() for how this is made
+# safe (file locking + build into a private temp directory + atomic
+# rename into place only on full success) -- these path helpers only
+# define WHERE the shared resource lives, not how concurrent access to
+# it is made safe.
+SHARED_REFERENCES_ROOT = "data/shared_references"
+
+
+def shared_reference_dir(species_key):
+    """
+    Shared, project-independent directory for a PRESET model
+    organism's reference files, keyed only by species_key (e.g.
+    "human", "mouse") -- NOT by project. Every project that selects
+    this preset species reuses the exact same files here rather than
+    each downloading its own separate copy.
+    """
+    return os.path.join(SHARED_REFERENCES_ROOT, species_key)
+
+
+def shared_cdna_fasta_dir(species_key):
+    "Shared directory holding a preset species' downloaded cDNA/transcriptome FASTA (used for the Salmon path)."
+    return os.path.join(shared_reference_dir(species_key), "cdna")
+
+
+def shared_genome_dir(species_key):
+    "Shared directory holding a preset species' downloaded genome FASTA + GTF annotation (used for the STAR path, and as a Salmon fallback for species with no standalone cDNA FASTA)."
+    return os.path.join(shared_reference_dir(species_key), "genome")
+
+
+def shared_salmon_index_dir(species_key):
+    "Shared, project-independent Salmon index for a preset species -- built once, reused by every project using that species."
+    return os.path.join(shared_reference_dir(species_key), "salmon_index")
+
+
+def shared_star_index_dir(species_key):
+    "Shared, project-independent STAR genome index for a preset species -- built once, reused by every project using that species."
+    return os.path.join(shared_reference_dir(species_key), "star_index")
+
+
+def shared_tx2gene_dir(species_key):
+    "Shared directory holding a preset species' tx2gene mapping CSV (built once from the shared cDNA FASTA, reused by every project)."
+    return os.path.join(shared_reference_dir(species_key), "tx2gene")
+
+
+def shared_gene_symbol_map_path(species_key):
+    "Shared gene_id -> gene_symbol mapping CSV for a preset species, built once from the shared reference and reused by every project using that species."
+    return os.path.join(shared_reference_dir(species_key), "gene_symbol_map.csv")
+
+
+def get_effective_reference_dir(project_name, species_key, is_custom):
+    """
+    The single source of truth for "where does THIS project's
+    reference actually live" -- shared_reference_dir(species_key) for
+    a preset organism, or the project's own private reference_dir()
+    for a custom upload. Every place that currently does
+    `reference_dir = pm.reference_dir(project)` in alignment_workspace.py
+    should instead call this function once is_custom/species_key are
+    known, so preset species correctly resolve to the shared location
+    while custom uploads keep their existing per-project isolation.
+    """
+    if is_custom or not species_key:
+        return reference_dir(project_name)
+    return shared_reference_dir(species_key)
 
 
 def salmon_index_dir(project_name):

@@ -31,6 +31,22 @@ to the UI verbatim from R's own error message, since we can't detect a
 missing R package without actually attempting to load it (same
 limitation as deseq2_manager.py's Rscript/DESeq2 check).
 
+--- IMPORTANT: versioned accessions (e.g. "ENSG00000141510.5") ---
+Ensembl gene/transcript/protein IDs and RefSeq accessions are often
+stored WITH a trailing ".N" version suffix (Ensembl's own GTF/FASTA
+files include it, and many downstream tools preserve it). However,
+AnnotationDbi's OrgDb-backed bitr() is keyed on the UNVERSIONED
+accession only -- passing versioned IDs in makes bitr() report every
+single one as invalid ("None of the keys entered are valid keys for
+'ENSEMBL'"), even though the underlying accession is perfectly valid.
+strip_id_version() / run_bitr_conversion() below automatically strip
+this suffix before the R-side lookup (for ENSEMBL/ENSEMBLTRANS/
+ENSEMBLPROT/REFSEQ specifically -- the namespaces that actually use
+versioning), then map the result back onto the ORIGINAL (possibly
+versioned) input IDs, so callers never need to think about this
+themselves and the returned mapping is always keyed exactly as the
+input was.
+
 --- A note on "SYMBOL" not being universal ---
 Every OrgDb package supports different keytypes(), and a few of this
 app's preset species deviate from the "obvious" choice:
@@ -49,7 +65,6 @@ app's preset species deviate from the "obvious" choice:
     directly rather than minting its own ENS-prefixed ID for these
     species). detect_id_type() below recognizes both natively.
 """
-import csv
 import json
 import os
 import re
@@ -144,6 +159,47 @@ COMMON_KEY_TYPES = [
 
 
 # ---------------------------------------------------------------------------
+# Versioned accession handling (e.g. "ENSG00000141510.5" -> "ENSG00000141510")
+# ---------------------------------------------------------------------------
+
+# Only Ensembl gene/transcript/protein IDs and RefSeq accessions use a
+# trailing ".N" version suffix in practice among the namespaces this app
+# deals with -- Entrez IDs, UniProt accessions, gene symbols, FlyBase/
+# WormBase IDs, and yeast ORF names are never versioned this way, so
+# they're deliberately left out of this map (stripping a "version" from
+# something that was never versioned to begin with could otherwise
+# accidentally truncate a legitimately different, unrelated ID).
+_VERSIONED_ID_PATTERNS = {
+    "ENSEMBL":      re.compile(r"^(ENS[A-Z]*G\d+)\.\d+$"),
+    "ENSEMBLTRANS": re.compile(r"^(ENS[A-Z]*T\d+)\.\d+$"),
+    "ENSEMBLPROT":  re.compile(r"^(ENS[A-Z]*P\d+)\.\d+$"),
+    "REFSEQ":       re.compile(r"^([NXY][MPRC]_\d+)\.\d+$"),
+}
+
+
+def strip_id_version(gene_id, id_type):
+    """
+    Strip a trailing version suffix (e.g. the ".5" in
+    "ENSG00000141510.5") from a gene ID string, if id_type is a
+    namespace known to use versioned accessions (see
+    _VERSIONED_ID_PATTERNS above). bitr()/AnnotationDbi's OrgDb lookups
+    are keyed on the UNVERSIONED accession only -- a version suffix
+    causes bitr() to report every ID as invalid ("None of the keys
+    entered are valid keys for ..."), even though the underlying
+    accession is perfectly valid.
+
+    Returns the input unchanged if it doesn't match a versioned pattern
+    for this id_type (e.g. it was already unversioned, or this id_type
+    doesn't use versions at all).
+    """
+    pattern = _VERSIONED_ID_PATTERNS.get(id_type)
+    if not pattern:
+        return gene_id
+    match = pattern.match(gene_id)
+    return match.group(1) if match else gene_id
+
+
+# ---------------------------------------------------------------------------
 # ID type auto-detection
 # ---------------------------------------------------------------------------
 
@@ -154,19 +210,24 @@ COMMON_KEY_TYPES = [
 # ENSMUSG for mouse, ENSDARG for zebrafish, ...) but all share the same
 # "ENS" + optional 3-4 letter species code + "G" (gene)/"T" (transcript)
 # structure, so one pattern covers every Ensembl vertebrate preset
-# species this app supports. Several non-vertebrate preset species
-# (fly, worm, yeast) use their native community database's own ID
-# scheme instead, since Ensembl imports these directly from
+# species this app supports. These Ensembl/RefSeq patterns are
+# deliberately NOT end-anchored (no trailing "$"), so a versioned
+# accession like "ENSG00000141510.5" or "NM_000546.6" is still detected
+# correctly as ENSEMBL/REFSEQ -- version-STRIPPING for the actual bitr()
+# call is handled separately by strip_id_version() above, but detection
+# itself should succeed either way. Several non-vertebrate preset
+# species (fly, worm, yeast) use their native community database's own
+# ID scheme instead, since Ensembl imports these directly from
 # FlyBase/WormBase/SGD rather than minting an "ENS"-prefixed ID -- those
 # get their own dedicated patterns below.
 _ID_PATTERNS = [
     ("FLYBASE",      re.compile(r"^FBgn\d+$")),                       # Drosophila (FlyBase gene ID)
     ("WORMBASE",      re.compile(r"^WBGene\d+$")),                     # C. elegans (WormBase gene ID)
     ("ORF",          re.compile(r"^Y[A-P][LR]\d{3}[WC](-[A-Z])?$")),   # Yeast systematic ORF name (SGD)
-    ("ENSEMBLTRANS", re.compile(r"^ENS[A-Z]*T\d+")),                   # ENST/ENSMUST/ENSDART...
-    ("ENSEMBLPROT",  re.compile(r"^ENS[A-Z]*P\d+")),                   # ENSP/ENSMUSP/ENSDARP...
-    ("ENSEMBL",      re.compile(r"^ENS[A-Z]*G\d+")),                   # ENSG/ENSMUSG/ENSDARG... (gene)
-    ("REFSEQ",       re.compile(r"^[NXY][MPRC]_\d+")),                 # NM_/NP_/NR_/XM_/XP_/XR_/NC_...
+    ("ENSEMBLTRANS", re.compile(r"^ENS[A-Z]*T\d+")),                   # ENST/ENSMUST/ENSDART... (version suffix tolerated)
+    ("ENSEMBLPROT",  re.compile(r"^ENS[A-Z]*P\d+")),                   # ENSP/ENSMUSP/ENSDARP... (version suffix tolerated)
+    ("ENSEMBL",      re.compile(r"^ENS[A-Z]*G\d+")),                   # ENSG/ENSMUSG/ENSDARG... (gene; version suffix tolerated)
+    ("REFSEQ",       re.compile(r"^[NXY][MPRC]_\d+")),                 # NM_/NP_/NR_/XM_/XP_/XR_/NC_... (version suffix tolerated)
     ("UNIPROT",      re.compile(r"^[A-NR-Z][0-9][A-Z0-9]{3}[0-9]$|^[OPQ][0-9][A-Z0-9]{3}[0-9]$")),
     ("ENTREZID",     re.compile(r"^\d+$")),                            # Plain numeric Entrez Gene ID
 ]
@@ -182,6 +243,9 @@ def detect_id_type(gene_ids, sample_size=200):
             "detected_type": str,      # one of _ID_PATTERNS' names, or "SYMBOL"
             "match_fraction": float,   # 0.0-1.0, how many of the sampled IDs matched
             "example_ids": [str, ...], # a few example IDs, for the user to sanity-check
+            "has_version_suffix": bool,  # True if a majority of the sample
+                                          # looks versioned (e.g. "ENSG...5")
+                                          # for a namespace that supports it
         }
 
     "SYMBOL" is returned when no database-ID pattern matches a strong
@@ -192,7 +256,7 @@ def detect_id_type(gene_ids, sample_size=200):
     """
     ids = [str(g) for g in gene_ids if pd.notna(g)]
     if not ids:
-        return {"detected_type": "SYMBOL", "match_fraction": 0.0, "example_ids": []}
+        return {"detected_type": "SYMBOL", "match_fraction": 0.0, "example_ids": [], "has_version_suffix": False}
 
     sample = ids[:sample_size]
     best_type, best_count = "SYMBOL", 0
@@ -209,10 +273,16 @@ def detect_id_type(gene_ids, sample_size=200):
     if match_fraction < 0.5:
         best_type = "SYMBOL"
 
+    has_version_suffix = False
+    if best_type in _VERSIONED_ID_PATTERNS:
+        versioned_count = sum(1 for gid in sample if strip_id_version(gid, best_type) != gid)
+        has_version_suffix = versioned_count >= (len(sample) * 0.5)
+
     return {
         "detected_type": best_type,
         "match_fraction": match_fraction,
         "example_ids": ids[:5],
+        "has_version_suffix": has_version_suffix,
     }
 
 
@@ -223,7 +293,10 @@ def detect_id_type(gene_ids, sample_size=200):
 # This script is written to a temp file and executed via Rscript,
 # mirroring deseq2_manager.py's _DESEQ2_R_SCRIPT pattern: a single
 # positional argument (a path to a JSON "job spec" file) rather than
-# plain CLI args, since the gene ID list can be very large.
+# plain CLI args, since the gene ID list can be very large. Note that
+# by the time gene_ids reaches this script, any version suffixes have
+# ALREADY been stripped by run_bitr_conversion() below -- this script
+# never needs to know about versioning at all.
 _BITR_R_SCRIPT = r'''
 suppressMessages({
   library(jsonlite)
@@ -280,7 +353,12 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
     using clusterProfiler::bitr(), via an Rscript subprocess.
 
     gene_ids: list/Series of gene ID strings to convert (e.g. every
-        gene_id in the project's counts matrix)
+        gene_id in the project's counts matrix) -- these may include
+        versioned Ensembl/RefSeq accessions (e.g. "ENSG00000141510.5");
+        version suffixes are stripped automatically before the R-side
+        lookup (see strip_id_version() above) and the returned mapping
+        is keyed back by the ORIGINAL (possibly versioned) input ID, so
+        callers never need to handle this themselves.
     from_type, to_type: Bioconductor keytype strings (see
         COMMON_KEY_TYPES), e.g. "ENSEMBL" -> "SYMBOL"
     orgdb_package: the Bioconductor OrgDb package name for this species
@@ -292,18 +370,24 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
         {
             "success": bool,
             "message": str,           # human-readable status/error
-            "mapping": dict,          # {gene_id: converted_id_or_original_id}
-                                       # -- covers EVERY input gene_id,
+            "mapping": dict,          # {original_gene_id: converted_id_or_original_id}
+                                       # -- covers EVERY input gene_id
+                                       # (keyed exactly as passed in,
+                                       # version suffix and all),
                                        # falling back to the original ID
                                        # for anything bitr() couldn't
                                        # match, so nothing is ever
                                        # silently dropped
             "n_converted": int,       # how many WERE successfully converted
             "n_total": int,           # total unique input IDs
+            "n_version_stripped": int,  # how many input IDs had a
+                                         # version suffix stripped before
+                                         # lookup (0 if from_type isn't a
+                                         # versioned namespace)
         }
     """
-    unique_ids = sorted(set(str(g) for g in gene_ids if pd.notna(g)))
-    n_total = len(unique_ids)
+    unique_ids_raw = sorted(set(str(g) for g in gene_ids if pd.notna(g)))
+    n_total = len(unique_ids_raw)
 
     if not bitr_tools_available():
         return {
@@ -314,9 +398,10 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
                 "annotation package) needs to be installed in your "
                 "environment before ID conversion can run."
             ),
-            "mapping": {gid: gid for gid in unique_ids},
+            "mapping": {gid: gid for gid in unique_ids_raw},
             "n_converted": 0,
             "n_total": n_total,
+            "n_version_stripped": 0,
         }
 
     if n_total == 0:
@@ -326,12 +411,31 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
             "mapping": {},
             "n_converted": 0,
             "n_total": 0,
+            "n_version_stripped": 0,
         }
+
+    # Strip version suffixes (e.g. "ENSG00000141510.5" ->
+    # "ENSG00000141510") before sending IDs to bitr() -- see this
+    # module's docstring for why. Multiple originally-versioned IDs
+    # could in principle collapse to the same stripped ID (e.g. two
+    # different Ensembl release versions of the same gene both present
+    # in one project's data), so we keep a stripped_id -> [original_ids]
+    # reverse map to correctly propagate one lookup result back to
+    # every original input that mapped to it.
+    stripped_to_originals = {}
+    for original_id in unique_ids_raw:
+        stripped_id = strip_id_version(original_id, from_type)
+        stripped_to_originals.setdefault(stripped_id, []).append(original_id)
+
+    lookup_ids = sorted(stripped_to_originals.keys())
+    n_version_stripped = sum(
+        1 for gid in unique_ids_raw if strip_id_version(gid, from_type) != gid
+    )
 
     os.makedirs(work_dir, exist_ok=True)
     output_csv_path = os.path.join(work_dir, "bitr_output.csv")
     job_spec = {
-        "gene_ids": unique_ids,
+        "gene_ids": lookup_ids,
         "from_type": from_type,
         "to_type": to_type,
         "orgdb_package": orgdb_package,
@@ -355,43 +459,64 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
         return {
             "success": False,
             "message": f"ID conversion failed: {(e.stdout or '') + (e.stderr or '')}",
-            "mapping": {gid: gid for gid in unique_ids},
+            "mapping": {gid: gid for gid in unique_ids_raw},
             "n_converted": 0,
             "n_total": n_total,
+            "n_version_stripped": n_version_stripped,
         }
     except subprocess.TimeoutExpired:
         return {
             "success": False,
             "message": "ID conversion timed out after 10 minutes.",
-            "mapping": {gid: gid for gid in unique_ids},
+            "mapping": {gid: gid for gid in unique_ids_raw},
             "n_converted": 0,
             "n_total": n_total,
+            "n_version_stripped": n_version_stripped,
         }
 
     if not os.path.exists(output_csv_path):
         return {
             "success": False,
             "message": f"Conversion script ran but produced no output. Log: {log}",
-            "mapping": {gid: gid for gid in unique_ids},
+            "mapping": {gid: gid for gid in unique_ids_raw},
             "n_converted": 0,
             "n_total": n_total,
+            "n_version_stripped": n_version_stripped,
         }
 
     result_df = pd.read_csv(output_csv_path)
-    converted = dict(zip(result_df["gene_id"].astype(str), result_df["converted_id"].astype(str)))
+    converted_by_stripped_id = dict(
+        zip(result_df["gene_id"].astype(str), result_df["converted_id"].astype(str))
+    )
 
-    # Build the FULL mapping covering every input ID, falling back to
-    # the original ID for anything bitr() couldn't match -- so callers
-    # never need to handle "missing" entries separately, consistent
-    # with reference_manager.py's extract_gene_symbol_map_from_*
-    # fallback convention.
-    mapping = {gid: converted.get(gid, gid) for gid in unique_ids}
-    n_converted = len(converted)
+    # Propagate each stripped-ID lookup result back onto every ORIGINAL
+    # input ID that produced it (usually just one, but see the
+    # collapsing note above), falling back to the original ID itself
+    # for anything bitr() couldn't match -- so callers never need to
+    # handle "missing" entries separately, consistent with
+    # reference_manager.py's extract_gene_symbol_map_from_* fallback
+    # convention.
+    mapping = {}
+    n_converted = 0
+    for stripped_id, original_ids in stripped_to_originals.items():
+        converted_value = converted_by_stripped_id.get(stripped_id)
+        for original_id in original_ids:
+            if converted_value:
+                mapping[original_id] = converted_value
+                n_converted += 1
+            else:
+                mapping[original_id] = original_id
 
     pct = (n_converted / n_total * 100) if n_total else 0.0
+    version_note = (
+        f" ({n_version_stripped:,} of these had a version suffix like "
+        f"'.5' stripped before lookup, e.g. 'ENSG00000141510.5' -> "
+        f"'ENSG00000141510'.)"
+        if n_version_stripped else ""
+    )
     message = (
         f"Converted {n_converted:,} of {n_total:,} gene ID(s) ({pct:.1f}%) "
-        f"from {from_type} to {to_type}. The remaining "
+        f"from {from_type} to {to_type}.{version_note} The remaining "
         f"{n_total - n_converted:,} gene(s) could not be matched and will "
         f"display their original {from_type} ID."
     )
@@ -402,4 +527,5 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
         "mapping": mapping,
         "n_converted": n_converted,
         "n_total": n_total,
+        "n_version_stripped": n_version_stripped,
     }

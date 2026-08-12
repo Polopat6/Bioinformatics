@@ -28,14 +28,17 @@ NCBI RefSeq's assembly-specific FTP path for E. coli K-12 MG1655
 permanently fixed path, so this URL will not go stale.
 """
 
+import fcntl
 import gzip
 import os
 import re
 import shutil
 import ssl
 import subprocess
+import time
 import urllib.request
 import urllib.error
+from datetime import datetime
 
 # On some systems (notably macOS with Python installed from python.org),
 # Python's SSL module doesn't automatically use the operating system's
@@ -165,6 +168,208 @@ REFERENCE_CATALOG = {
 }
 
 ENSEMBL_BASE_URL = "https://ftp.ensembl.org/pub"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency-safe shared resource preparation
+# ---------------------------------------------------------------------------
+#
+# Used for PRESET species' shared, project-independent reference files
+# and Salmon/STAR indices (see project_manager.py's shared_reference_dir()
+# and friends) -- NOT needed for custom uploads, since those are always
+# scoped to a single project and therefore can never race with another
+# project's concurrent access to the same files.
+#
+# The core problem this solves: if two different projects (each
+# potentially running in its own Streamlit session/process) select the
+# same preset species at close to the same time, and neither has
+# downloaded/built it yet, naively checking "does this shared path
+# exist?" and downloading/building if not would race -- both processes
+# could see "not there yet" and both start writing into the same shared
+# directory at the same time, corrupting each other's output, or one
+# process could start using a reference that a second process is
+# simultaneously overwriting mid-download/mid-build.
+#
+# The fix has two parts, used together:
+#
+#   1. File locking via fcntl.flock -- an OS-level, cross-PROCESS lock
+#      (unlike a Python threading.Lock, which only protects against
+#      concurrent threads within a single process, not concurrent
+#      Streamlit sessions/processes, which is how real concurrent
+#      users of this app are actually structured). A lock file exists
+#      per shared resource; only one process can hold it at a time,
+#      and every other process trying to acquire it simply waits until
+#      the current holder releases it (or crashes -- flock's lock is
+#      automatically released by the OS if the holding process dies
+#      for any reason, so there's no separate "detect and clean up a
+#      stale lock" logic needed, unlike a naive lock-file-existence
+#      scheme).
+#
+#   2. Build into a private temporary directory, then perform a single
+#      atomic os.rename() into the final shared location ONLY once the
+#      build fully succeeds. This guarantees the final shared directory
+#      either doesn't exist yet, or contains a fully-completed prior
+#      build -- there is no window where a concurrent reader could see
+#      a half-downloaded/half-indexed shared directory, and a crashed
+#      or failed build never leaves partial output behind at the final
+#      path for a later attempt to mistake for a successful one.
+#
+# Together, these mean: the FIRST project to request a given preset
+# species does the real work (download or index build) while holding
+# the lock; every OTHER project requesting the same species at the
+# same time waits (with live progress feedback via
+# wait_message_callback) until the first one finishes, then simply
+# reuses the now-ready shared files -- no duplicate downloads, no
+# duplicate index builds, no risk of two processes corrupting the same
+# directory.
+
+def _resource_is_ready(resource_dir):
+    """
+    A shared resource is considered "ready" if its directory exists and
+    contains at least one file/subdirectory -- this is checked both
+    before attempting to acquire a lock (fast path: nothing to do) and
+    immediately after acquiring one (in case another process finished
+    building it while this one was waiting for the lock).
+    """
+    return os.path.isdir(resource_dir) and len(os.listdir(resource_dir)) > 0
+
+
+def ensure_shared_resource(resource_dir, build_fn, wait_message_callback=None,
+                            poll_interval=5, force=False):
+    """
+    Ensure a shared, project-independent resource (a preset species'
+    downloaded reference files, or its built Salmon/STAR index) exists
+    at resource_dir, safely handling the case where multiple projects
+    request the same resource at close to the same time -- see the
+    module-level comment above for the full concurrency rationale.
+
+    resource_dir: the FINAL destination directory for the resource
+        (e.g. project_manager.shared_cdna_fasta_dir("human")). This
+        function guarantees resource_dir only ever comes into
+        existence via a single atomic rename from a completed temp
+        build -- callers can safely assume that if resource_dir exists
+        and is non-empty, it represents a fully-completed prior build,
+        never a partial/in-progress one.
+
+    build_fn(temp_dir) -> (success: bool, message: str): callback that
+        performs the actual download/extraction/index-build, writing
+        its COMPLETE output into temp_dir (never directly into
+        resource_dir) -- this function handles moving the finished
+        result into resource_dir atomically only after build_fn
+        reports success. build_fn should behave exactly like it would
+        if temp_dir were the real final destination (e.g. an existing
+        reference_manager.py function like get_transcriptome_fasta_for_salmon
+        or download_genome_and_gtf, called with temp_dir as its
+        dest_dir argument, needs no changes to support this).
+
+    wait_message_callback(elapsed_seconds): optional callback invoked
+        periodically (about every poll_interval seconds) while this
+        call is blocked waiting for a DIFFERENT process's build of the
+        SAME resource to finish -- lets the UI show live "another
+        project is currently preparing this reference, please wait..."
+        feedback instead of an unexplained silent pause. Never called
+        if this process acquires the lock immediately (the common,
+        no-contention case) or if the resource was already ready
+        before any locking was attempted.
+
+    force: if True, skips the "already ready, reuse it" fast path
+        entirely and always rebuilds -- used to support an explicit
+        user-requested "re-download"/"re-index" action on what is now
+        a SHARED resource. This is still fully lock-protected (so it
+        can never race with another process concurrently trying to
+        build or reuse the exact same resource), but note the one risk
+        this does NOT solve: if some OTHER project's alignment/
+        quantification run is actively reading the OLD version of
+        this shared resource while a force rebuild replaces it, that
+        other run could fail or behave unexpectedly once the files
+        underneath it change -- this function has no way to know
+        whether a shared resource is currently "in use" elsewhere, so
+        a force rebuild should be used thoughtfully (e.g. not while
+        you know other projects/users are actively running alignment
+        against the same species).
+
+    Returns (success: bool, message: str, built_by_this_call: bool).
+    built_by_this_call is True only if THIS call actually performed the
+    download/build (as opposed to finding the resource already ready,
+    or finding it ready after waiting for another process to finish
+    it) -- useful for the caller to decide whether to show a "built
+    successfully" vs. a "was already available" message.
+    """
+    # Fast path: already fully built (the common case after the first
+    # project sets up a given species) -- no lock needed at all. Never
+    # taken when force=True, since the whole point of force is to
+    # rebuild even though a ready copy already exists.
+    if not force and _resource_is_ready(resource_dir):
+        return True, "Already available (shared reference, reused from a previous build).", False
+
+    lock_path = resource_dir.rstrip(os.sep) + ".lock"
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+
+    lock_file = open(lock_path, "a+")
+    start_time = time.time()
+    try:
+        # Try to acquire the lock without blocking first, so a process
+        # that gets it immediately (no contention) never even enters
+        # the wait-and-poll loop or invokes wait_message_callback at
+        # all.
+        acquired = False
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            acquired = False
+
+        while not acquired:
+            elapsed = time.time() - start_time
+            if wait_message_callback:
+                wait_message_callback(elapsed)
+            time.sleep(poll_interval)
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+
+        # Lock acquired. Re-check: another process may have finished
+        # building this exact resource while we were waiting for the
+        # lock -- the single most common reason to be waiting at all.
+        # Skipped entirely when force=True, for the same reason as the
+        # pre-lock fast path above.
+        if not force and _resource_is_ready(resource_dir):
+            return True, "Already available (another project finished preparing it while this one was waiting).", False
+
+        # We hold the lock and either the resource isn't ready yet, or
+        # force=True was requested -- build it ourselves, into a
+        # private temp directory scoped to this process's PID (so two
+        # sequential failed attempts, or a process crash mid-build,
+        # never collide with a later attempt's temp directory).
+        temp_dir = resource_dir.rstrip(os.sep) + f".building.{os.getpid()}"
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        try:
+            success, message = build_fn(temp_dir)
+        except Exception as e:
+            success, message = False, f"Unexpected error while building shared resource: {e}"
+
+        if success:
+            # Atomic on the same filesystem -- resource_dir either
+            # doesn't exist yet, or (the normal case for force=True,
+            # or the rare case of a previous build somehow leaving
+            # something there without a lock) gets fully replaced in
+            # one step. There is no window where a concurrent reader
+            # could observe a half-populated resource_dir.
+            if os.path.isdir(resource_dir):
+                shutil.rmtree(resource_dir, ignore_errors=True)
+            os.rename(temp_dir, resource_dir)
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        return success, message, True
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 # ---------------------------------------------------------------------------
