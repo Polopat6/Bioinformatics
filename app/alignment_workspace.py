@@ -702,6 +702,9 @@ def render():
                 "needs to be done once per reference."
             )
 
+    reference_dir = pm.reference_dir(project)
+    os.makedirs(reference_dir, exist_ok=True)
+
     saved_species, saved_is_custom = pm.get_reference_choice(project)
 
     ref_source_options = ["🧬 Use a pre-loaded model organism", "📁 Upload my own reference (custom species)"]
@@ -1340,6 +1343,38 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
     # accurate, machine-specific default matters even more here.
     detected_cores, recommended_threads = pm.get_recommended_thread_count()
 
+    # --- Auto-detect read length from an actual trimmed sample, for
+    # STAR's --sjdbOverhang (ideally read_length - 1 per STAR's manual).
+    # Previously this app always used a fixed default of 100 regardless
+    # of the actual data -- fine for typical 100-150bp reads, but wrong
+    # for anything else (e.g. our own airway test data's 63bp reads,
+    # where the correct value is 62, not 99). Detected here (once, from
+    # the first usable sample) rather than left as a fixed guess, so
+    # the index build below is correctly sized for THIS project's
+    # actual read length automatically.
+    detected_read_length = None
+    for entry in manifest:
+        detected_read_length = qm.detect_fastq_read_length(entry["r1"], is_gzipped=True)
+        if detected_read_length:
+            break
+
+    if detected_read_length:
+        sjdb_overhang = detected_read_length - 1
+        st.caption(
+            f"📏 Detected read length: **{detected_read_length}bp** "
+            f"(from `{os.path.basename(manifest[0]['r1'])}`) -- using "
+            f"`--sjdbOverhang {sjdb_overhang}` for the genome index below."
+        )
+    else:
+        sjdb_overhang = 100
+        st.caption(
+            "📏 Could not automatically detect read length from your "
+            "trimmed reads -- falling back to the default "
+            "`--sjdbOverhang 100` (appropriate for typical 100-150bp "
+            "reads; if your reads are a very different length, this "
+            "may reduce splice-junction detection accuracy slightly)."
+        )
+
     # --- Index step ---
     st.subheader("🔧 STAR Genome Index")
     with st.expander("ℹ️ When would I need to re-index? (click to learn more)"):
@@ -1352,7 +1387,9 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
             "- Your read length changed substantially from previous "
             "samples (the index is optimized using a value called "
             "`sjdbOverhang`, ideally read length minus 1 — a big change "
-            "in read length can benefit from a fresh index)\n"
+            "in read length can benefit from a fresh index; this app "
+            "now detects your read length automatically each time, so "
+            "you'll see a note above if it changed)\n"
             "- The index seems corrupted or alignment is failing with "
             "unexplained errors\n\n"
             "You do **not** need to re-index just because you added new "
@@ -1360,7 +1397,13 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
             "lengths — the existing index will work fine for those.\n\n"
             "⚠️ Building a STAR index can require significant memory "
             "(16–30GB depending on species) and take a while — this is "
-            "normal and only happens once per reference."
+            "normal and only happens once per reference.\n\n"
+            "ℹ️ This app also automatically sizes STAR's "
+            "`--genomeSAindexNbases` parameter based on your genome's "
+            "actual size -- important for smaller genomes (a single "
+            "chromosome, a bacterial genome, or another small custom "
+            "reference), where STAR's large-genome default would "
+            "otherwise produce an oversized or invalid index."
         )
 
     # Preset species reuse a SHARED, project-independent STAR index --
@@ -1407,7 +1450,15 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
     if build_clicked or force_index:
         def _build_star_index_impl(temp_dir):
-            return qm.build_star_index(genome_fasta, gtf_path, temp_dir, threads=index_threads)
+            # genome_sa_index_nbases is left as None (the default) so
+            # build_star_index auto-computes it from the genome's
+            # actual length -- see quantification_manager.py's
+            # compute_genome_sa_index_nbases() docstring for why this
+            # matters, especially for smaller genomes.
+            return qm.build_star_index(
+                genome_fasta, gtf_path, temp_dir, threads=index_threads,
+                sjdb_overhang=sjdb_overhang,
+            )
 
         if index_is_shared:
             status_placeholder = st.empty()
@@ -1425,7 +1476,10 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
             status_placeholder.empty()
         else:
             with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
-                success, log = qm.build_star_index(genome_fasta, gtf_path, index_dir, threads=index_threads)
+                success, log = qm.build_star_index(
+                    genome_fasta, gtf_path, index_dir, threads=index_threads,
+                    sjdb_overhang=sjdb_overhang,
+                )
 
         if success:
             st.success("✅ STAR genome index built successfully.")
@@ -1459,6 +1513,57 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
         key="star_align_threads_slider",
     )
 
+    # --- Advanced STAR alignment options ---
+    # Exposed as a small set of well-established, commonly-used toggles
+    # rather than individual low-level flags -- a non-expert user has no
+    # meaningful basis to decide on any single underlying flag in
+    # isolation, so each option here bundles a validated, documented
+    # STAR feature/preset instead. See quantification_manager.py's
+    # run_star_align docstring for exactly what each one does.
+    with st.expander("⚙️ Advanced STAR options (optional)"):
+        use_two_pass = st.checkbox(
+            "Two-pass mode (better novel splice junction detection)",
+            value=False,
+            key="star_two_pass_checkbox",
+            help=(
+                "STAR aligns your reads once to discover splice "
+                "junctions, then re-aligns using those junctions as "
+                "extra annotation -- meaningfully improves detection of "
+                "splice junctions not already in your GTF. Most useful "
+                "for less-annotated/non-model organisms; roughly "
+                "doubles alignment time per sample. Well-annotated "
+                "genomes (human/mouse) benefit less since most real "
+                "junctions are usually already known."
+            ),
+        )
+        use_encode_options = st.checkbox(
+            "Use ENCODE-recommended filtering options",
+            value=False,
+            key="star_encode_options_checkbox",
+            help=(
+                "Applies the standard set of alignment filtering "
+                "settings used in the ENCODE project's own RNA-seq "
+                "pipelines (multimapping tolerance, splice junction "
+                "overhang minimums, mismatch tolerance, intron length "
+                "bounds). A well-established, commonly-used preset "
+                "bundle rather than a single tunable setting."
+            ),
+        )
+        add_strand_field = st.checkbox(
+            "Add strand field to BAM output",
+            value=False,
+            key="star_strand_field_checkbox",
+            help=(
+                "Annotates each alignment's strand in the output BAM "
+                "file based on intron motif. Only needed if you plan to "
+                "feed this project's BAM files into a downstream tool "
+                "that expects this strand tag (e.g. Cufflinks-family "
+                "tools) -- has no effect on the gene counts this app "
+                "itself produces, so most users can safely leave this "
+                "unchecked."
+            ),
+        )
+
     quant_label = "🔄 Re-run Alignment" if quant_done else "🚀 Align & Count All Samples"
     if quant_done and not st.session_state.get("_star_align_clicked"):
         st.success("✅ Alignment & counting has already been run for this project.")
@@ -1471,7 +1576,11 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
         for i, entry in enumerate(manifest):
             progress_bar.progress(i / n_samples, text=f"Aligning {i + 1}/{n_samples}: {entry['sample']}...")
-            success, log, sample_out_dir = qm.run_star_align(entry, index_dir, align_dir, threads=align_threads)
+            success, log, sample_out_dir = qm.run_star_align(
+                entry, index_dir, align_dir, threads=align_threads,
+                use_two_pass=use_two_pass, use_encode_options=use_encode_options,
+                add_strand_field=add_strand_field,
+            )
             mapping_rate = qm.parse_star_mapping_rate(sample_out_dir, entry["sample"]) if success else None
             results.append({
                 "Sample": entry["sample"],

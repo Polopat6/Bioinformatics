@@ -12,6 +12,7 @@ same reasoning as reference_manager.py.
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -194,17 +195,145 @@ def star_index_exists(index_dir):
     return os.path.exists(os.path.join(index_dir, "SAindex"))
 
 
-def build_star_index(genome_fasta, gtf_path, index_dir, threads=4, sjdb_overhang=100):
+def estimate_genome_length(genome_fasta):
+    """
+    Estimate a genome FASTA's total sequence length (bp), by summing
+    the length of every non-header line -- used to auto-compute STAR's
+    --genomeSAindexNbases for small genomes (see
+    compute_genome_sa_index_nbases below for why this matters).
+
+    This is a simple, dependency-free line-scan rather than a full
+    FASTA parse (we only need a total length, not per-sequence
+    lengths), so it stays fast even for a multi-GB genome FASTA.
+    """
+    total_length = 0
+    with open(genome_fasta, "r", errors="ignore") as f:
+        for line in f:
+            if line.startswith(">"):
+                continue
+            total_length += len(line.strip())
+    return total_length
+
+
+def compute_genome_sa_index_nbases(genome_length):
+    """
+    Compute STAR's recommended --genomeSAindexNbases value for a genome
+    of the given length, following STAR's own manual formula:
+
+        min(14, log2(GenomeLength) / 2 - 1)
+
+    STAR's default (14) is sized for large genomes (human/mouse-scale,
+    several Gb). For smaller genomes -- a single chromosome, a custom
+    non-model organism reference, a bacterial genome -- using the
+    default value produces an oversized, invalid, or badly-degraded
+    suffix array index; STAR's own log output explicitly recommends
+    reducing this value for small genomes. Since custom/non-model
+    species uploads are a core supported workflow in this app (see
+    alignment_workspace.py's custom reference path), and those are
+    disproportionately likely to be small genomes, this must be
+    computed automatically rather than left at STAR's large-genome
+    default in every case.
+
+    A floor of 4 is applied since going much lower rarely makes sense
+    and protects against a degenerate (near-zero or negative) result
+    for extremely small inputs (e.g. a single short custom contig).
+    """
+    if genome_length <= 0:
+        return 14
+    recommended = min(14, int(math.log2(genome_length) / 2 - 1))
+    return max(4, recommended)
+
+
+def detect_fastq_read_length(fastq_path, is_gzipped=True):
+    """
+    Detect the actual read length from a FASTQ file's first read, for
+    auto-computing STAR's --sjdbOverhang (which should be read_length -
+    1 per STAR's manual, not left at a fixed guess -- a mismatched
+    value measurably hurts splice-junction detection accuracy,
+    especially for read lengths that differ from the common
+    100-150bp range this app's previous fixed default of 100 assumed).
+
+    is_gzipped: whether fastq_path is gzip-compressed (true for every
+        trimmed FASTQ this app produces, per trimming_workspace.py's
+        fastp-based trimming step, which always writes .fastq.gz
+        output).
+
+    Returns the read length as an int, or None if the file couldn't be
+    read/parsed (e.g. empty file) -- callers should fall back to a
+    reasonable default (100) in that case rather than crashing.
+    """
+    try:
+        if is_gzipped:
+            import gzip
+            opener = gzip.open
+        else:
+            opener = open
+
+        with opener(fastq_path, "rt", errors="ignore") as f:
+            f.readline()  # FASTQ record 1: header line (starts with @)
+            sequence_line = f.readline().strip()  # FASTQ record 2: the actual sequence
+            if sequence_line:
+                return len(sequence_line)
+        return None
+    except (OSError, EOFError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# STAR: ENCODE-recommended options bundle
+# ---------------------------------------------------------------------------
+#
+# These are the standard, widely-used "ENCODE options" for bulk RNA-seq
+# alignment with STAR -- a well-established bundle (not our own
+# invention) that the STAR manual itself references as the settings
+# used in the ENCODE project's own RNA-seq pipelines. They're offered
+# here as ONE combined toggle rather than exposing each flag
+# individually, since a non-expert user has no meaningful way to decide
+# on any one of these in isolation -- they're designed and validated as
+# a set.
+ENCODE_OPTIONS_FLAGS = [
+    "--outFilterType", "BySJout",
+    "--outFilterMultimapNmax", "20",
+    "--alignSJoverhangMin", "8",
+    "--alignSJDBoverhangMin", "1",
+    "--outFilterMismatchNmax", "999",
+    "--outFilterMismatchNoverLmax", "0.04",
+    "--alignIntronMin", "20",
+    "--alignIntronMax", "1000000",
+    "--alignMatesGapMax", "1000000",
+]
+
+
+def build_star_index(genome_fasta, gtf_path, index_dir, threads=4, sjdb_overhang=100,
+                      genome_sa_index_nbases=None):
     """
     Build a STAR genome index from a genome FASTA + GTF annotation.
 
     sjdb_overhang should ideally be set to (read_length - 1); 100 is a
     reasonable default for typical 100-150bp reads and rarely matters
-    much in practice.
+    much in practice for genomes with reads in that common range. For
+    read lengths that differ meaningfully from that (e.g. this app's
+    older/shorter-read test data), the CALLER should compute this via
+    detect_fastq_read_length() on an actual trimmed FASTQ first, rather
+    than relying on this default -- see alignment_workspace.py's index
+    build step.
+
+    genome_sa_index_nbases: if None (the default), this is
+    AUTO-COMPUTED from the genome FASTA's actual length via
+    estimate_genome_length() + compute_genome_sa_index_nbases() --
+    critical for small (e.g. single-chromosome, bacterial, or other
+    custom non-model organism) genomes, where STAR's built-in default
+    (effectively 14) produces an oversized/invalid index. Pass an
+    explicit int only to override this auto-detection.
 
     Returns (success: bool, log: str).
     """
     os.makedirs(index_dir, exist_ok=True)
+
+    if genome_sa_index_nbases is None:
+        genome_length = estimate_genome_length(genome_fasta)
+        genome_sa_index_nbases = compute_genome_sa_index_nbases(genome_length)
+
     cmd = [
         "STAR",
         "--runMode", "genomeGenerate",
@@ -213,6 +342,7 @@ def build_star_index(genome_fasta, gtf_path, index_dir, threads=4, sjdb_overhang
         "--sjdbGTFfile", gtf_path,
         "--sjdbOverhang", str(sjdb_overhang),
         "--runThreadN", str(threads),
+        "--genomeSAindexNbases", str(genome_sa_index_nbases),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=7200)
@@ -227,11 +357,40 @@ def build_star_index(genome_fasta, gtf_path, index_dir, threads=4, sjdb_overhang
 # STAR: alignment + built-in gene counting
 # ---------------------------------------------------------------------------
 
-def run_star_align(sample_entry, index_dir, output_base_dir, threads=4):
+def run_star_align(sample_entry, index_dir, output_base_dir, threads=4,
+                    use_two_pass=False, use_encode_options=False,
+                    add_strand_field=False, limit_bam_sort_ram=None):
     """
     Run STAR alignment for a single sample (paired or single-end), using
     --quantMode GeneCounts to get gene-level counts directly from STAR
     without needing a separate counting tool (e.g. featureCounts).
+
+    use_two_pass: adds --twopassMode Basic. STAR performs a first-pass
+        alignment to discover novel splice junctions, then re-aligns
+        using those junctions as additional annotation -- meaningfully
+        improves novel splice junction sensitivity, at the cost of
+        roughly doubling alignment time per sample. Most valuable for
+        less-annotated/non-model organisms where the supplied GTF is
+        likely incomplete; less impactful for well-annotated genomes
+        like human/mouse where most real junctions are already known.
+
+    use_encode_options: adds the standard ENCODE-recommended options
+        bundle (see ENCODE_OPTIONS_FLAGS above) -- a well-established,
+        commonly-used preset for bulk RNA-seq, not exposed as
+        individual flags since they're designed/validated as a set.
+
+    add_strand_field: adds --outSAMstrandField intronMotif, which
+        annotates each alignment's strand in the output BAM based on
+        intron motif -- needed only if the resulting BAM will be fed
+        into a downstream tool that expects this strand tag (e.g.
+        Cufflinks-family tools); has no effect on the gene counts this
+        app itself uses, so most users can safely leave this off.
+
+    limit_bam_sort_ram: optional int (bytes) to explicitly cap the
+        memory STAR's BAM-sorting step is allowed to use, via
+        --limitBAMsortRAM. Only relevant if a run is failing with a
+        BAM-sorting memory error on a very large genome/very deep
+        sample -- left as None (STAR's own default behavior) otherwise.
 
     Output includes:
         <sample>_Aligned.sortedByCoord.out.bam
@@ -263,6 +422,16 @@ def run_star_align(sample_entry, index_dir, output_base_dir, threads=4):
         "--outFileNamePrefix", out_prefix,
         "--runThreadN", str(threads),
     ]
+
+    if use_two_pass:
+        cmd += ["--twopassMode", "Basic"]
+    if use_encode_options:
+        cmd += ENCODE_OPTIONS_FLAGS
+    if add_strand_field:
+        cmd += ["--outSAMstrandField", "intronMotif"]
+    if limit_bam_sort_ram:
+        cmd += ["--limitBAMsortRAM", str(limit_bam_sort_ram)]
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=7200)
         return True, result.stdout + result.stderr, sample_out_dir
