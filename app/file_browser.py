@@ -34,7 +34,17 @@ Design goals (shared by both widgets):
     _is_path_within_root() for the actual enforcement, which resolves
     symlinks and ".." components before checking, rather than doing a
     naive string-prefix comparison (which a symlink or ".." could
-    trivially bypass).
+    trivially bypass). The DEFAULT root (see _default_browse_root
+    below) is the filesystem root "/" itself -- i.e. by default there
+    is effectively no sandboxing restriction beyond the underlying OS's
+    own file permissions, since real deployments (e.g. an HPC user
+    needing to reach shared /scratch or /disk storage well outside
+    their own home directory) were found in practice to need to
+    navigate to arbitrary locations on the machine, not just their own
+    home directory tree. Callers that DO want a narrower, safer
+    restriction (e.g. a genuinely multi-tenant deployment where users
+    shouldn't browse each other's files) should pass an explicit,
+    narrower `root_dir` themselves.
   - Returns an existing file's or directory's ABSOLUTE PATH, not its
     contents -- nothing is read into memory or copied anywhere by
     either widget in this module. The whole point is to avoid moving/
@@ -57,14 +67,19 @@ def _default_browse_root():
     The default starting root for the file/directory browser, when the
     caller doesn't specify one explicitly.
 
-    Uses the user's home directory -- on an HPC or shared server, this
-    is "whatever directory the machine defaults a user into" on login
-    (the same directory an interactive SSH session starts in), which is
-    a natural, familiar starting point and (unlike the process's current
-    working directory) is stable regardless of where the Streamlit
-    process itself happens to have been launched from.
+    Defaults to "/" (the filesystem root) -- i.e. no sandboxing
+    restriction by default beyond the OS's own file permissions. This
+    was changed from an earlier default of the user's home directory
+    after real deployment testing on an HPC found that navigation
+    needed to reach shared storage locations (e.g. /scratch or /disk
+    mounts) well outside the user's own home directory tree, and a
+    home-directory sandbox made those genuinely necessary locations
+    unreachable. Callers that specifically want a narrower restriction
+    (e.g. a genuinely multi-tenant deployment where per-user isolation
+    matters) should pass an explicit, narrower `root_dir` of their own
+    rather than relying on this default.
     """
-    return os.path.expanduser("~")
+    return "/"
 
 
 def _is_path_within_root(candidate_path, root_path):
@@ -84,13 +99,21 @@ def _is_path_within_root(candidate_path, root_path):
          realpath follows symlinks to their real, final target before
          we compare.
 
+    When root_path is "/" (the default -- see _default_browse_root),
+    this check still runs (rather than being skipped as a redundant
+    no-op), since it's cheap and correctly handles the one edge case
+    that still matters even with a "/" root: os.path.realpath on a
+    malformed or highly unusual candidate path failing/raising, which
+    this function's caller can then treat as "not accessible" rather
+    than propagating an unexpected exception.
+
     Returns True only if the resolved candidate_path is root_path itself
     or a genuine descendant of it.
     """
     resolved_root = os.path.realpath(root_path)
     resolved_candidate = os.path.realpath(candidate_path)
     return resolved_candidate == resolved_root or resolved_candidate.startswith(
-        resolved_root + os.sep
+        resolved_root.rstrip(os.sep) + os.sep
     )
 
 
@@ -132,9 +155,18 @@ def _list_directory_entries(dir_path, file_extensions=None):
         if entry.startswith("."):
             continue
         full_path = os.path.join(dir_path, entry)
-        if os.path.isdir(full_path):
+        try:
+            is_dir = os.path.isdir(full_path)
+            is_file = os.path.isfile(full_path)
+        except OSError:
+            # Permission denied stat'ing this specific entry (can
+            # happen with a "/" root, e.g. certain system directories)
+            # -- skip just this one entry rather than failing the
+            # entire listing.
+            continue
+        if is_dir:
             subdirs.append(entry)
-        elif os.path.isfile(full_path):
+        elif is_file:
             if file_extensions is None or any(
                 entry.lower().endswith(ext.lower()) for ext in file_extensions
             ):
@@ -145,18 +177,26 @@ def _list_directory_entries(dir_path, file_extensions=None):
 
 def _render_directory_navigator(key_prefix, root_dir):
     """
-    Shared navigation UI (current-directory display + "go up"/"go into
-    subdirectory" controls) used by both render_server_file_browser and
+    Shared navigation UI (current-directory display + a "jump to an
+    exact path" text input + "go up"/"go into subdirectory" controls)
+    used by both render_server_file_browser and
     render_server_directory_browser below -- factored out since the
     navigation mechanics are identical between the two; they only
     differ in what the final "confirm"/"select" action actually does
     (pick a FILE within the current directory, vs. confirm the CURRENT
     DIRECTORY itself).
 
+    Includes a direct "jump to path" text input alongside point-and-
+    click navigation, since with the default root now being "/" (see
+    _default_browse_root), a user who already knows the exact path
+    they want (e.g. a known /scratch or /disk mount on an HPC) would
+    otherwise need to click through many nested directory levels one
+    at a time to reach it.
+
     Returns (current_dir, subdirs, files) -- the validated current
-    directory path (after handling any "go up"/"go into" click this
-    run) and that directory's listing, ready for the caller to render
-    its own file-vs-directory-specific confirmation UI underneath.
+    directory path (after handling any navigation action this run) and
+    that directory's listing, ready for the caller to render its own
+    file-vs-directory-specific confirmation UI underneath.
     """
     current_dir_key = f"{key_prefix}_browse_current_dir"
 
@@ -186,6 +226,33 @@ def _render_directory_navigator(key_prefix, root_dir):
     # always reflects current_dir exactly as computed on this run.
     st.code(current_dir, language=None)
 
+    # "Jump directly to a known path" -- a plain text input, separate
+    # from point-and-click navigation, so a user who already knows
+    # exactly where they want to go (e.g. a specific /scratch project
+    # path) doesn't have to click through every intermediate directory
+    # level one at a time to get there. Still fully subject to the same
+    # sandbox check as every other navigation action below.
+    jump_col, jump_btn_col = st.columns([4, 1])
+    with jump_col:
+        jump_path = st.text_input(
+            "Or jump directly to a path:",
+            value="", placeholder="e.g. /scratch/bioscratch/Podrab_lab",
+            key=f"{key_prefix}_browse_jump_path_input",
+        )
+    with jump_btn_col:
+        st.markdown("<div style='margin-top: 1.7rem;'></div>", unsafe_allow_html=True)
+        jump_clicked = st.button("Jump", key=f"{key_prefix}_browse_jump_btn")
+
+    if jump_clicked and jump_path:
+        if _is_path_within_root(jump_path, root_dir) and os.path.isdir(jump_path):
+            st.session_state[current_dir_key] = os.path.realpath(jump_path)
+            st.rerun()
+        else:
+            st.error(
+                f"⚠️ '{jump_path}' isn't accessible from here -- double "
+                "check the path exists and is a directory (not a file)."
+            )
+
     subdirs, _ = _list_directory_entries(current_dir, file_extensions=None)
 
     nav_options = ["(stay here)"]
@@ -199,7 +266,7 @@ def _render_directory_navigator(key_prefix, root_dir):
     )
     if st.button("Go", key=f"{key_prefix}_browse_nav_go_btn"):
         if nav_choice == ".. (go up one level)":
-            new_dir = os.path.dirname(current_dir)
+            new_dir = os.path.dirname(current_dir.rstrip(os.sep)) or os.sep
         elif nav_choice.startswith("📁 "):
             new_dir = os.path.join(current_dir, nav_choice[2:])
         else:
@@ -234,10 +301,11 @@ def render_server_file_browser(key_prefix, root_dir=None, file_extensions=None,
         navigation state doesn't collide with each other.
 
     root_dir: the sandboxed root directory this browser is allowed to
-        navigate within -- defaults to _default_browse_root() (the
-        user's home directory) if not given. The user can never
-        navigate to any path outside this root, no matter how they
-        interact with the widget (see _is_path_within_root).
+        navigate within -- defaults to _default_browse_root() ("/", the
+        filesystem root -- i.e. effectively unrestricted beyond the
+        OS's own file permissions) if not given. Pass an explicit,
+        narrower path here if a genuinely restricted sandbox is needed
+        for a specific deployment/call site.
 
     file_extensions: optional list of file extensions to filter the
         file listing to (e.g. [".fa", ".fasta", ".fa.gz", ".fna"] for a
@@ -317,7 +385,7 @@ def render_server_directory_browser(key_prefix, root_dir=None,
     full set of FASTQ files for many samples) rather than one file.
 
     key_prefix, root_dir: same meaning as in render_server_file_browser
-        above.
+        above (root_dir also defaults to "/" if not given).
 
     preview_extensions: optional list of file extensions (e.g.
         [".fastq", ".fastq.gz"]) -- if given, a live count of how many
