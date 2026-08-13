@@ -1148,6 +1148,20 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
     # Auto-detected thread default, same pattern as FastQC/fastp — used
     # for both the index-build step and the quantification step below,
     # since both accept Salmon's "-p" flag via quantification_manager.py.
+    #
+    # IMPORTANT: detected_cores (the machine's REAL core count) and
+    # recommended_threads (a conservative SUGGESTED starting value,
+    # deliberately capped low by get_recommended_thread_count) serve two
+    # different purposes here. Every slider below uses detected_cores
+    # for max_value (so a user on a large machine -- e.g. an HPC node --
+    # can actually select a high thread count) and recommended_threads
+    # only for the slider's initial `value` (a sensible, un-intimidating
+    # starting point). A previous version of this file incorrectly used
+    # max(8, recommended_threads) as max_value, which -- since
+    # recommended_threads is itself always <= 8 -- silently capped every
+    # slider at 8 regardless of how many cores were actually detected
+    # (confirmed via real testing on a 32-core machine, where every
+    # slider was stuck at a max of 8 despite 32 cores being available).
     detected_cores, recommended_threads = pm.get_recommended_thread_count()
 
     # --- Index step ---
@@ -1185,12 +1199,14 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
 
     index_threads = st.slider(
         "Threads for indexing:",
-        min_value=1, max_value=max(8, recommended_threads), value=recommended_threads,
+        min_value=1, max_value=detected_cores, value=recommended_threads,
         help=(
             f"Detected {detected_cores} CPU core(s) on this machine, so "
-            f"{recommended_threads} is suggested. Indexing is a one-time "
-            "step per reference, so it's usually fine to use most of "
-            "your available cores here."
+            f"{recommended_threads} is suggested as a starting point. "
+            "Indexing is a one-time step per reference, so it's usually "
+            "fine to use most (or all) of your available cores here -- "
+            "you can raise this slider up to your machine's full core "
+            "count if you'd like to speed this up further."
         ),
         key="salmon_index_threads_slider",
     )
@@ -1261,13 +1277,14 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
 
     quant_threads = st.slider(
         "Threads per sample (quantification):",
-        min_value=1, max_value=max(8, recommended_threads), value=recommended_threads,
+        min_value=1, max_value=detected_cores, value=recommended_threads,
         help=(
             f"Detected {detected_cores} CPU core(s) on this machine, so "
-            f"{recommended_threads} is suggested. Since samples are "
-            "quantified one at a time (not simultaneously), this "
-            "controls how many threads Salmon uses *within* each "
-            "sample's quantification run."
+            f"{recommended_threads} is suggested as a starting point. "
+            "Since samples are quantified one at a time (not "
+            "simultaneously), this controls how many threads Salmon "
+            "uses *within* each sample's quantification run -- you can "
+            "raise this up to your machine's full core count."
         ),
         key="salmon_quant_threads_slider",
     )
@@ -1340,7 +1357,10 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
     # Auto-detected thread default, same pattern as Salmon above — STAR
     # is generally more CPU- and memory-hungry than Salmon, so having an
-    # accurate, machine-specific default matters even more here.
+    # accurate, machine-specific default matters even more here. See
+    # the matching comment in _render_salmon_quantification above for
+    # why detected_cores (not recommended_threads) is used as every
+    # slider's max_value below.
     detected_cores, recommended_threads = pm.get_recommended_thread_count()
 
     # --- Auto-detect read length from an actual trimmed sample, for
@@ -1397,7 +1417,11 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
             "lengths — the existing index will work fine for those.\n\n"
             "⚠️ Building a STAR index can require significant memory "
             "(16–30GB depending on species) and take a while — this is "
-            "normal and only happens once per reference.\n\n"
+            "normal and only happens once per reference. Note that this "
+            "memory requirement is driven by genome size, not thread "
+            "count -- raising the thread count below speeds up the "
+            "CPU-bound portion of indexing, but won't reduce (or "
+            "increase) how much RAM is needed.\n\n"
             "ℹ️ This app also automatically sizes STAR's "
             "`--genomeSAindexNbases` parameter based on your genome's "
             "actual size -- important for smaller genomes (a single "
@@ -1414,13 +1438,17 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
     index_threads = st.slider(
         "Threads for indexing:",
-        min_value=1, max_value=max(8, recommended_threads), value=recommended_threads,
+        min_value=1, max_value=detected_cores, value=recommended_threads,
         help=(
             f"Detected {detected_cores} CPU core(s) on this machine, so "
-            f"{recommended_threads} is suggested. STAR's indexing step "
-            "is memory-hungry regardless of thread count (16-30GB "
-            "depending on species) — more threads mainly speeds up the "
-            "CPU-bound portion of indexing, not the memory requirement."
+            f"{recommended_threads} is suggested as a starting point. "
+            "STAR's indexing step needs a fairly fixed amount of memory "
+            "regardless of thread count (16-30GB depending on species) "
+            "-- but more threads DOES meaningfully speed up the "
+            "CPU-bound portion of indexing (STAR's suffix array "
+            "construction parallelizes well), so raising this toward "
+            "your machine's full core count is worthwhile if you have "
+            "the RAM to support it."
         ),
         key="star_index_threads_slider",
     )
@@ -1502,13 +1530,14 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
     align_threads = st.slider(
         "Threads per sample (alignment):",
-        min_value=1, max_value=max(8, recommended_threads), value=recommended_threads,
+        min_value=1, max_value=detected_cores, value=recommended_threads,
         help=(
             f"Detected {detected_cores} CPU core(s) on this machine, so "
-            f"{recommended_threads} is suggested. Since samples are "
-            "aligned one at a time (not simultaneously), this controls "
-            "how many threads STAR uses *within* each sample's "
-            "alignment run."
+            f"{recommended_threads} is suggested as a starting point. "
+            "Since samples are aligned one at a time (not "
+            "simultaneously), this controls how many threads STAR uses "
+            "*within* each sample's alignment run -- you can raise this "
+            "up to your machine's full core count."
         ),
         key="star_align_threads_slider",
     )
