@@ -551,42 +551,54 @@ def _render_sra_lookup_section(fastq_dir):
                 key="sra_selected_runs",
             )
 
+            # Auto-detected default (used below for both concurrency
+            # controls), same pattern used for FastQC/fastp/Salmon/STAR
+            # elsewhere in the app. detected_cores is the machine's REAL
+            # core count; recommended_threads is a conservative SUGGESTED
+            # starting value only -- every slider below uses
+            # detected_cores as its max_value (so a user on a large
+            # machine, e.g. an HPC node with dozens of cores, can
+            # actually select a high value) and recommended_threads only
+            # to pre-fill each slider's starting point. A previous
+            # version of this file capped BOTH sliders' max_value at a
+            # low fixed number regardless of the actual machine's core
+            # count -- confirmed via real testing on a 32-core HPC node,
+            # where these sliders were stuck well below the machine's
+            # real capacity.
+            detected_cores, recommended_threads = pm.get_recommended_thread_count()
+
             max_workers_help = (
                 "How many samples to download at the same time. Since "
                 "downloading is mostly spent waiting on network transfer "
                 "rather than heavy local computation, downloading several "
                 "samples at once is meaningfully faster than one at a "
-                "time. 3 is a reasonably safe default — increase it if "
-                "your internet connection is fast and you're downloading "
-                "many samples; decrease it if downloads start failing."
+                "time. A moderate default is suggested as a safe starting "
+                "point -- increase it if your internet connection is "
+                "fast and you're downloading many samples; decrease it "
+                "if downloads start failing."
             )
             max_workers = st.slider(
                 "Parallel downloads:",
-                min_value=1, max_value=6, value=3,
+                min_value=1, max_value=detected_cores, value=min(3, detected_cores),
                 help=max_workers_help,
                 key="sra_max_workers",
             )
 
-            # Auto-detected default, same pattern used for FastQC/fastp/
-            # Salmon/STAR elsewhere in the app. Note this multiplies with
-            # "Parallel downloads" above for total simultaneous thread
-            # usage (e.g. 3 concurrent downloads x 4 threads each = up to
-            # 12 threads active at once) — the help text calls this out
-            # explicitly since it's an easy thing to overlook when two
-            # separate sliders both affect the same underlying resource.
-            detected_cores, recommended_threads = pm.get_recommended_thread_count()
             threads_per_run = st.slider(
                 "Threads per download (fasterq-dump):",
-                min_value=1, max_value=max(8, recommended_threads), value=recommended_threads,
+                min_value=1, max_value=detected_cores, value=recommended_threads,
                 help=(
                     f"How many threads fasterq-dump uses while extracting "
                     f"*each* sample. Detected {detected_cores} CPU core(s) "
                     f"on this machine, so {recommended_threads} is "
-                    "suggested. This multiplies with 'Parallel downloads' "
-                    "above — e.g. 3 parallel downloads x 4 threads each "
-                    "means up to 12 threads active at once, so consider "
-                    "lowering one slider if you raise the other on a "
-                    "smaller machine."
+                    "suggested as a starting point. This multiplies with "
+                    "'Parallel downloads' above — e.g. 3 parallel "
+                    "downloads x 4 threads each means up to 12 threads "
+                    "active at once, so consider lowering one slider if "
+                    "you raise the other, especially on a smaller "
+                    "machine. Both sliders can be raised up to this "
+                    f"machine's full {detected_cores}-core capacity if "
+                    "you have the resources to support it."
                 ),
                 key="sra_threads_per_run",
             )
@@ -1080,16 +1092,29 @@ def render():
                 # once, same pattern as the SRA parallel-download slider —
                 # higher values speed up larger batches (e.g. 16 samples /
                 # 32 paired-end files) at the cost of using more CPU/RAM
-                # simultaneously. The default is auto-detected from this
-                # machine's actual CPU core count (via
-                # pm.get_recommended_thread_count()) rather than a fixed
-                # guess, so a small laptop and a large server each start
-                # from a sensible value instead of both defaulting to the
-                # same hardcoded number.
+                # simultaneously.
+                #
+                # IMPORTANT: detected_cores (the machine's REAL core
+                # count) and recommended_threads (a conservative
+                # SUGGESTED starting value, deliberately capped low by
+                # project_manager.py's get_recommended_thread_count) serve
+                # two different purposes here. This slider uses
+                # detected_cores for max_value (so a user on a large
+                # machine -- e.g. an HPC node with dozens of cores -- can
+                # actually select a high thread count) and
+                # recommended_threads only for the slider's initial
+                # `value` (a sensible, un-intimidating starting point). A
+                # previous version of this file incorrectly used
+                # max(8, recommended_threads) as max_value, which --
+                # since recommended_threads is itself always <= 8 --
+                # silently capped this slider at 8 regardless of how many
+                # cores were actually detected (confirmed via real
+                # testing on a 32-core machine, where this slider was
+                # stuck at a max of 8 despite 32 cores being available).
                 detected_cores, recommended_threads = pm.get_recommended_thread_count()
                 fastqc_threads = st.slider(
                     "FastQC parallel threads:",
-                    min_value=1, max_value=max(8, recommended_threads), value=recommended_threads,
+                    min_value=1, max_value=detected_cores, value=recommended_threads,
                     help=(
                         f"How many files FastQC processes at the same time. "
                         f"Detected {detected_cores} CPU core(s) on this "
@@ -1097,8 +1122,10 @@ def render():
                         "a starting point (leaving some headroom for the "
                         "rest of the system). Higher values finish faster "
                         "for larger sample batches but use more CPU and "
-                        "memory at once — lower this if your computer seems "
-                        "to be struggling."
+                        "memory at once -- you can raise this up to your "
+                        "machine's full core count if you have the "
+                        "resources to support it; lower it if your "
+                        "computer seems to be struggling."
                     ),
                     key="fastqc_threads_slider",
                 )
