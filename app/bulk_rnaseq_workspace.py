@@ -97,6 +97,11 @@ FASTQC_MODULE_GUIDANCE = {
 # argument, which expects no leading dot).
 FASTQ_BROWSE_EXTENSIONS = [".fastq", ".fastq.gz", ".fq", ".fq.gz"]
 
+# Same convention, for metadata files -- used by the metadata file
+# browser option added alongside manual upload (see
+# _render_metadata_file_input below).
+METADATA_BROWSE_EXTENSIONS = [".csv", ".txt", ".xlsx", ".xls"]
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -119,29 +124,73 @@ def _build_example_metadata_xlsx():
     return buffer.getvalue()
 
 
-def _read_metadata_file(uploaded_file):
+def _read_metadata_file(file_or_path):
     """
-    Read an uploaded metadata file into a DataFrame, supporting both CSV
+    Read a metadata file into a DataFrame, supporting both CSV
     (.csv/.txt) and Excel (.xlsx/.xls) formats since users without a
     bioinformatics background often work in Excel rather than plain text.
+
+    file_or_path: either a Streamlit UploadedFile object (from
+        st.file_uploader) OR a plain string path to an existing file on
+        disk (e.g. one selected via the server-side file browser, see
+        _render_metadata_file_input) -- pandas' read_csv/read_excel both
+        accept either a file-like object or a path string transparently,
+        so no special-casing is needed here beyond checking the
+        filename to decide CSV vs. Excel parsing.
 
     Returns (dataframe_or_none, error_message_or_none). If reading fails,
     a plain-language error message is returned instead of raising, so the
     caller can show it directly in the UI.
     """
-    filename = uploaded_file.name.lower()
+    filename = (
+        file_or_path.name if hasattr(file_or_path, "name") else os.path.basename(file_or_path)
+    ).lower()
     try:
         if filename.endswith((".xlsx", ".xls")):
             # Reads the first sheet by default, which matches the guidance
             # given to users in the help box above.
-            return pd.read_excel(uploaded_file, sheet_name=0), None
+            return pd.read_excel(file_or_path, sheet_name=0), None
         else:
-            return pd.read_csv(uploaded_file), None
+            return pd.read_csv(file_or_path), None
     except Exception as e:
         return None, (
             "⚠️ We couldn't read this file. Please double check that it's "
             "a valid .csv or .xlsx file with your sample data on the first "
             f"sheet/tab. (Technical detail: {e})"
+        )
+
+
+def _render_metadata_file_input():
+    """
+    Render the metadata file input point, offering a choice between
+    uploading from the user's own computer (the original behavior) or
+    browsing for a file already sitting on this server (e.g. an HPC's
+    /scratch storage) -- same rationale and pattern as
+    alignment_workspace.py's _render_reference_file_input for genome/GTF
+    files, applied here to metadata spreadsheets.
+
+    Returns a value suitable for passing straight to _read_metadata_file:
+    either a Streamlit UploadedFile object (upload path) or a plain path
+    string (browse path), or None if nothing has been provided this run.
+    """
+    input_method = st.radio(
+        "How would you like to provide your metadata file?",
+        ["📤 Upload from your computer", "📂 Browse files already on this server"],
+        key="metadata_input_method_radio",
+        horizontal=True,
+    )
+
+    if input_method.startswith("📤"):
+        return st.file_uploader(
+            "Upload your sample metadata file (.csv or .xlsx):",
+            type=["csv", "txt", "xlsx", "xls"],
+            key="metadata_upload",
+        )
+    else:
+        return fb.render_server_file_browser(
+            key_prefix="metadata_browse",
+            file_extensions=METADATA_BROWSE_EXTENSIONS,
+            label="Browse for your sample metadata file already on this server:",
         )
 
 
@@ -1073,16 +1122,20 @@ def render():
     # Only rendered if Step 1's SRA lookup was actually used this session.
     _render_sra_metadata_autofill_section(project, metadata_saved_path)
 
-    uploaded_meta = st.file_uploader(
-        "Upload your sample metadata file (.csv or .xlsx):",
-        type=["csv", "txt", "xlsx", "xls"],
-    )
+    # --- Provide metadata: upload OR browse for a file already on this
+    # server (same choice/pattern as the FASTQ and reference-file inputs
+    # elsewhere in the app -- see _render_metadata_file_input's
+    # docstring). uploaded_meta may be either a Streamlit UploadedFile
+    # (upload path) or a plain path string (browse path); both are
+    # handled transparently by _read_metadata_file below.
+    uploaded_meta = _render_metadata_file_input()
 
     raw_meta_df = None
     read_error = None
 
     if uploaded_meta:
-        # A fresh upload this session always takes priority.
+        # A fresh upload/browse-selection this session always takes
+        # priority.
         raw_meta_df, read_error = _read_metadata_file(uploaded_meta)
     elif os.path.exists(metadata_saved_path):
         # No new upload this session, but this project already has a
@@ -1090,7 +1143,7 @@ def render():
         # upload or an SRA auto-fill) — reload it so the project doesn't
         # appear empty.
         raw_meta_df = pd.read_csv(metadata_saved_path)
-        st.info(f"📋 Using previously saved metadata for this project ({len(raw_meta_df)} row(s)). Upload a new file above to replace it.")
+        st.info(f"📋 Using previously saved metadata for this project ({len(raw_meta_df)} row(s)). Provide a new file above to replace it.")
     elif os.path.exists(samplesheet_path):
         # Self-healing fallback for projects created before metadata.csv
         # persistence existed: the matched samplesheet already contains
@@ -1106,7 +1159,7 @@ def render():
         pm.save_sample_column(project, "sample")
         st.info(
             f"📋 Recovered metadata for this project from your previously "
-            f"saved sample list ({len(raw_meta_df)} row(s)). Upload a new "
+            f"saved sample list ({len(raw_meta_df)} row(s)). Provide a new "
             "file above if you'd like to replace it."
         )
 
@@ -1115,10 +1168,10 @@ def render():
         st.error(read_error)
     elif raw_meta_df is not None:
         if raw_meta_df.empty or len(raw_meta_df.columns) == 0:
-            st.error("⚠️ This file appears to be empty. Please check it and re-upload.")
+            st.error("⚠️ This file appears to be empty. Please check it and try again.")
         else:
             if uploaded_meta:
-                st.success("✅ Metadata file uploaded! Here's a preview:")
+                st.success("✅ Metadata file loaded! Here's a preview:")
             st.dataframe(raw_meta_df, use_container_width=True, hide_index=True)
 
             st.markdown("**Which column contains your sample names?**")
@@ -1171,7 +1224,7 @@ def render():
             raw_meta_df.to_csv(metadata_saved_path, index=False)
             pm.save_sample_column(project, sample_col)
     else:
-        st.info("No metadata file uploaded yet. Use the box above, or download the template if you're not sure how to format one.")
+        st.info("No metadata file provided yet. Use the options above, or download the template if you're not sure how to format one.")
 
     st.markdown("---")
 
