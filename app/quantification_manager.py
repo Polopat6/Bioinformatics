@@ -280,6 +280,98 @@ def detect_fastq_read_length(fastq_path, is_gzipped=True):
 
 
 # ---------------------------------------------------------------------------
+# STAR: file-descriptor-limit-aware BAM sorting bin count
+# ---------------------------------------------------------------------------
+#
+# STAR's coordinate-sorted BAM output (--outSAMtype BAM SortedByCoordinate)
+# works by splitting alignments into --outBAMsortingBinsN genome bins
+# (default: 50) and sorting each bin's worth of reads independently
+# before merging -- this parallelizes the sort across threads. The
+# practical consequence: STAR needs roughly (threads x bins) file
+# descriptors open SIMULTANEOUSLY during this step. With STAR's default
+# 50 bins and enough threads (e.g. 24, as used in real testing on a
+# 32-core HPC node), this can reach into the hundreds to low thousands
+# of simultaneously open files -- comfortably exceeding the DEFAULT
+# per-process open-file limit on many Linux systems/HPC login or
+# interactive nodes (commonly 1024, via `ulimit -n`), causing STAR to
+# fail with a "could not create output file ... BAMsort" error. This was
+# hit directly during real full-genome alignment testing (24 threads,
+# default 50 bins, default ulimit -n 1024 -> STAR crashed; confirmed
+# fixed by either raising ulimit -n in the shell, OR -- what this
+# function does instead -- lowering the bin count so the ACTUAL number
+# of simultaneously open files this run will need comfortably stays
+# under whatever this machine's limit happens to be, with no shell
+# configuration required at all).
+
+def get_open_file_limit():
+    """
+    Return this process's current soft limit on simultaneously open
+    file descriptors (equivalent to the shell's `ulimit -n`), via the
+    standard library's resource module (POSIX-only -- this app already
+    assumes a Linux/Mac environment for all its other external tools,
+    so this introduces no new platform constraint).
+
+    Returns an int, or a conservative fallback of 1024 (a very common
+    real-world default -- confirmed via direct testing to be the exact
+    value that caused a real STAR failure) if the limit can't be
+    determined for any reason (e.g. on a non-POSIX platform where the
+    resource module itself isn't available).
+    """
+    try:
+        import resource
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        return soft_limit
+    except (ImportError, ValueError, OSError):
+        return 1024
+
+
+def compute_safe_bam_sorting_bins(threads, file_descriptor_limit=None, default_bins=50,
+                                   safety_margin=0.5):
+    """
+    Compute a safe value for STAR's --outBAMsortingBinsN, given how many
+    threads will be used and this machine's actual open-file-descriptor
+    limit -- see the module-level comment above for the full rationale.
+
+    threads: the --runThreadN value this alignment run will actually
+        use -- more threads means more simultaneously open files for
+        any given bin count, so the safe bin count must scale down as
+        threads scales up.
+
+    file_descriptor_limit: this machine's open-file limit -- if None
+        (the default), detected automatically via get_open_file_limit().
+        Exposed as a parameter mainly to make this function easily
+        testable without needing to actually change the test process's
+        real ulimit.
+
+    default_bins: STAR's own default (50) -- returned unchanged
+        whenever the detected file-descriptor limit is generous enough
+        to comfortably support it at the given thread count, so runs on
+        typically-configured machines see no behavior change at all
+        from this safety logic.
+
+    safety_margin: what fraction of the raw file-descriptor limit to
+        actually budget for STAR's BAM sorting specifically (default
+        50%) -- deliberately conservative, since STAR is not the only
+        thing that may need open file descriptors during this run
+        (Python's own subprocess machinery, any other files this
+        process has open, etc.), and because the true simultaneous
+        file count during BAM sorting isn't an exact, guaranteed
+        (threads x bins) in every case -- this margin is a buffer
+        against undercounting.
+
+    Returns an int bin count: min(default_bins, a safe value computed
+    from the file-descriptor budget divided by thread count), with a
+    floor of 1 so this never returns a nonsensical zero-or-negative
+    value even at extreely low limits/high thread counts.
+    """
+    if file_descriptor_limit is None:
+        file_descriptor_limit = get_open_file_limit()
+
+    safe_bins = int((file_descriptor_limit * safety_margin) / max(1, threads))
+    return max(1, min(default_bins, safe_bins))
+
+
+# ---------------------------------------------------------------------------
 # STAR: ENCODE-recommended options bundle
 # ---------------------------------------------------------------------------
 #
@@ -359,7 +451,8 @@ def build_star_index(genome_fasta, gtf_path, index_dir, threads=4, sjdb_overhang
 
 def run_star_align(sample_entry, index_dir, output_base_dir, threads=4,
                     use_two_pass=False, use_encode_options=False,
-                    add_strand_field=False, limit_bam_sort_ram=None):
+                    add_strand_field=False, limit_bam_sort_ram=None,
+                    bam_sorting_bins=None):
     """
     Run STAR alignment for a single sample (paired or single-end), using
     --quantMode GeneCounts to get gene-level counts directly from STAR
@@ -392,6 +485,24 @@ def run_star_align(sample_entry, index_dir, output_base_dir, threads=4,
         BAM-sorting memory error on a very large genome/very deep
         sample -- left as None (STAR's own default behavior) otherwise.
 
+    bam_sorting_bins: controls --outBAMsortingBinsN, the number of
+        genome bins STAR splits alignments into for parallelized
+        coordinate-sorting during BAM output. If None (the default),
+        AUTO-COMPUTED via compute_safe_bam_sorting_bins(threads) based
+        on this machine's actual open-file-descriptor limit --
+        important because STAR needs roughly (threads x bins)
+        simultaneously open files during this step, which can exceed a
+        machine's default per-process file-descriptor limit (commonly
+        1024) at higher thread counts, causing a hard-to-diagnose
+        "could not create output file ... BAMsort" crash. This was hit
+        directly during real full-genome alignment testing (24
+        threads, STAR's default 50 bins, a 1024 file-descriptor limit)
+        -- auto-computing this value keeps runs safe on any machine
+        without requiring the user to manually raise `ulimit -n`
+        first. Pass an explicit int to override this auto-detection
+        (e.g. if you know your environment's actual limit is higher
+        than what get_open_file_limit() can detect).
+
     Output includes:
         <sample>_Aligned.sortedByCoord.out.bam
         <sample>_ReadsPerGene.out.tab   <- gene-level counts
@@ -411,6 +522,9 @@ def run_star_align(sample_entry, index_dir, output_base_dir, threads=4,
     else:
         return False, f"Sample '{sample_name}' has an incomplete/missing trimmed read layout ({sample_entry['read_type']}); skipped.", sample_out_dir
 
+    if bam_sorting_bins is None:
+        bam_sorting_bins = compute_safe_bam_sorting_bins(threads)
+
     cmd = [
         "STAR",
         "--runMode", "alignReads",
@@ -418,6 +532,7 @@ def run_star_align(sample_entry, index_dir, output_base_dir, threads=4,
         "--readFilesIn", *read_files_arg,
         "--readFilesCommand", "zcat",
         "--outSAMtype", "BAM", "SortedByCoordinate",
+        "--outBAMsortingBinsN", str(bam_sorting_bins),
         "--quantMode", "GeneCounts",
         "--outFileNamePrefix", out_prefix,
         "--runThreadN", str(threads),

@@ -41,6 +41,7 @@ import streamlit as st
 import project_manager as pm
 import reference_manager as rm
 import quantification_manager as qm
+import file_browser as fb
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +543,95 @@ WORKSPACE_KEY = "bulk_rnaseq"
 FASTA_UPLOAD_TYPES = ["fa", "fasta", "fna", "fa.gz", "fasta.gz", "fna.gz"]
 ANNOTATION_UPLOAD_TYPES = ["gtf", "gff", "gff3", "gtf.gz", "gff.gz", "gff3.gz"]
 
+# Extension lists used by the server-side file browser (see
+# file_browser.py) to filter its file listing to plausible candidates
+# for each file type -- includes the leading "." (unlike
+# FASTA_UPLOAD_TYPES/ANNOTATION_UPLOAD_TYPES above, which st.file_uploader
+# expects WITHOUT a leading dot), since file_browser.render_server_file_browser
+# matches these directly against os.path.splitext-style suffixes.
+FASTA_BROWSE_EXTENSIONS = [f".{ext}" for ext in FASTA_UPLOAD_TYPES]
+ANNOTATION_BROWSE_EXTENSIONS = [f".{ext}" for ext in ANNOTATION_UPLOAD_TYPES]
+
+
+def _render_reference_file_input(purpose_label, key_prefix, file_extensions, dest_path,
+                                  help_text=None):
+    """
+    Render a single reference-file input point that offers the user a
+    choice between two ways to provide a file, and returns the
+    resulting on-disk path once the file is available -- or None if
+    nothing has been provided yet this run.
+
+    This exists specifically to solve a real friction point discovered
+    during actual deployment testing: when this app runs on a remote
+    host (an HPC node, a shared lab server) that ALREADY has the needed
+    reference file sitting on its own disk, forcing the user through
+    st.file_uploader means needlessly transferring a potentially
+    multi-GB file from that SAME machine, through a browser, back to
+    itself -- pointlessly slow (or outright impractical for a
+    multi-gigabyte genome FASTA) compared to simply pointing the app at
+    the file's existing path.
+
+    purpose_label: what this file is for, used in the radio button's
+        section label (e.g. "genome FASTA", "GTF/GFF3 annotation").
+    key_prefix: unique Streamlit widget/session_state key scoping for
+        this specific input point (e.g. "custom_fasta", "custom_gtf")
+        -- required so two calls to this function on the same page (one
+        for the FASTA, one for the GTF) don't collide.
+    file_extensions: list of extensions WITHOUT a leading dot (Streamlit
+        file_uploader's own convention), e.g. FASTA_UPLOAD_TYPES -- used
+        both for the upload widget's `type` argument and (converted to
+        a leading-dot form) to filter the server-browse file listing.
+    dest_path: where an UPLOADED file should be saved to on disk (server-
+        browsed files are used directly from wherever they already are
+        -- see file_browser.py's module docstring -- and are never
+        copied here).
+    help_text: optional help string shown under the section label.
+
+    Returns the resulting file's path (str) if one is available after
+    this render (either just-uploaded-and-saved, or an existing
+    server-browsed selection), or None otherwise.
+    """
+    if help_text:
+        st.caption(help_text)
+
+    input_method = st.radio(
+        f"How would you like to provide the {purpose_label}?",
+        ["📤 Upload from your computer", "📂 Browse files already on this server"],
+        key=f"{key_prefix}_input_method_radio",
+        horizontal=True,
+    )
+
+    if input_method.startswith("📤"):
+        uploaded_file = st.file_uploader(
+            f"Upload {purpose_label}",
+            type=file_extensions,
+            key=f"{key_prefix}_upload",
+        )
+        if uploaded_file is not None:
+            with open(dest_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            return dest_path
+        # An upload from an EARLIER run may already be saved on disk at
+        # dest_path even though nothing was just re-uploaded THIS run
+        # (Streamlit's file_uploader doesn't persist a "previously
+        # uploaded" state across reruns the way a plain value would) --
+        # so fall back to whatever's already there, if anything.
+        return dest_path if os.path.exists(dest_path) else None
+
+    else:
+        browse_extensions = [f".{ext}" for ext in file_extensions]
+        selected_path = fb.render_server_file_browser(
+            key_prefix=f"{key_prefix}_browse",
+            file_extensions=browse_extensions,
+            label=f"Browse for the {purpose_label} already on this server:",
+        )
+        # Server-browsed files are used directly from their existing
+        # location -- never copied into dest_path -- since the entire
+        # point of this option is to avoid needlessly duplicating a
+        # potentially multi-GB file that's already sitting somewhere
+        # perfectly usable.
+        return selected_path
+
 
 def render():
     st.title("🧮 RNA Alignment & Counts")
@@ -905,14 +995,25 @@ def render():
         # projects' custom uploads have no guarantee of actually being
         # the same organism/assembly even if they happen to look
         # similar, so sharing them would risk silently mixing up
-        # unrelated references across projects.
+        # unrelated references across projects. Note this applies
+        # regardless of whether the file arrived via upload or via the
+        # server-side browser below -- ONLY uploaded files get COPIED
+        # into this directory; server-browsed files are referenced
+        # directly from wherever they already live (see
+        # _render_reference_file_input's docstring) and are never
+        # duplicated into reference_dir at all.
         reference_dir = pm.reference_dir(project)
         os.makedirs(reference_dir, exist_ok=True)
 
         st.markdown(
-            "Upload your own reference files below. You'll need a "
+            "Provide your reference files below. You'll need a "
             "**genome or transcriptome FASTA** file, plus a **GTF or "
-            "GFF3 annotation** file."
+            "GFF3 annotation** file. For each one, you can either "
+            "upload it from your own computer, or -- if this app is "
+            "running on a shared server/HPC that already has the file "
+            "sitting on its disk -- browse for it directly there "
+            "instead, without needing to transfer it through your "
+            "browser at all (much faster for large genome files)."
         )
 
         with st.expander("ℹ️ Not sure which files you need? (click to learn more)"):
@@ -936,27 +1037,27 @@ def render():
         custom_fasta_dest = os.path.join(reference_dir, "custom_input.fa")
         custom_gtf_dest = os.path.join(reference_dir, "custom_input.gtf")
 
-        if method == "star":
-            st.markdown("**Genome FASTA** (required for STAR):")
-        else:
-            st.markdown("**FASTA file** (transcriptome preferred; genome FASTA also accepted if paired with an annotation below):")
-
-        uploaded_fasta = st.file_uploader(
-            "Upload FASTA file",
-            type=FASTA_UPLOAD_TYPES,
-            key="custom_fasta_upload",
+        fasta_label = "genome FASTA" if method == "star" else "FASTA file (transcriptome preferred; genome FASTA also accepted if paired with an annotation below)"
+        st.markdown(f"**{'Genome FASTA' if method == 'star' else 'FASTA file'}** ({'required for STAR' if method == 'star' else 'transcriptome preferred'}):")
+        fasta_path = _render_reference_file_input(
+            purpose_label=fasta_label,
+            key_prefix="custom_fasta",
+            file_extensions=FASTA_UPLOAD_TYPES,
+            dest_path=custom_fasta_dest,
         )
 
+        st.markdown("---")
         st.markdown("**Annotation file** (GTF or GFF3):")
         annotation_help = (
-            "Required for STAR. For Salmon, only required if you uploaded a "
+            "Required for STAR. For Salmon, only required if you provided a "
             "genome FASTA rather than a transcriptome FASTA."
         )
-        uploaded_gtf = st.file_uploader(
-            "Upload GTF/GFF3 file",
-            type=ANNOTATION_UPLOAD_TYPES,
-            help=annotation_help,
-            key="custom_gtf_upload",
+        gtf_path_input = _render_reference_file_input(
+            purpose_label="GTF/GFF3 annotation file",
+            key_prefix="custom_gtf",
+            file_extensions=ANNOTATION_UPLOAD_TYPES,
+            dest_path=custom_gtf_dest,
+            help_text=annotation_help,
         )
 
         # Let the user tell us directly whether their organism has
@@ -980,40 +1081,59 @@ def render():
                 ),
             )
 
-        if uploaded_fasta and st.button("💾 Save Custom Reference Files", key="save_custom_ref_btn"):
-            # Save FASTA
-            fasta_bytes = uploaded_fasta.getbuffer()
-            with open(custom_fasta_dest, "wb") as f:
-                f.write(fasta_bytes)
-
-            if not rm.validate_fasta_file(custom_fasta_dest):
-                st.error("⚠️ The uploaded FASTA file doesn't look valid. Please check the file and try again.")
+        st.markdown("---")
+        if fasta_path and st.button("💾 Confirm Reference Files", key="save_custom_ref_btn"):
+            # fasta_path/gtf_path_input may point to a file we just
+            # copied into reference_dir (upload path) OR to a file
+            # that's already sitting somewhere ELSE entirely on this
+            # server (browse path) -- either way, by this point they're
+            # simply "the path to use", so the validation/completion
+            # logic below doesn't need to distinguish between the two
+            # any further. We DO need to remember which path was
+            # actually chosen, though, since every downstream step
+            # (Salmon/STAR index building, tx2gene/gene-symbol mapping)
+            # currently assumes the fixed conventional filenames
+            # custom_input.fa/custom_input.gtf inside reference_dir --
+            # so a server-browsed file's path is persisted explicitly
+            # rather than silently relying on those fixed names.
+            if not rm.validate_fasta_file(fasta_path):
+                st.error("⚠️ That FASTA file doesn't look valid. Please check it and try again.")
             else:
-                st.success(f"✅ FASTA file saved ({uploaded_fasta.name}).")
+                st.success(f"✅ FASTA file confirmed ({os.path.basename(fasta_path)}).")
+                st.session_state["_custom_fasta_actual_path"] = fasta_path
 
                 gtf_saved = False
-                if uploaded_gtf:
-                    with open(custom_gtf_dest, "wb") as f:
-                        f.write(uploaded_gtf.getbuffer())
-                    if not rm.validate_annotation_file(custom_gtf_dest):
-                        st.error("⚠️ The uploaded annotation file doesn't look like a valid GTF/GFF file.")
+                if gtf_path_input:
+                    if not rm.validate_annotation_file(gtf_path_input):
+                        st.error("⚠️ That annotation file doesn't look like a valid GTF/GFF file.")
                     else:
-                        st.success(f"✅ Annotation file saved ({uploaded_gtf.name}).")
+                        st.success(f"✅ Annotation file confirmed ({os.path.basename(gtf_path_input)}).")
+                        st.session_state["_custom_gtf_actual_path"] = gtf_path_input
                         gtf_saved = True
 
                 if method == "star" and not gtf_saved:
-                    st.error("⚠️ STAR requires both a genome FASTA and a GTF/GFF3 annotation file. Please upload both.")
+                    st.error("⚠️ STAR requires both a genome FASTA and a GTF/GFF3 annotation file. Please provide both.")
                 else:
                     pm.mark_step_complete(project, "reference_ready")
                     st.session_state["_custom_ref_saved"] = True
                     st.session_state["_custom_no_intron"] = is_no_intron_organism
 
+        # Resolve the ACTUAL fasta/gtf paths to use for extraction/
+        # indexing below -- prefer whatever was just confirmed this run
+        # (st.session_state["_custom_fasta_actual_path"], set above),
+        # falling back to the conventional custom_input.fa/gtf location
+        # for backward compatibility with projects set up before this
+        # server-browse option existed (which always used that fixed
+        # path via a plain upload).
+        resolved_custom_fasta = st.session_state.get("_custom_fasta_actual_path", custom_fasta_dest)
+        resolved_custom_gtf = st.session_state.get("_custom_gtf_actual_path", custom_gtf_dest)
+
         # If this looks like a genome FASTA (not already a transcriptome)
         # and we're using Salmon, offer to extract transcripts.
-        if method == "salmon" and st.session_state.get("_custom_ref_saved") and os.path.exists(custom_gtf_dest):
+        if method == "salmon" and st.session_state.get("_custom_ref_saved") and os.path.exists(resolved_custom_gtf):
             st.markdown("---")
             st.info(
-                "Since you uploaded a genome + annotation, Salmon needs "
+                "Since you provided a genome + annotation, Salmon needs "
                 "transcript-level sequences extracted from them first."
             )
             if st.button("🧬 Extract Transcript Sequences", key="extract_btn"):
@@ -1023,11 +1143,11 @@ def render():
                 with st.spinner("Extracting transcript sequences..."):
                     if use_no_intron_method:
                         success, message = rm.extract_gene_level_transcripts(
-                            custom_fasta_dest, custom_gtf_dest, extracted_path
+                            resolved_custom_fasta, resolved_custom_gtf, extracted_path
                         )
                     else:
                         success, message = rm.extract_transcripts_with_gffread(
-                            custom_fasta_dest, custom_gtf_dest, extracted_path
+                            resolved_custom_fasta, resolved_custom_gtf, extracted_path
                         )
 
                 if success:
@@ -1135,7 +1255,16 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
         # comment above for why.
         cdna_candidates.insert(0, os.path.join(reference_dir, "cdna", f"{species_key}.cdna.fa"))
     else:
-        cdna_candidates.insert(0, os.path.join(reference_dir, "custom_input.fa"))
+        # A custom reference's FASTA may be either the conventional
+        # copied-in path (custom_input.fa, for an uploaded file) or an
+        # arbitrary server-side path (for a browsed file, remembered in
+        # session_state by _render_reference_file_input's caller) --
+        # prefer whichever was actually confirmed, falling back to the
+        # conventional path for backward compatibility with projects
+        # set up before the server-browse option existed.
+        cdna_candidates.insert(0, st.session_state.get(
+            "_custom_fasta_actual_path", os.path.join(reference_dir, "custom_input.fa")
+        ))
 
     transcriptome_fasta = next((p for p in cdna_candidates if os.path.exists(p)), None)
     if not transcriptome_fasta:
@@ -1346,8 +1475,18 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
         genome_fasta = os.path.join(reference_dir, "genome", f"{species_key}.genome.fa")
         gtf_path = os.path.join(reference_dir, "genome", f"{species_key}.annotation.gtf")
     else:
-        genome_fasta = os.path.join(reference_dir, "custom_input.fa")
-        gtf_path = os.path.join(reference_dir, "custom_input.gtf")
+        # A custom reference's FASTA/GTF may be either the conventional
+        # copied-in path (custom_input.fa/gtf, for an uploaded file) or
+        # an arbitrary server-side path (for browsed files) -- prefer
+        # whichever was actually confirmed in Step 2, falling back to
+        # the conventional path for backward compatibility with
+        # projects set up before the server-browse option existed.
+        genome_fasta = st.session_state.get(
+            "_custom_fasta_actual_path", os.path.join(reference_dir, "custom_input.fa")
+        )
+        gtf_path = st.session_state.get(
+            "_custom_gtf_actual_path", os.path.join(reference_dir, "custom_input.gtf")
+        )
 
     if not (os.path.exists(genome_fasta) and os.path.exists(gtf_path)):
         st.error("⚠️ Could not find a genome + annotation for this project. Please complete Step 2 first.")

@@ -28,6 +28,7 @@ import streamlit as st
 
 import project_manager as pm
 import sra_manager as sra
+import file_browser as fb
 
 # Plain-language explanations for each FastQC module, shown when a sample
 # gets a WARN or FAIL for that module. Written for someone with little to
@@ -88,6 +89,13 @@ FASTQC_MODULE_GUIDANCE = {
         "interfere with accurate mapping."
     ),
 }
+
+# Extensions the server-side directory browser previews/matches against
+# when looking for FASTQ files -- includes the leading "." since
+# file_browser.py's extension filtering matches directly against
+# os.path.splitext-style suffixes (unlike st.file_uploader's `type`
+# argument, which expects no leading dot).
+FASTQ_BROWSE_EXTENSIONS = [".fastq", ".fastq.gz", ".fq", ".fq.gz"]
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +160,9 @@ def _validate_sample_pairs(filenames):
 
     Takes a plain list of filename strings (not Streamlit UploadedFile
     objects) so it can be used both for freshly uploaded files and for
-    files already sitting on disk from a previous session.
+    files already sitting on disk from a previous session (including
+    files symlinked in via the server-side directory browser -- see
+    _symlink_fastq_files_from_directory).
 
     Returns: { sample_name: {"R1": filename, "R2": filename} }
              or { sample_name: {"SE": filename} } for single-end samples.
@@ -184,6 +194,14 @@ def _list_existing_fastq(fastq_dir):
     List FASTQ filenames already saved to disk for this project from a
     previous session. Used so reopening a project shows previously
     uploaded files instead of appearing empty.
+
+    Uses os.listdir + a plain name filter (not os.path.isfile), which
+    means this INTENTIONALLY also picks up symlinks to real FASTQ files
+    elsewhere on disk (e.g. ones created by the server-side "browse for
+    a directory of FASTQ files" option below) exactly the same as a
+    directly-uploaded, physically-copied file -- from this function's
+    (and every downstream consumer's) point of view, a valid symlink and
+    a real file are indistinguishable and equally usable.
     """
     if not os.path.isdir(fastq_dir):
         return []
@@ -208,6 +226,80 @@ def _save_uploaded_files(uploaded_files, fastq_dir):
             out_file.write(f.getbuffer())
         saved_paths.append(dest_path)
     return saved_paths
+
+
+def _symlink_fastq_files_from_directory(source_dir, fastq_dir):
+    """
+    Scan source_dir (a server-side directory the user confirmed via
+    file_browser.render_server_directory_browser -- e.g. a folder that
+    already contains a full set of raw FASTQ files for many samples)
+    for FASTQ files, and SYMLINK (never copy) each one directly into
+    fastq_dir under its original filename.
+
+    Symlinking (rather than copying) is the whole point of this feature:
+    raw FASTQ files are often large and numerous (dozens of samples x
+    paired-end files can easily total many tens or hundreds of GB), so
+    physically duplicating them into fastq_dir would be slow and waste
+    a large amount of disk space for no benefit when the files already
+    exist in a perfectly usable location on the very same machine
+    Streamlit is running on. A symlink is created essentially instantly
+    regardless of the target file's size, and every downstream piece of
+    code in this app (FastQC, trimming, alignment) reads through the
+    symlink exactly as if it were a real file -- no other code needed
+    to change to support this.
+
+    Skips (rather than erroring on) any filename that would collide
+    with a file/symlink already present in fastq_dir -- e.g. from an
+    earlier upload or a previous browse-and-symlink action for the same
+    project -- since silently overwriting a different, already-in-use
+    file under the same name could otherwise corrupt an existing
+    project's data unexpectedly.
+
+    Returns (n_linked: int, n_skipped: int, skipped_names: list[str]).
+    """
+    os.makedirs(fastq_dir, exist_ok=True)
+    _, matching_files = _find_fastq_filenames_in_directory(source_dir)
+
+    n_linked = 0
+    skipped_names = []
+
+    for filename in matching_files:
+        source_path = os.path.join(source_dir, filename)
+        dest_path = os.path.join(fastq_dir, filename)
+
+        if os.path.exists(dest_path) or os.path.islink(dest_path):
+            skipped_names.append(filename)
+            continue
+
+        os.symlink(source_path, dest_path)
+        n_linked += 1
+
+    return n_linked, len(skipped_names), skipped_names
+
+
+def _find_fastq_filenames_in_directory(source_dir):
+    """
+    List just the FASTQ-looking filenames directly inside source_dir
+    (non-recursive -- files in subdirectories are NOT included, matching
+    the same "immediate contents only" convention file_browser.py's own
+    directory listing uses, so what the user previewed while browsing
+    is exactly what gets matched here).
+
+    Returns (all_entries: list[str], fastq_filenames: list[str]) -- the
+    full raw listing (for diagnostic/empty-directory messaging) and the
+    subset that looks like a FASTQ file by extension.
+    """
+    try:
+        all_entries = sorted(os.listdir(source_dir))
+    except OSError:
+        return [], []
+
+    fastq_filenames = [
+        name for name in all_entries
+        if not name.startswith(".") and os.path.isfile(os.path.join(source_dir, name))
+        and any(name.lower().endswith(ext) for ext in FASTQ_BROWSE_EXTENSIONS)
+    ]
+    return all_entries, fastq_filenames
 
 
 def _build_match_table(sample_pairs, meta_df):
@@ -439,6 +531,74 @@ def _build_quality_flags(summary_df):
         details_by_file[filename] = explanations
 
     return pd.DataFrame(overview_rows), details_by_file
+
+
+def _render_server_directory_fastq_section(fastq_dir):
+    """
+    Render the "point to a directory of FASTQ files already on this
+    server" section of Step 1 -- an alternative to both manual upload
+    and SRA download, for the case where this app is running on a
+    remote host (HPC node, shared lab server) that already has a
+    directory full of raw FASTQ files sitting on its own disk.
+
+    Files are SYMLINKED (never copied) into fastq_dir -- see
+    _symlink_fastq_files_from_directory's docstring for why this
+    matters for potentially very large, numerous raw FASTQ files.
+    """
+    with st.expander("📂 Or point to a directory of FASTQ files already on this server"):
+        st.markdown(
+            "If this app is running on a shared server or HPC that "
+            "already has your raw FASTQ files sitting on its own disk "
+            "(rather than on your local computer), you can point "
+            "directly at the folder containing them here -- this "
+            "avoids needing to transfer potentially very large files "
+            "through your browser at all. The files are linked into "
+            "this project directly from their existing location "
+            "(not copied), so this works instantly regardless of how "
+            "large or numerous they are."
+        )
+
+        selected_dir = fb.render_server_directory_browser(
+            key_prefix="fastq_dir_browse",
+            preview_extensions=FASTQ_BROWSE_EXTENSIONS,
+            label="Browse for the directory containing your FASTQ files:",
+        )
+
+        if selected_dir:
+            all_entries, fastq_filenames = _find_fastq_filenames_in_directory(selected_dir)
+
+            if not fastq_filenames:
+                st.warning(
+                    f"⚠️ No FASTQ files (`.fastq`, `.fastq.gz`, `.fq`, "
+                    f"`.fq.gz`) were found directly inside this "
+                    f"directory ({len(all_entries)} other item(s) "
+                    "present). Double-check you've browsed to the right "
+                    "folder -- note that files in SUBdirectories of the "
+                    "selected folder are not automatically included; "
+                    "browse directly to the folder containing the "
+                    "actual FASTQ files."
+                )
+            else:
+                st.success(f"✅ Found {len(fastq_filenames)} FASTQ file(s) in this directory.")
+                st.dataframe(
+                    pd.DataFrame({"File": fastq_filenames}),
+                    use_container_width=True, hide_index=True,
+                )
+
+                if st.button("🔗 Link These Files Into This Project", key="fastq_dir_browse_link_btn"):
+                    n_linked, n_skipped, skipped_names = _symlink_fastq_files_from_directory(
+                        selected_dir, fastq_dir
+                    )
+                    if n_linked:
+                        st.success(f"✅ Linked {n_linked} new file(s) into this project.")
+                    if n_skipped:
+                        st.info(
+                            f"ℹ️ Skipped {n_skipped} file(s) that already exist "
+                            f"in this project (same filename already present): "
+                            f"{', '.join(skipped_names)}."
+                        )
+                    if n_linked:
+                        st.rerun()
 
 
 def _render_sra_lookup_section(fastq_dir):
@@ -812,14 +972,21 @@ def render():
         saved_paths = _save_uploaded_files(uploaded_fastq, fastq_dir)
         st.success(f"✅ {len(saved_paths)} new file(s) uploaded successfully.")
 
+    # --- Point to a directory of FASTQ files already on this server ---
+    # (an alternative to browser upload -- see this function's docstring
+    # for why this matters when the app runs on a remote host that
+    # already has the data on its own disk.)
+    _render_server_directory_fastq_section(fastq_dir)
+
     # --- Fetch from SRA/NCBI (alternative to manual upload) ---
     _render_sra_lookup_section(fastq_dir)
 
     # Build sample_pairs from the union of files already on disk (from
     # this session's upload above, plus anything from previous sessions,
-    # plus anything just downloaded from SRA) rather than only from this
-    # session's upload widget. This is what makes reopening a project
-    # actually reflect prior progress.
+    # plus anything just downloaded from SRA or symlinked in from a
+    # server-side directory) rather than only from this session's upload
+    # widget. This is what makes reopening a project actually reflect
+    # prior progress.
     all_fastq_names = _list_existing_fastq(fastq_dir)
 
     sample_pairs = {}
