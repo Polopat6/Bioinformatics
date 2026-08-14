@@ -351,6 +351,115 @@ def _find_fastq_filenames_in_directory(source_dir):
     return all_entries, fastq_filenames
 
 
+def _remove_fastq_samples(fastq_dir, sample_pairs, sample_names_to_remove):
+    """
+    Remove every FASTQ file (R1, R2, and/or SE) belonging to the given
+    sample name(s) from fastq_dir -- the mechanism behind the new
+    "Remove a sample from this project" section (see
+    _render_fastq_removal_section), added specifically in response to a
+    real usability-testing finding: a non-bioinformatics user had no
+    easy way to remove a sample that had been downloaded by mistake
+    (e.g. the wrong SRA accession, or a duplicate/unwanted run) short of
+    manually locating and deleting files on disk themselves.
+
+    Uses os.remove (not shutil.rmtree or similar) on each individual
+    file/symlink path -- this is deliberately SAFE for the symlinked-
+    FASTQ case (see _symlink_fastq_files_from_directory above):
+    os.remove on a symlink deletes only the symlink itself, never the
+    file it points to, so removing a sample that was linked in from a
+    server-side directory (rather than uploaded/copied) never touches
+    or deletes the user's original data elsewhere on disk -- only this
+    project's reference to it.
+
+    sample_pairs: the dict returned by _validate_sample_pairs (i.e.
+        {sample_name: {"R1": filename, ...}}), used to look up exactly
+        which filename(s) belong to each sample being removed.
+    sample_names_to_remove: list/set of sample names (keys of
+        sample_pairs) to remove.
+
+    Returns (removed_filenames: list[str], errors: list[str]) -- the
+    filenames that were actually deleted, and any per-file error
+    messages encountered (e.g. a permissions issue) -- errors don't
+    stop the rest of the removal from proceeding, so one problematic
+    file doesn't block removing everything else that CAN be removed.
+    """
+    removed_filenames = []
+    errors = []
+
+    for sample_name in sample_names_to_remove:
+        reads = sample_pairs.get(sample_name, {})
+        for key in ("R1", "R2", "SE"):
+            if key not in reads:
+                continue
+            filename = reads[key]
+            path = os.path.join(fastq_dir, filename)
+            try:
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.remove(path)
+                    removed_filenames.append(filename)
+            except OSError as e:
+                errors.append(f"{filename}: {e}")
+
+    return removed_filenames, errors
+
+
+def _render_fastq_removal_section(fastq_dir, sample_pairs):
+    """
+    Render a "Remove a sample from this project" expander, letting the
+    user select one or more DETECTED samples (from sample_pairs, i.e.
+    whatever's currently sitting in fastq_dir) and remove all of that
+    sample's FASTQ file(s) from the project in one click -- added
+    specifically in response to a real usability-testing finding (see
+    _remove_fastq_samples' docstring): there was previously no
+    in-app way to undo an accidental download/upload short of manually
+    finding and deleting files on the server's filesystem directly,
+    which is not a reasonable expectation for a non-bioinformatics user.
+
+    Only rendered when there's at least one detected sample to remove
+    (the caller should skip calling this entirely when sample_pairs is
+    empty, though it degrades gracefully either way).
+    """
+    if not sample_pairs:
+        return
+
+    with st.expander("🗑️ Remove a sample from this project"):
+        st.caption(
+            "Made a mistake -- downloaded the wrong accession, or want "
+            "to drop a sample you no longer need? Select it below. This "
+            "only removes the file(s) from THIS project; if a file was "
+            "linked in from a folder elsewhere on this server (rather "
+            "than uploaded), the original file itself is never deleted "
+            "-- only this project's link to it."
+        )
+        samples_to_remove = st.multiselect(
+            "Select sample(s) to remove:",
+            options=sorted(sample_pairs.keys()),
+            key="fastq_remove_select",
+        )
+        if samples_to_remove:
+            st.warning(
+                f"⚠️ This will remove {len(samples_to_remove)} sample's "
+                f"FASTQ file(s) from this project: **{', '.join(samples_to_remove)}**. "
+                "This cannot be undone from within the app (though you "
+                "can always re-upload, re-download, or re-link the same "
+                "sample again afterward if needed)."
+            )
+            if st.button("🗑️ Remove Selected Sample(s)", key="fastq_remove_btn"):
+                removed_filenames, errors = _remove_fastq_samples(fastq_dir, sample_pairs, samples_to_remove)
+                if removed_filenames:
+                    st.success(
+                        f"✅ Removed {len(removed_filenames)} file(s) for "
+                        f"{len(samples_to_remove)} sample(s): {', '.join(samples_to_remove)}."
+                    )
+                if errors:
+                    st.error(
+                        "⚠️ Some file(s) could not be removed:\n\n"
+                        + "\n".join(f"- {e}" for e in errors)
+                    )
+                if removed_filenames:
+                    st.rerun()
+
+
 def _build_match_table(sample_pairs, meta_df):
     """
     Build a plain-language matching table showing, for every sample
@@ -653,9 +762,29 @@ def _render_server_directory_fastq_section(fastq_dir):
 def _render_sra_lookup_section(fastq_dir):
     """
     Render the "fetch from SRA/NCBI" section of Step 1. Lets a user look
-    up any NCBI accession (run, study, or BioProject), see each run's
-    metadata — critically including its official Library Strategy — and
-    download selected runs directly into the project's fastq_dir.
+    up any NCBI accession(s) -- one or MANY at once -- and download
+    selected runs directly into the project's fastq_dir.
+
+    Supports THREE ways to specify what to look up:
+      1. A single search term (a study, e.g. "SRP123456", or a whole
+         BioProject, e.g. "PRJNA123456") that itself expands to many
+         runs -- handled via sra.lookup_accession.
+      2. A pasted, free-form list of individual run accessions (e.g.
+         several SRR numbers separated by commas, spaces, and/or
+         newlines in any combination) -- handled via
+         sra.lookup_multiple_accessions, since a raw multi-accession
+         string is NOT something a single esearch term reliably expands
+         correctly (confirmed directly: NCBI's esearch does not treat a
+         comma-separated list of accession numbers as an OR query the
+         way one might expect).
+      3. An uploaded file (.txt, .csv, or .xlsx) containing a list of
+         accessions -- for cases where the user already has an
+         accession list saved as a file (e.g. exported from a previous
+         analysis, or a supplementary table from a paper) rather than
+         wanting to copy/paste them by hand.
+    All three inputs are combined together into one lookup, so a user
+    can mix e.g. a couple of pasted accessions with an uploaded list in
+    the same lookup if they want.
 
     The Library Strategy check exists specifically to prevent a common
     mistake: downloading a public dataset that looks like RNA-seq FASTQ
@@ -679,11 +808,15 @@ def _render_sra_lookup_section(fastq_dir):
         st.markdown(
             "Instead of uploading your own files, you can search for and "
             "download publicly available sequencing data directly from "
-            "NCBI's Sequence Read Archive (SRA), using any valid "
-            "accession:\n"
-            "- A single **run** (e.g. `SRR12345678`)\n"
-            "- A **study** (e.g. `SRP123456`)\n"
-            "- A whole **BioProject** (e.g. `PRJNA123456`)\n\n"
+            "NCBI's Sequence Read Archive (SRA):\n"
+            "- A single **study** or **BioProject** accession (e.g. "
+            "`SRP123456` or `PRJNA123456`) that expands to every run in "
+            "that study, OR\n"
+            "- **Multiple individual run accessions at once** (e.g. "
+            "several `SRR12345678`-style numbers) -- paste them below "
+            "(separated by commas, spaces, or one per line -- any mix "
+            "works) or upload a `.txt`/`.csv`/`.xlsx` file listing "
+            "them.\n\n"
             "⚠️ **Important:** not everything on public repositories is "
             "RNA-seq data, even if it looks like ordinary FASTQ files. "
             "We check each run's official \"Library Strategy\" annotation "
@@ -708,21 +841,82 @@ def _render_sra_lookup_section(fastq_dir):
             )
             return
 
-        accession_input = st.text_input(
-            "Enter an NCBI/SRA accession:",
-            placeholder="e.g. SRR12345678, SRP123456, or PRJNA123456",
-            key="sra_accession_input",
+        single_term_input = st.text_input(
+            "Study or BioProject accession (expands to every run in it):",
+            placeholder="e.g. SRP123456 or PRJNA123456",
+            key="sra_single_term_input",
         )
 
-        if st.button("🔍 Look Up", key="sra_lookup_btn") and accession_input:
-            with st.spinner(f"Looking up '{accession_input}' on NCBI..."):
-                success, rows, message = sra.lookup_accession(accession_input)
+        accession_list_text = st.text_area(
+            "Or paste one or more individual run accessions:",
+            placeholder="e.g.\nSRR1039508, SRR1039509, SRR1039512\n(or one per line -- commas, spaces, and newlines all work)",
+            key="sra_accession_list_input",
+            height=100,
+        )
 
-            if not success:
-                st.error(f"⚠️ {message}")
+        uploaded_accession_file = st.file_uploader(
+            "Or upload a file listing accessions (.txt, .csv, or .xlsx):",
+            type=["txt", "csv", "xlsx", "xls"],
+            key="sra_accession_file_upload",
+        )
+
+        if st.button("🔍 Look Up", key="sra_lookup_btn"):
+            # Combine every accession source provided this run: the
+            # pasted text area (split on commas/whitespace/newlines --
+            # see sra._split_accession_list_text) and/or an uploaded
+            # file's contents (see sra.parse_accessions_from_file) --
+            # both are optional and independent, so a user can use
+            # either, both, or neither (falling back to the single
+            # study/BioProject term instead).
+            combined_accessions = list(sra._split_accession_list_text(accession_list_text))
+
+            file_read_error = None
+            if uploaded_accession_file is not None:
+                file_accessions, file_read_error = sra.parse_accessions_from_file(uploaded_accession_file)
+                combined_accessions.extend(file_accessions)
+
+            # De-duplicate while preserving order, in case the same
+            # accession appears in both the text area and the uploaded
+            # file.
+            seen = set()
+            combined_accessions = [a for a in combined_accessions if not (a in seen or seen.add(a))]
+
+            if file_read_error:
+                st.error(f"⚠️ {file_read_error}")
+            elif combined_accessions:
+                # Multi-accession path -- takes priority over the
+                # single-term input if both are filled in, since
+                # providing a specific list is a more precise request
+                # than a broader study/BioProject search.
+                with st.spinner(f"Looking up {len(combined_accessions)} accession(s) on NCBI..."):
+                    success, rows, message, not_found = sra.lookup_multiple_accessions(combined_accessions)
+
+                if not success:
+                    st.error(f"⚠️ {message}")
+                else:
+                    st.session_state["_sra_lookup_rows"] = rows
+                    st.success(f"✅ {message}")
+                    if not_found:
+                        st.warning(
+                            f"⚠️ {len(not_found)} accession(s) returned no "
+                            f"results and were skipped: {', '.join(not_found)}. "
+                            "Double-check these for typos."
+                        )
+            elif single_term_input:
+                with st.spinner(f"Looking up '{single_term_input}' on NCBI..."):
+                    success, rows, message = sra.lookup_accession(single_term_input)
+
+                if not success:
+                    st.error(f"⚠️ {message}")
+                else:
+                    st.session_state["_sra_lookup_rows"] = rows
+                    st.success(f"✅ {message}")
             else:
-                st.session_state["_sra_lookup_rows"] = rows
-                st.success(f"✅ {message}")
+                st.warning(
+                    "⚠️ Please enter a study/BioProject accession, paste "
+                    "one or more run accessions, or upload a file listing "
+                    "them before looking up."
+                )
 
         lookup_rows = st.session_state.get("_sra_lookup_rows")
         if lookup_rows:
@@ -757,6 +951,7 @@ def _render_sra_lookup_section(fastq_dir):
             selected_runs = st.multiselect(
                 "Select which run(s) to download:",
                 options=run_options,
+                default=run_options,
                 key="sra_selected_runs",
             )
 
@@ -942,6 +1137,354 @@ def _render_sra_metadata_autofill_section(project, metadata_saved_path):
     return False
 
 
+def _render_metadata_sync_section(raw_meta_df, sample_col, sample_pairs, metadata_saved_path):
+    """
+    Render a "sync metadata with your FASTQ sample list" section,
+    letting the user add metadata row(s) for FASTQ samples that don't
+    have one yet, and/or remove metadata row(s) that no longer have a
+    matching FASTQ sample -- both in a couple of clicks, without needing
+    to re-upload an entire replacement metadata file.
+
+    Added specifically in response to a real usability-testing finding:
+    a non-bioinformatics user found it difficult to keep their metadata
+    table in sync after downloading a new sample or removing an existing
+    one (e.g. via the new "Remove a sample" feature above, or after an
+    SRA download added new samples) -- there was no easy way to add a
+    row for a newly-arrived sample, or clean up a now-orphaned row,
+    short of manually editing the underlying spreadsheet file outside
+    the app and re-uploading it from scratch.
+
+    NOTE: rows added by this section are intentionally left BLANK
+    (aside from the sample name) -- see
+    _render_metadata_ncbi_refetch_section below for the companion
+    feature that actually fills those blanks in from NCBI, for samples
+    that were originally fetched via SRA/NCBI (rather than requiring the
+    user to manually type in every field for a sample whose real
+    metadata already exists publicly on NCBI).
+
+    raw_meta_df: the metadata DataFrame in its ORIGINAL (pre-rename)
+        column form, as currently loaded/persisted -- this function
+        operates on and re-saves this exact structure so a change here
+        is immediately reflected the next time this project is opened.
+    sample_col: the name of the column in raw_meta_df that holds sample
+        names (may not literally be called "sample" -- this is whatever
+        column the user picked in the "Which column contains your
+        sample names?" dropdown above).
+    sample_pairs: the dict returned by _validate_sample_pairs, i.e. the
+        FASTQ samples currently detected in this project.
+    metadata_saved_path: where to persist the updated metadata CSV.
+
+    Any change made here triggers an immediate st.rerun(), so the
+    match table in Step 3 (and everywhere else metadata is used)
+    reflects the sync instantly.
+    """
+    fastq_sample_names = set(sample_pairs.keys())
+    meta_sample_names = set(raw_meta_df[sample_col].astype(str))
+
+    missing_from_meta = sorted(fastq_sample_names - meta_sample_names)
+    orphaned_in_meta = sorted(meta_sample_names - fastq_sample_names)
+
+    if not missing_from_meta and not orphaned_in_meta:
+        return
+
+    with st.expander("🔄 Sync metadata with your FASTQ sample list", expanded=True):
+        st.caption(
+            "Quickly add row(s) for samples you've downloaded/uploaded "
+            "but haven't added metadata for yet, or remove row(s) for "
+            "samples that no longer have a matching FASTQ file (e.g. "
+            "after using \"Remove a sample\" above) -- no need to "
+            "re-upload your whole metadata file for either. Newly added "
+            "rows start out BLANK (aside from the sample name) -- if "
+            "these are samples you originally fetched from SRA/NCBI, "
+            "see the \"Re-fetch metadata from NCBI\" section further "
+            "below to fill them in automatically rather than typing "
+            "everything in by hand."
+        )
+
+        col_add, col_remove = st.columns(2)
+
+        with col_add:
+            if missing_from_meta:
+                st.markdown(f"**{len(missing_from_meta)} FASTQ sample(s) have no metadata row:**")
+                st.caption(", ".join(missing_from_meta))
+                samples_to_add = st.multiselect(
+                    "Add a blank row for:",
+                    options=missing_from_meta,
+                    default=missing_from_meta,
+                    key="meta_sync_add_select",
+                    help="New row(s) are added with blank values for every column besides the sample name -- fill in the details afterward in the table above, or use NCBI re-fetch below if these came from SRA.",
+                )
+                if samples_to_add and st.button("➕ Add Selected Row(s)", key="meta_sync_add_btn"):
+                    new_rows = pd.DataFrame({sample_col: samples_to_add})
+                    for col in raw_meta_df.columns:
+                        if col != sample_col:
+                            new_rows[col] = ""
+                    updated_raw_df = pd.concat([raw_meta_df, new_rows], ignore_index=True)
+                    os.makedirs(os.path.dirname(metadata_saved_path), exist_ok=True)
+                    updated_raw_df.to_csv(metadata_saved_path, index=False)
+                    st.success(
+                        f"✅ Added {len(samples_to_add)} row(s). Scroll up "
+                        "to fill in their details (e.g. condition) in the "
+                        "metadata table, or use NCBI re-fetch below if "
+                        "these samples came from SRA."
+                    )
+                    st.rerun()
+            else:
+                st.caption("✅ Every FASTQ sample already has a metadata row.")
+
+        with col_remove:
+            if orphaned_in_meta:
+                st.markdown(f"**{len(orphaned_in_meta)} metadata row(s) have no matching FASTQ file:**")
+                st.caption(", ".join(orphaned_in_meta))
+                samples_to_remove = st.multiselect(
+                    "Remove row(s) for:",
+                    options=orphaned_in_meta,
+                    default=orphaned_in_meta,
+                    key="meta_sync_remove_select",
+                )
+                if samples_to_remove and st.button("🗑️ Remove Selected Row(s)", key="meta_sync_remove_btn"):
+                    updated_raw_df = raw_meta_df[
+                        ~raw_meta_df[sample_col].astype(str).isin(samples_to_remove)
+                    ]
+                    os.makedirs(os.path.dirname(metadata_saved_path), exist_ok=True)
+                    updated_raw_df.to_csv(metadata_saved_path, index=False)
+                    st.success(f"✅ Removed {len(samples_to_remove)} row(s) from your metadata.")
+                    st.rerun()
+            else:
+                st.caption("✅ Every metadata row has a matching FASTQ sample.")
+
+
+def _detect_blank_metadata_samples(raw_meta_df, sample_col):
+    """
+    Return the sample name(s) whose metadata row has NOTHING filled in
+    besides the sample name itself (every other column is blank/NaN) --
+    used to pre-select sensible defaults in
+    _render_metadata_ncbi_refetch_section below, since these are exactly
+    the rows a user would want to re-fetch (e.g. rows just added via
+    _render_metadata_sync_section's "Add a blank row for" button, or any
+    other row that's never had its details filled in).
+
+    A "blank" cell is either a true NaN or a string that's empty/only
+    whitespace after stripping -- covers both a truly missing pandas
+    value and a manually-added blank string cell (e.g. from the sync
+    section above, which fills new rows with "").
+    """
+    other_cols = [c for c in raw_meta_df.columns if c != sample_col]
+    if not other_cols:
+        # No other columns exist at all -- every sample is trivially
+        # "blank" in this case, though there'd be nothing meaningful
+        # for a re-fetch to fill in either.
+        return raw_meta_df[sample_col].astype(str).tolist()
+
+    def _is_blank_row(row):
+        return all(pd.isna(row[c]) or str(row[c]).strip() == "" for c in other_cols)
+
+    blank_mask = raw_meta_df.apply(_is_blank_row, axis=1)
+    return raw_meta_df.loc[blank_mask, sample_col].astype(str).tolist()
+
+
+def _merge_ncbi_metadata_rows(raw_meta_df, sample_col, metadata_rows, overwrite_existing=False):
+    """
+    Merge NCBI-derived attribute data (from sra.build_metadata_dataframe,
+    which returns a list of dicts each keyed by "sample" -- the Run
+    accession) into raw_meta_df's EXISTING rows for matching samples,
+    rather than adding new rows or replacing the whole table.
+
+    This is the core mechanism behind
+    _render_metadata_ncbi_refetch_section: unlike
+    _render_sra_metadata_autofill_section (which BUILDS an entirely new
+    metadata table from scratch, intended for first-time setup), this
+    function targets specific, already-existing row(s) and fills in
+    just their missing/blank fields -- exactly what's needed when a
+    sample was already added to the metadata sheet (e.g. via the sync
+    feature above) with blank values, and the user wants to go back and
+    populate those blanks from NCBI without disturbing any other
+    already-filled-in samples or columns.
+
+    Matching is done by comparing metadata_rows' "sample" value against
+    raw_meta_df[sample_col] -- this works correctly because, for any
+    sample originally downloaded via this app's SRA feature, the sample
+    name IS the Run accession (fasterq-dump's own output naming
+    convention, which this app's FASTQ-matching logic already relies on
+    elsewhere), so a lookup keyed by Run accession lines up directly
+    with the project's existing sample names with no extra translation
+    needed.
+
+    overwrite_existing: if False (the default, and the expected common
+        case), only currently-BLANK cells are filled in -- any column
+        that already has a real value for that sample is left
+        completely untouched, even if NCBI's data for it happens to
+        differ. If True, every matched column is overwritten with
+        NCBI's value regardless of what was there before -- offered as
+        an explicit opt-in for a genuine "start over from NCBI" case,
+        never the default (since silently overwriting a user's own
+        manually-entered/edited values would be a bad, low-trust
+        surprise).
+
+    A brand new column present in NCBI's data but not yet in
+    raw_meta_df (e.g. "strain", "treatment") is automatically added
+    (defaulting to blank for every OTHER, non-matched sample), so
+    running this repeatedly for different samples over time correctly
+    accumulates whatever attribute columns each individual NCBI lookup
+    happens to provide.
+
+    Returns (updated_df, filled_sample_names: list[str]) -- the merged
+    DataFrame, and the list of sample names that actually received at
+    least one filled-in value (for a clear success message -- a sample
+    present in metadata_rows but with, say, every value already
+    non-blank and overwrite_existing=False would correctly NOT appear
+    in this list, since nothing was actually changed for it).
+    """
+    updated_df = raw_meta_df.copy()
+    filled_samples = []
+
+    for entry in metadata_rows:
+        sample_name = entry.get("sample")
+        mask = updated_df[sample_col].astype(str) == str(sample_name)
+        if not mask.any():
+            continue
+        idx = updated_df.index[mask][0]
+
+        any_filled = False
+        for col, val in entry.items():
+            if col == "sample":
+                continue
+            if col not in updated_df.columns:
+                updated_df[col] = pd.Series([pd.NA] * len(updated_df), dtype=object)
+            elif not pd.api.types.is_object_dtype(updated_df[col]):
+                # A column that's entirely blank for every sample so far
+                # (e.g. never filled in yet) gets read back from the CSV
+                # as a NUMERIC dtype (float64) by pandas, since an
+                # all-empty column has nothing to infer a string type
+                # from. Newer/stricter pandas correctly REFUSES to
+                # silently upcast that column when a real string value
+                # (e.g. "27") is written into it -- raising
+                # "TypeError: Invalid value '27' for dtype 'float64'" --
+                # rather than the old, looser behavior of quietly
+                # converting the whole column on the fly. This explicit
+                # conversion must happen BEFORE the assignment below.
+                updated_df[col] = updated_df[col].astype(object)
+
+            current_val = updated_df.at[idx, col]
+            is_blank = pd.isna(current_val) or str(current_val).strip() == ""
+            if overwrite_existing or is_blank:
+                updated_df.at[idx, col] = val
+                any_filled = True
+
+        if any_filled:
+            filled_samples.append(sample_name)
+
+    return updated_df, filled_samples
+
+
+def _render_metadata_ncbi_refetch_section(project, raw_meta_df, sample_col, metadata_saved_path):
+    """
+    Render a "Re-fetch metadata from NCBI for existing sample(s)"
+    section: lets the user select one or more samples ALREADY present
+    in the metadata table (defaulting to whichever ones currently have
+    nothing filled in besides their sample name -- see
+    _detect_blank_metadata_samples) and re-run an SRA/NCBI lookup for
+    exactly those samples, filling in their blank fields directly.
+
+    Added specifically in response to a real gap: a user downloaded new
+    FASTQ files via SRA, used the "Sync metadata" feature above to add
+    blank row(s) for those samples, but had no way to actually populate
+    those rows' details from NCBI afterward short of either typing them
+    in by hand or re-uploading an entirely new metadata file -- this
+    fills that exact gap by letting the ORIGINAL NCBI lookup be repeated
+    on demand, targeted at specific sample(s), any time after the
+    initial download.
+
+    This is a genuinely different tool from
+    _render_sra_metadata_autofill_section above (which only works
+    immediately after a Step 1 lookup this SAME session, and BUILDS a
+    brand new metadata table from scratch) -- this section instead
+    works on the metadata table AS IT ALREADY EXISTS on disk, in any
+    session (not just right after a lookup), and only fills in the
+    specific sample(s) selected, leaving every other row/column
+    completely untouched.
+
+    Only meaningful for samples whose sample name is itself a real SRA
+    Run accession (true for anything downloaded via this app's own SRA
+    feature) -- a manually-named sample (e.g. "PatientA") will simply
+    return "not found" from NCBI, surfaced clearly via the same
+    not_found reporting used elsewhere in this app's SRA lookup flow,
+    rather than silently failing.
+    """
+    with st.expander("🔎 Re-fetch metadata from NCBI for existing sample(s)"):
+        st.markdown(
+            "If some of your samples came from SRA/NCBI but their "
+            "metadata row is still blank (e.g. after adding a row via "
+            "\"Sync metadata\" above), you can repeat the original NCBI "
+            "lookup here to pull in their `strain`/`treatment`/`media`/"
+            "etc. details automatically -- no need to type them in by "
+            "hand, and no need to look them up again in Step 1. This "
+            "only works for samples whose name is an actual SRA Run "
+            "accession (e.g. `SRR12345678`) -- exactly what this app's "
+            "own SRA download feature produces."
+        )
+
+        all_samples = raw_meta_df[sample_col].astype(str).tolist()
+        blank_samples = _detect_blank_metadata_samples(raw_meta_df, sample_col)
+
+        selected_samples = st.multiselect(
+            "Which sample(s) should be re-fetched from NCBI?",
+            options=all_samples,
+            default=blank_samples,
+            key="meta_ncbi_refetch_select",
+            help="Defaults to whichever sample(s) currently have nothing filled in besides their name.",
+        )
+
+        overwrite_existing = st.checkbox(
+            "Overwrite already-filled-in values too (not just blanks)",
+            value=False,
+            key="meta_ncbi_refetch_overwrite",
+            help="Leave unchecked (recommended) to only fill in currently-blank cells, leaving any value you've already entered or edited completely untouched. Check this only if you specifically want to discard existing values and replace them with NCBI's data.",
+        )
+
+        if selected_samples and st.button("🔍 Look Up on NCBI and Fill In", key="meta_ncbi_refetch_btn"):
+            with st.spinner(f"Looking up {len(selected_samples)} sample(s) on NCBI..."):
+                success, lookup_rows, message, not_found = sra.lookup_multiple_accessions(selected_samples)
+
+            if not success:
+                st.error(f"⚠️ {message}")
+            else:
+                metadata_rows = sra.build_metadata_dataframe(lookup_rows, selected_runs=selected_samples)
+                updated_df, filled_samples = _merge_ncbi_metadata_rows(
+                    raw_meta_df, sample_col, metadata_rows, overwrite_existing=overwrite_existing,
+                )
+
+                if filled_samples:
+                    os.makedirs(os.path.dirname(metadata_saved_path), exist_ok=True)
+                    updated_df.to_csv(metadata_saved_path, index=False)
+                    st.success(
+                        f"✅ Filled in metadata for {len(filled_samples)} "
+                        f"sample(s): {', '.join(filled_samples)}."
+                    )
+                else:
+                    st.info(
+                        "ℹ️ NCBI data was found, but there was nothing new "
+                        "to fill in -- either every selected sample "
+                        "already had values in every column (try checking "
+                        "\"Overwrite\" above if you want to replace them "
+                        "anyway), or NCBI didn't provide any additional "
+                        "characteristics fields for these sample(s)."
+                    )
+
+                if not_found:
+                    st.warning(
+                        f"⚠️ {len(not_found)} sample(s) returned no results "
+                        f"from NCBI and were skipped: {', '.join(not_found)}. "
+                        "This is expected for samples that weren't "
+                        "originally downloaded from SRA (e.g. manually "
+                        "named samples) -- their metadata will need to be "
+                        "filled in by hand instead."
+                    )
+
+                if filled_samples:
+                    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # Main render function
 # ---------------------------------------------------------------------------
@@ -1062,6 +1605,12 @@ def render():
                 "If you meant to upload paired-end data, make sure both the "
                 "`_R1` and `_R2` files for each sample are uploaded together."
             )
+
+        # --- Remove a sample (ease-of-use fix from real usability testing) ---
+        # See _render_fastq_removal_section's docstring for the finding
+        # that motivated this: no previous in-app way to undo an
+        # accidental download/upload.
+        _render_fastq_removal_section(fastq_dir, sample_pairs)
     else:
         st.info("No files uploaded yet. Use the box above to get started.")
 
@@ -1223,6 +1772,32 @@ def render():
             os.makedirs(os.path.dirname(metadata_saved_path), exist_ok=True)
             raw_meta_df.to_csv(metadata_saved_path, index=False)
             pm.save_sample_column(project, sample_col)
+
+            # --- Sync metadata with FASTQ sample list (ease-of-use fix
+            # from real usability testing) --- See
+            # _render_metadata_sync_section's docstring for the finding
+            # that motivated this: no easy way to add/remove metadata
+            # row(s) to match the current FASTQ sample list without
+            # re-uploading an entire replacement file. Only rendered
+            # once sample_pairs is known (i.e. at least one FASTQ file
+            # has been detected), since there's nothing meaningful to
+            # sync against otherwise.
+            if sample_pairs:
+                _render_metadata_sync_section(raw_meta_df, sample_col, sample_pairs, metadata_saved_path)
+
+            # --- Re-fetch metadata from NCBI for existing sample(s) ---
+            # See _render_metadata_ncbi_refetch_section's docstring:
+            # this is the companion feature to the sync section above,
+            # letting a user repeat the original SRA/NCBI lookup for
+            # specific sample(s) already in the metadata table (most
+            # commonly ones just added as blank rows above) and fill in
+            # their details automatically, rather than typing them in
+            # by hand or re-uploading an entirely new metadata file.
+            # Always shown once metadata exists (not gated behind
+            # sample_pairs like the sync section above), since this is
+            # useful any time -- even for a sample that already matched
+            # successfully but whose metadata is still incomplete.
+            _render_metadata_ncbi_refetch_section(project, raw_meta_df, sample_col, metadata_saved_path)
     else:
         st.info("No metadata file provided yet. Use the options above, or download the template if you're not sure how to format one.")
 
@@ -1439,7 +2014,7 @@ def render():
                         "post-trimming quality control."
                     )
 
-                    if st.button("➡️ Proceed to Trimming & Post-Trimming QC", type="primary"):
+                    if st.button("➡️ Proceed to Trimming & Post-Trim QC", type="primary"):
                         # Jump straight to the Trimming workspace, carrying
                         # over the same active project automatically (the
                         # project selection lives in

@@ -287,8 +287,8 @@ def detect_fastq_read_length(fastq_path, is_gzipped=True):
 # works by splitting alignments into --outBAMsortingBinsN genome bins
 # (default: 50) and sorting each bin's worth of reads independently
 # before merging -- this parallelizes the sort across threads. The
-# practical consequence: STAR needs roughly (threads x bins) file
-# descriptors open SIMULTANEOUSLY during this step. With STAR's default
+# practical consequence: STAR needs roughly one open file handle PER
+# BIN, PER THREAD simultaneously during this step. With STAR's default
 # 50 bins and enough threads (e.g. 24, as used in real testing on a
 # 32-core HPC node), this can reach into the hundreds to low thousands
 # of simultaneously open files -- comfortably exceeding the DEFAULT
@@ -362,7 +362,7 @@ def compute_safe_bam_sorting_bins(threads, file_descriptor_limit=None, default_b
     Returns an int bin count: min(default_bins, a safe value computed
     from the file-descriptor budget divided by thread count), with a
     floor of 1 so this never returns a nonsensical zero-or-negative
-    value even at extreely low limits/high thread counts.
+    value even at extremely low limits/high thread counts.
     """
     if file_descriptor_limit is None:
         file_descriptor_limit = get_open_file_limit()
@@ -489,19 +489,11 @@ def run_star_align(sample_entry, index_dir, output_base_dir, threads=4,
         genome bins STAR splits alignments into for parallelized
         coordinate-sorting during BAM output. If None (the default),
         AUTO-COMPUTED via compute_safe_bam_sorting_bins(threads) based
-        on this machine's actual open-file-descriptor limit --
-        important because STAR needs roughly (threads x bins)
-        simultaneously open files during this step, which can exceed a
-        machine's default per-process file-descriptor limit (commonly
-        1024) at higher thread counts, causing a hard-to-diagnose
-        "could not create output file ... BAMsort" crash. This was hit
-        directly during real full-genome alignment testing (24
-        threads, STAR's default 50 bins, a 1024 file-descriptor limit)
-        -- auto-computing this value keeps runs safe on any machine
-        without requiring the user to manually raise `ulimit -n`
-        first. Pass an explicit int to override this auto-detection
-        (e.g. if you know your environment's actual limit is higher
-        than what get_open_file_limit() can detect).
+        on this machine's actual open-file-descriptor limit -- see the
+        module-level comment above compute_safe_bam_sorting_bins for
+        the full rationale (confirmed to fix a real crash hit during
+        real full-genome alignment testing at higher thread counts).
+        Pass an explicit int to override this auto-detection.
 
     Output includes:
         <sample>_Aligned.sortedByCoord.out.bam
@@ -607,126 +599,111 @@ def read_star_gene_counts(sample_output_dir, sample_name, strandedness_column=1)
 
 
 # ---------------------------------------------------------------------------
-# tximport: gene-level collapsing of Salmon's transcript-level output
+# Mapping-rate quality classification (plain-language QC flag)
 # ---------------------------------------------------------------------------
 #
-# Salmon quantifies at the transcript level. For organisms with no
-# introns (e.g. bacteria), each gene typically has exactly one
-# transcript, so transcript-level counts are already gene-level. For
-# eukaryotes with multiple transcripts per gene, transcript-level counts
-# need to be collapsed to gene-level using a transcript-to-gene (tx2gene)
-# mapping — this is exactly what tximport does, and is the standard,
-# recommended approach for feeding Salmon output into DESeq2. See
-# reference_manager.py's extract_tx2gene_from_ensembl_fasta /
-# extract_tx2gene_from_gtf / build_identity_tx2gene + save_tx2gene_csv
-# for how the tx2gene mapping itself is built for each reference source.
+# Discovered via a real usability test (a non-bioinformatics user ran
+# through the full pipeline against a genuinely mismatched reference --
+# a different E. coli STRAIN than the one the experiment actually used):
+# every sample was shown as a plain "✅ Success" in the results table
+# regardless of its actual mapping rate, even though every single sample
+# had a mapping rate under 50%. The existing caption text ("rates above
+# ~70-80% are typically considered good...") was present on the SAME
+# PAGE but easy to miss/ignore, especially for a user with no prior
+# reference point for what a "good" rate even looks like. This function
+# provides a hard, automatic 3-tier classification so a badly mismatched
+# reference (wrong species, wrong strain, contamination, degraded RNA)
+# is impossible to overlook, rather than relying on the user to
+# separately notice and interpret a raw percentage number themselves.
 
-# This R script is written to a temp file and executed via Rscript. It
-# takes three positional arguments: a tx2gene CSV path (columns TXNAME,
-# GENEID), a sample manifest CSV path (columns sample, path — one row
-# per sample pointing at that sample's quant.sf file), and an output
-# path for the resulting gene-level counts matrix CSV.
-#
-# tximport's default countsFromAbundance="no" setting returns the raw
-# summed read counts per gene (the appropriate input for DESeq2), rather
-# than a length-bias-corrected variant — this matches what DESeq2's own
-# documentation recommends when importing via tximport without also
-# supplying an average transcript length offset matrix.
-#
-# dropInfReps=TRUE skips loading Salmon's inferential replicate data
-# (bootstrap/Gibbs samples used for uncertainty-aware DE methods like
-# swish). Without this flag, tximport requires the R "jsonlite" package
-# to parse those replicate files even when a user only wants standard
-# gene-level counts for DESeq2 — an easy-to-miss extra dependency that
-# has nothing to do with the actual counts being requested here. Setting
-# dropInfReps=TRUE avoids that dependency entirely for this standard-DE
-# use case.
-_TXIMPORT_R_SCRIPT = r'''
-suppressMessages(library(tximport))
-
-args <- commandArgs(trailingOnly = TRUE)
-tx2gene_path <- args[1]
-samples_manifest_path <- args[2]
-output_path <- args[3]
-
-tx2gene <- read.csv(tx2gene_path, stringsAsFactors = FALSE)
-samples <- read.csv(samples_manifest_path, stringsAsFactors = FALSE)
-
-files <- samples$path
-names(files) <- samples$sample
-
-missing_files <- files[!file.exists(files)]
-if (length(missing_files) > 0) {
-  stop(paste("Missing quant.sf file(s):", paste(missing_files, collapse = ", ")))
-}
-
-txi <- tximport(files, type = "salmon", tx2gene = tx2gene, countsFromAbundance = "no", dropInfReps = TRUE)
-
-counts_df <- as.data.frame(round(txi$counts))
-counts_df$gene_id <- rownames(counts_df)
-counts_df <- counts_df[, c("gene_id", samples$sample)]
-
-write.csv(counts_df, output_path, row.names = FALSE)
-cat("tximport gene-level collapsing completed successfully.\n")
-cat(paste("Genes:", nrow(counts_df), "| Samples:", length(samples$sample)), "\n")
-'''
-
-
-def tximport_available():
-    """Check whether Rscript (and by extension, R + tximport) is available."""
-    return shutil.which("Rscript") is not None
-
-
-def run_tximport_gene_collapse(sample_quant_paths, tx2gene_path, output_path, work_dir):
+def classify_mapping_rate(rate_pct):
     """
-    Run tximport (via an Rscript subprocess) to collapse Salmon's
-    transcript-level quant.sf output into gene-level counts, using a
-    pre-built tx2gene mapping (see reference_manager.py's
-    extract_tx2gene_from_ensembl_fasta / extract_tx2gene_from_gtf /
-    build_identity_tx2gene + save_tx2gene_csv).
+    Classify a mapping rate (Salmon's overall "Mapping Rate", or STAR's
+    "Uniquely Mapped %") into a plain-language quality tier.
 
-    sample_quant_paths: dict {sample_name: path_to_quant.sf}
-    tx2gene_path: path to a CSV with columns TXNAME, GENEID
-    output_path: where to write the resulting gene-level counts matrix
-    work_dir: scratch directory for the temporary R script and sample
-        manifest CSV this function creates
+    Thresholds:
+      - rate_pct >= 80: "good" -- a healthy mapping rate, no action
+        needed. This matches the commonly cited "80%+ is good for a
+        well-annotated reference" guidance already used elsewhere in
+        this app's own help text.
+      - 50 <= rate_pct < 80: "caution" -- lower than ideal but not
+        necessarily wrong; many legitimate real-world datasets
+        (degraded FFPE samples, less-complete non-model organism
+        references, etc.) genuinely fall in this range. Flagged so the
+        user is prompted to double-check their setup, without being
+        told outright that something is broken.
+      - rate_pct < 50: "poor" -- a strong, hard-to-ignore signal that
+        something is very likely wrong. The single most common real-
+        world cause (confirmed directly via usability testing) is a
+        MISMATCHED REFERENCE -- not necessarily the wrong species, but
+        potentially the wrong STRAIN of the same species (e.g. two
+        bacterial strains can differ enough in their genome sequence
+        that most reads fail to align to the wrong one's reference).
+        Other plausible causes (sample contamination, badly degraded
+        RNA, a corrupted/incomplete reference download) are listed too,
+        but reference mismatch is called out first since it's both the
+        most common cause in practice and the easiest for a user to
+        actually go back and check/fix.
 
-    Returns (success: bool, message_or_log: str).
+    rate_pct may be None (e.g. if the mapping-rate value itself
+    couldn't be parsed from the tool's own output) -- handled
+    gracefully as its own "unknown" tier rather than raising, since a
+    missing rate is a different (and separately already-surfaced)
+    problem from a genuinely low one.
+
+    Returns a dict:
+        {
+            "tier": "good" | "caution" | "poor" | "unknown",
+            "icon": a single emoji appropriate for inline display
+                    (e.g. directly inside a results table cell),
+            "short_label": a brief tier description suitable for a
+                    table cell (e.g. "Good", "Check reference"),
+            "message": a full plain-language explanation, suitable for
+                    display via st.success/st.warning/st.error
+                    immediately below/near the results table for any
+                    sample that isn't a clean "good".
+        }
     """
-    import pandas as pd
+    if rate_pct is None:
+        return {
+            "tier": "unknown", "icon": "⚪", "short_label": "Unknown",
+            "message": "Mapping rate could not be determined for this sample.",
+        }
 
-    if not tximport_available():
-        return False, (
-            "Rscript was not found on this system. R with the tximport "
-            "package needs to be installed in your environment (it's "
-            "included in the project's Dockerfile) before gene-level "
-            "collapsing can run."
-        )
-
-    os.makedirs(work_dir, exist_ok=True)
-
-    # Write the sample manifest tximport's R script expects.
-    manifest_path = os.path.join(work_dir, "tximport_samples.csv")
-    manifest_df = pd.DataFrame({
-        "sample": list(sample_quant_paths.keys()),
-        "path": list(sample_quant_paths.values()),
-    })
-    manifest_df.to_csv(manifest_path, index=False)
-
-    # Write the R script itself to a temp file rather than passing it
-    # inline via `Rscript -e`, since the script is long enough that
-    # shell-escaping it inline would be fragile/error-prone.
-    r_script_path = os.path.join(work_dir, "run_tximport.R")
-    with open(r_script_path, "w") as f:
-        f.write(_TXIMPORT_R_SCRIPT)
-
-    cmd = ["Rscript", r_script_path, tx2gene_path, manifest_path, output_path]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=1800
-        )
-        return True, result.stdout + result.stderr
-    except subprocess.CalledProcessError as e:
-        return False, f"tximport failed: {(e.stdout or '') + (e.stderr or '')}"
-    except subprocess.TimeoutExpired:
-        return False, "tximport timed out after 30 minutes."
+    if rate_pct >= 80:
+        return {
+            "tier": "good", "icon": "🟢", "short_label": "Good",
+            "message": f"{rate_pct}% -- a healthy mapping rate.",
+        }
+    elif rate_pct >= 50:
+        return {
+            "tier": "caution", "icon": "🟡", "short_label": "Check reference",
+            "message": (
+                f"{rate_pct}% is lower than the ~80%+ typically expected "
+                "for a well-matched reference. This CAN still be a "
+                "legitimate result (e.g. a partially-annotated non-model "
+                "organism, or somewhat degraded samples), but it's worth "
+                "double-checking that you selected the correct species "
+                "(and, for organisms with multiple common strains/"
+                "sub-species, the correct STRAIN) before trusting these "
+                "results."
+            ),
+        }
+    else:
+        return {
+            "tier": "poor", "icon": "🔴", "short_label": "Likely wrong reference",
+            "message": (
+                f"{rate_pct}% is unusually low and is a strong signal "
+                "that something doesn't match. The single most common "
+                "cause is a MISMATCHED REFERENCE -- this doesn't always "
+                "mean the wrong species outright; it's also very common "
+                "to select the right species but the wrong STRAIN (e.g. "
+                "two E. coli strains, or two mouse sub-strains, can "
+                "differ enough in their genome sequence that most reads "
+                "fail to align to a mismatched one). Other possible "
+                "causes: sample contamination, badly degraded RNA, or a "
+                "corrupted/incomplete reference download. Please "
+                "double-check your reference/species selection in Step "
+                "2 before proceeding to use these results."
+            ),
+        }

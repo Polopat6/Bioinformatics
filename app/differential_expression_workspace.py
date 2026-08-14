@@ -213,6 +213,28 @@ _DEFAULT_COLOR_PALETTE = [
     "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
 ]
 
+# Built-in Plotly colorscale names appropriate for a SEQUENTIAL (single
+# direction -- e.g. "low distance" through "high distance", never
+# negative) heatmap. Offered as a picker for the Sample Distance
+# heatmap, since distance is fundamentally a one-directional quantity
+# with no meaningful "zero-centered" midpoint -- a diverging colorscale
+# (built around a meaningful zero) would be a poor visual fit there.
+SEQUENTIAL_COLORSCALE_OPTIONS = [
+    "Blues", "Greens", "Greys", "Oranges", "Purples", "Reds",
+    "Viridis", "Cividis", "Plasma", "Inferno", "Magma", "Turbo",
+    "YlOrRd", "YlGnBu",
+]
+
+# Built-in Plotly colorscale names appropriate for a DIVERGING (two-
+# directional, meaningfully centered around zero) heatmap. Offered as a
+# picker for the Top Genes z-score heatmap, since a z-score is
+# genuinely bidirectional (above vs. below each gene's own average),
+# unlike the Sample Distance heatmap's always-positive distances above.
+DIVERGING_COLORSCALE_OPTIONS = [
+    "RdBu", "RdYlBu", "RdYlGn", "PiYG", "PRGn", "BrBG", "PuOr",
+    "Spectral", "Picnic", "Portland",
+]
+
 # Common output sizes for PDF export, in pixels. "Print quality"
 # presets are sized at 300 DPI for their nominal paper dimensions.
 PDF_SIZE_PRESETS = {
@@ -394,6 +416,13 @@ def _apply_plot_style(fig, style, default_title="", default_x_label=None,
     caller (e.g. default_title="PCA: Sample Similarity — Before Batch
     Correction"), so the user can freely retype/rename it via the
     style panel's title field with no forced, unremovable suffix.
+
+    IMPORTANT for callers that also plan to rename group/category
+    labels via _apply_group_label_renaming (see below): that renaming
+    must be applied AFTER this function, never before -- the
+    color_map recoloring here is matched by each trace's CURRENT
+    (original/raw) name, so renaming first would break that matching
+    entirely.
     """
     title_text = (style.get("title") or "").strip() or default_title
 
@@ -469,6 +498,183 @@ def _apply_plot_style(fig, style, default_title="", default_x_label=None,
     return fig
 
 
+def _render_group_label_renaming_controls(key_prefix, group_values,
+                                           label="Rename group labels (optional)"):
+    """
+    Render an optional "rename these labels for display" expander,
+    letting the user override how each distinct value in a color-by/
+    group-by column (or a fixed category set like "Up-regulated") is
+    SHOWN in a plot's legend/annotation labels -- e.g. relabeling a raw
+    metadata value like "untreated" to a more presentation-friendly
+    "Vehicle Control" -- entirely for DISPLAY purposes, without needing
+    to edit the underlying metadata file or re-run anything.
+
+    This is the same renaming pattern already used for the Venn
+    diagram's contrast labels (see render()'s "Rename contrast labels"
+    expander), generalized here into a reusable helper so the same
+    capability is available anywhere else a metadata-driven group value
+    or fixed category shows up in a legend (PCA, the Sample Distance
+    and Top Genes heatmaps' group annotation strips, and the volcano/MA
+    plots' Up-regulated/Down-regulated/Not-significant categories).
+
+    group_values: the distinct raw values needing a display label (e.g.
+        pca_df[color_by].astype(str).unique(), or the fixed 3-item list
+        ["Up-regulated", "Down-regulated", "Not significant"]).
+
+    Returns a dict {raw_value: display_label}. Every raw_value is
+    guaranteed to be present as a key (mapping to itself unless the
+    user typed something different), so callers can safely do
+    `label_map.get(raw_value, raw_value)` -- or, since every key is
+    always present, simply `label_map[raw_value]` -- either is safe.
+    """
+    display_map = {}
+    with st.expander(f"✏️ {label}"):
+        st.caption(
+            "Customize how each value below is displayed (e.g. rename "
+            "\"untreated\" to \"Vehicle Control\") -- this only changes "
+            "the DISPLAY text in this plot's legend/labels; your "
+            "underlying data is never modified."
+        )
+        n_cols = min(3, max(1, len(group_values)))
+        cols = st.columns(n_cols)
+        for i, val in enumerate(group_values):
+            with cols[i % n_cols]:
+                display_map[str(val)] = st.text_input(
+                    f"Label for `{val}`:", value=str(val),
+                    key=f"{key_prefix}_group_label_{val}",
+                )
+    return display_map
+
+
+def _apply_group_label_renaming(fig, group_label_map):
+    """
+    Rename each trace's legend display name (fig.data[i].name) according
+    to group_label_map ({raw_value: display_label}), leaving everything
+    else about the figure untouched.
+
+    This MUST be applied AFTER _apply_plot_style (see that function's
+    docstring) -- _apply_plot_style's color_map recoloring is matched
+    against each trace's ORIGINAL/raw name, so renaming first would
+    silently break that matching. Calling this last means a user can
+    freely rename e.g. "untreated" to "Vehicle Control" purely for
+    display, without needing to also retype that new name into the
+    color-picker panel above it (which was already built and applied
+    using the original raw names).
+
+    Safe to call with an empty/falsy group_label_map -- the figure is
+    returned completely unchanged in that case. Also safe if a trace's
+    current name isn't a key in group_label_map at all (e.g. a
+    non-group-related trace on the same figure) -- only matching traces
+    are touched.
+    """
+    if not group_label_map:
+        return fig
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", None)
+        if trace_name in group_label_map and group_label_map[trace_name] != trace_name:
+            trace.name = group_label_map[trace_name]
+    return fig
+
+
+def _render_heatmap_color_controls(key_prefix, options, default, default_reverse=False):
+    """
+    Render a small "heatmap colors" control pair -- a colorscale picker
+    (from `options`, a list of built-in Plotly colorscale names -- see
+    SEQUENTIAL_COLORSCALE_OPTIONS / DIVERGING_COLORSCALE_OPTIONS above)
+    plus a "Reverse" checkbox -- and return the pair ready to pass
+    straight into go.Heatmap's own `colorscale=`/`reversescale=`
+    arguments.
+
+    default, default_reverse: the colorscale name and reverse-flag that
+        reproduce this workspace's ORIGINAL (pre-this-feature) hardcoded
+        appearance for a given heatmap, so a user who never touches
+        these controls sees no visual change at all (e.g. the Sample
+        Distance heatmap's original hardcoded "Blues_r" is equivalent
+        to default="Blues", default_reverse=True).
+
+    Returns (colorscale_name: str, reverse: bool).
+    """
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        colorscale = st.selectbox(
+            "Heatmap color scale:", options=options,
+            index=options.index(default) if default in options else 0,
+            key=f"{key_prefix}_colorscale_select",
+        )
+    with col2:
+        reverse = st.checkbox(
+            "Reverse", value=default_reverse, key=f"{key_prefix}_colorscale_reverse",
+            help="Flips the color scale's direction (e.g. which end is dark vs. light).",
+        )
+    return colorscale, reverse
+
+
+def _format_pvalues_for_display(df, columns=("pvalue", "padj"), sci_notation_threshold=1e-4):
+    """
+    Return a copy of df with the given columns reformatted as DISPLAY
+    values: scientific notation (e.g. "3.40e-12") for any non-null
+    value smaller in absolute value than sci_notation_threshold, and a
+    plain rounded decimal otherwise -- so an on-screen results table
+    doesn't show either a wall of zeros or silently round a genuinely
+    tiny, significant p-value down to a meaningless "0.000000".
+
+    This is a DISPLAY-ONLY transform, intended purely for the DataFrame
+    passed to st.dataframe(...) -- NEVER for a CSV/download export,
+    which should always keep the original, full-precision numeric
+    values so downstream tools/analyses aren't affected by this purely
+    cosmetic on-screen formatting. Callers must build this from a COPY
+    of whatever DataFrame is actually offered for download (e.g. call
+    this ONLY when building the on-screen preview, and pass the
+    original, untouched DataFrame to _render_csv_download separately).
+
+    A value of exactly 0.0 (which genuinely does occur -- e.g. an
+    extremely significant gene whose p-value underflows to zero in
+    floating point) is also shown in scientific notation ("0.00e+00")
+    rather than falling through to plain rounding, since 0.0 is
+    unambiguously below any reasonable threshold and "0.000000" would
+    otherwise look identical to a merely small-but-nonzero value
+    rounded down.
+
+    IMPORTANT implementation detail: every non-null value is converted
+    to a STRING (never left as a raw Python float), even for the
+    "plain decimal" branch -- confirmed via direct testing that mixing
+    raw floats and formatted strings within the SAME column causes
+    Streamlit's internal Arrow-based dataframe serialization
+    (pyarrow.Table.from_pandas) to fail with an ArrowInvalid error on
+    that column (Streamlit does catch this and falls back to an
+    automatic type-coercion recovery path, but relying on that silent
+    recovery is fragile and produces a confusing warning in the logs).
+    Making every entry in the column a consistent string type avoids
+    this failure mode entirely, since a string-typed column with
+    scattered null (NaN) entries converts to Arrow without any type
+    ambiguity.
+    """
+    display_df = df.copy()
+
+    def _fmt(v):
+        if pd.isna(v):
+            return v
+        if abs(v) < sci_notation_threshold:
+            return f"{v:.2e}"
+        # Explicit fixed-decimal formatting (NOT Python's general "g"
+        # format or a bare str(round(...))) -- both of those can
+        # silently switch to scientific notation on their own for
+        # small-but-still-"plain-branch" values (e.g. if the user picks
+        # a very permissive sci_notation_threshold like 1e-10, a value
+        # like 0.00005 would still land in this "plain" branch, but
+        # Python's own str()/"g" formatting would render it as "5e-05"
+        # regardless -- defeating the point of this branch only ever
+        # showing plain decimals). ".6f" guarantees a genuinely fixed-
+        # decimal string every time, independent of the value's actual
+        # magnitude.
+        return f"{float(v):.6f}"
+
+    for col in columns:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(_fmt)
+    return display_df
+
+
 def _sanitize_filename(custom_name, fallback, extension):
     """
     Sanitize a user-provided file name for use in a download_button:
@@ -507,7 +713,10 @@ def _render_csv_download(df, default_filename, key_prefix, expander_label,
     df: the DataFrame to export. Converted to CSV bytes fresh on every
         render -- cheap enough that no "Generate" button/step is needed
         here (unlike PDF export, which has real rendering cost via
-        kaleido).
+        kaleido). This should always be the ORIGINAL, full-precision
+        DataFrame (never a display-only reformatted copy -- see
+        _format_pvalues_for_display's docstring), so exported files
+        stay fully usable by downstream tools/analyses.
     expander_label: the visible label for the wrapping expander (e.g.
         the same text the download button used to show before this
         helper existed), so the download stays easy to find even
@@ -788,6 +997,16 @@ def _plot_pca(pca_df, pct_variance, color_by, show_confidence_ellipse=False, con
         skipped (too little data for a meaningful ellipse) rather than
         causing an error.
 
+    Note on display labels: this function always builds traces using
+    the RAW group values from pca_df[color_by] as each trace's "name"
+    -- this is intentional, since _apply_plot_style's color-map
+    recoloring (applied by the caller right after this function
+    returns) is matched against these exact raw names. If the caller
+    also wants to show a friendlier display label (e.g. "Vehicle
+    Control" instead of a raw "untreated"), that renaming should be
+    applied via _apply_group_label_renaming AFTER _apply_plot_style --
+    see that function's docstring for why the ordering matters.
+
     Returns (fig, ellipse_stats) -- the figure, and a list of per-group
     ellipse statistics dicts (see _compute_confidence_ellipse) for
     display below the plot, or an empty list if
@@ -849,6 +1068,15 @@ def _plot_volcano(results_df, padj_threshold=0.05, lfc_threshold=1.0, gene_name_
         the "Gene ID -> Gene Name Mapping" uploader in render()). When
         given, hover text shows the readable name alongside the raw
         gene ID; when omitted, the raw gene ID is shown as-is.
+
+    Note on display labels: as with _plot_pca above, this function
+    always builds its three traces using the raw category names
+    ("Up-regulated", "Down-regulated", "Not significant") as each
+    trace's "name", since the caller's _apply_plot_style color-map
+    recoloring is matched against these exact names. A caller wanting
+    to show renamed category labels (e.g. via
+    _render_group_label_renaming_controls) should apply
+    _apply_group_label_renaming AFTER _apply_plot_style.
 
     Returns (fig, df) -- the figure AND the prepared DataFrame (with
     the "neg_log10_padj" and "direction" columns added, NaN rows
@@ -1316,14 +1544,16 @@ def _cluster_order_from_distance_matrix(distance_df):
         return samples
 
 
-def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, show_group_annotation=True):
+def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, show_group_annotation=True,
+                                   group_label_map=None, colorscale="Blues", reverse_colorscale=True):
     """
     Build a sample-to-sample distance heatmap (Euclidean distance on
     VST-transformed counts), with rows/columns ordered by hierarchical
     clustering -- the standard companion QC view to PCA, since PCA's
     first 2-4 components can sometimes miss an outlier or mislabeled
-    sample that a full pairwise distance comparison catches. Darker
-    (lower-distance) cells indicate more similar samples.
+    sample that a full pairwise distance comparison catches. By
+    default, darker (lower-distance) cells indicate more similar
+    samples -- see colorscale/reverse_colorscale below to customize.
 
     meta_df, group_column: if given (a metadata DataFrame with a
         "sample" column, and the name of the column to group by), each
@@ -1344,9 +1574,30 @@ def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, 
         keep group_column selected for OTHER purposes (e.g. the
         clustering-mismatch smart flag below the heatmap) while still
         hiding the visual annotation on the plot itself.
+    group_label_map: optional dict {raw_group_value: display_label} --
+        e.g. {"untreated": "Vehicle Control"} -- applied to the group
+        annotation strip's legend entries, hover text, and each
+        sample's axis-label suffix, purely for DISPLAY purposes (the
+        underlying grouping/coloring logic still operates on the raw
+        metadata values). See _render_group_label_renaming_controls for
+        how this dict is built. Pass None (the default) for no
+        renaming -- raw metadata values are shown as-is.
+    colorscale, reverse_colorscale: the heatmap's color scale (any
+        built-in Plotly colorscale name -- see
+        SEQUENTIAL_COLORSCALE_OPTIONS) and whether to reverse its
+        direction. Defaults (colorscale="Blues", reverse_colorscale=True)
+        exactly reproduce this function's ORIGINAL hardcoded appearance
+        ("Blues_r"), so a caller that doesn't pass these sees no visual
+        change. See _render_heatmap_color_controls for the paired UI
+        control.
     """
     order = _cluster_order_from_distance_matrix(distance_df)
     ordered_df = distance_df.loc[order, order]
+
+    group_label_map = group_label_map or {}
+
+    def _display_group(raw_value):
+        return group_label_map.get(raw_value, raw_value)
 
     sample_to_group = {}
     if show_group_annotation and meta_df is not None and group_column and group_column in meta_df.columns:
@@ -1361,7 +1612,7 @@ def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, 
     # where hover text isn't available).
     if sample_to_group:
         display_labels = [
-            f"{s} ({sample_to_group.get(s, '?')})" for s in ordered_df.index
+            f"{s} ({_display_group(sample_to_group.get(s, '?'))})" for s in ordered_df.index
         ]
     else:
         display_labels = list(ordered_df.index)
@@ -1370,7 +1621,8 @@ def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, 
         z=ordered_df.values,
         x=display_labels,
         y=display_labels,
-        colorscale="Blues_r",
+        colorscale=colorscale,
+        reversescale=reverse_colorscale,
         colorbar=dict(title="Distance", x=1.02),
         hovertemplate="%{y} vs %{x}<br>Distance: %{z:.1f}<extra></extra>",
     ))
@@ -1398,22 +1650,22 @@ def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, 
         # continuous colorscales natively) by giving each integer group
         # code a hard-edged color band rather than a smooth gradient.
         if n_groups == 1:
-            colorscale = [[0, strip_colors[0]], [1, strip_colors[0]]]
+            strip_colorscale = [[0, strip_colors[0]], [1, strip_colors[0]]]
         else:
-            colorscale = []
+            strip_colorscale = []
             for i, color in enumerate(strip_colors):
-                colorscale.append([i / n_groups, color])
-                colorscale.append([(i + 1) / n_groups, color])
+                strip_colorscale.append([i / n_groups, color])
+                strip_colorscale.append([(i + 1) / n_groups, color])
 
         fig.add_trace(go.Heatmap(
             z=z_strip,
             x=["Group"],
             y=display_labels,
             xaxis="x2",
-            colorscale=colorscale,
+            colorscale=strip_colorscale,
             zmin=0, zmax=n_groups,
             showscale=False,
-            text=[[g] for g in groups_in_order],
+            text=[[_display_group(g)] for g in groups_in_order],
             hovertemplate="%{y}<br>Group: %{text}<extra></extra>",
         ))
 
@@ -1443,7 +1695,7 @@ def _plot_sample_distance_heatmap(distance_df, meta_df=None, group_column=None, 
             fig.add_trace(go.Scatter(
                 x=[None], y=[None], mode="markers",
                 marker=dict(size=10, color=color),
-                name=str(group_name),
+                name=str(_display_group(group_name)),
                 showlegend=True,
             ))
     else:
@@ -1557,6 +1809,11 @@ def _plot_ma(results_df, padj_threshold=0.05, lfc_threshold=1.0, gene_name_map=N
     Mean expression (baseMean) is shown on a log-scaled x-axis, the
     standard convention for this plot.
 
+    Note on display labels: as with _plot_volcano, this function always
+    builds its three traces using the raw category names as each
+    trace's "name" -- a caller wanting renamed category labels should
+    apply _apply_group_label_renaming AFTER _apply_plot_style.
+
     Returns the figure only (no separate "df" return value needed here,
     since this reuses results_df directly rather than building its own
     filtered/derived copy the way _plot_volcano does for gene labeling).
@@ -1621,7 +1878,8 @@ def _cluster_order_generic(matrix_df, axis=0):
 
 
 def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_top=25,
-                             meta_df=None, group_column=None, group_samples=True):
+                             meta_df=None, group_column=None, group_samples=True,
+                             group_label_map=None, colorscale="RdBu", reverse_colorscale=True):
     """
     Build a z-scored expression heatmap of the top N most significant
     genes (by adjusted p-value) from the current contrast, across every
@@ -1673,6 +1931,20 @@ def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_to
         (useful if you specifically want to check whether clustering
         recovers your groups on its own, without them being forced
         together).
+    group_label_map: optional dict {raw_group_value: display_label} --
+        applied to the group annotation strip's legend entries, hover
+        text, and each sample's column-label suffix, purely for
+        DISPLAY purposes -- see _plot_sample_distance_heatmap's
+        matching parameter for the full rationale. Pass None (the
+        default) for no renaming.
+    colorscale, reverse_colorscale: the heatmap's color scale (any
+        built-in Plotly colorscale name -- see
+        DIVERGING_COLORSCALE_OPTIONS, since a z-score is genuinely
+        bidirectional around zero) and whether to reverse its
+        direction. Defaults (colorscale="RdBu", reverse_colorscale=True)
+        exactly reproduce this function's ORIGINAL hardcoded appearance
+        ("RdBu_r"), so a caller that doesn't pass these sees no visual
+        change.
 
     Returns (fig, z_df) -- the figure AND the z-scored matrix itself
     (genes x samples, in the final displayed order, gene_id as the
@@ -1695,6 +1967,11 @@ def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_to
     z_df = log_subset.sub(row_mean, axis=0).div(row_std, axis=0)
 
     gene_order = _cluster_order_generic(z_df, axis=0)
+
+    group_label_map = group_label_map or {}
+
+    def _display_group(raw_value):
+        return group_label_map.get(raw_value, raw_value)
 
     # sample_to_group is only built when group_samples is True -- when the
     # user checks "Ignore grouping" (group_samples=False), this stays empty
@@ -1747,7 +2024,7 @@ def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_to
 
     if sample_to_group:
         display_sample_labels = [
-            f"{s} ({sample_to_group.get(s, '?')})" for s in z_df.columns
+            f"{s} ({_display_group(sample_to_group.get(s, '?'))})" for s in z_df.columns
         ]
     else:
         display_sample_labels = list(z_df.columns)
@@ -1756,7 +2033,8 @@ def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_to
         z=z_df.values,
         x=display_sample_labels,
         y=display_gene_labels,
-        colorscale="RdBu_r",
+        colorscale=colorscale,
+        reversescale=reverse_colorscale,
         zmid=0,
         colorbar=dict(title="Z-score", x=1.08),
         hovertemplate="Gene: %{y}<br>Sample: %{x}<br>Z-score: %{z:.2f}<extra></extra>",
@@ -1785,22 +2063,22 @@ def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_to
             _DEFAULT_COLOR_PALETTE[i % len(_DEFAULT_COLOR_PALETTE)] for i in range(n_groups)
         ]
         if n_groups == 1:
-            colorscale = [[0, strip_colors[0]], [1, strip_colors[0]]]
+            strip_colorscale = [[0, strip_colors[0]], [1, strip_colors[0]]]
         else:
-            colorscale = []
+            strip_colorscale = []
             for i, color in enumerate(strip_colors):
-                colorscale.append([i / n_groups, color])
-                colorscale.append([(i + 1) / n_groups, color])
+                strip_colorscale.append([i / n_groups, color])
+                strip_colorscale.append([(i + 1) / n_groups, color])
 
         fig.add_trace(go.Heatmap(
             z=z_strip,
             x=display_sample_labels,
             y=["Group"],
             yaxis="y2",
-            colorscale=colorscale,
+            colorscale=strip_colorscale,
             zmin=0, zmax=n_groups,
             showscale=False,
-            text=[groups_in_order],
+            text=[[_display_group(g) for g in groups_in_order]],
             hovertemplate="%{x}<br>Group: %{text}<extra></extra>",
         ))
 
@@ -1833,7 +2111,7 @@ def _plot_top_genes_heatmap(norm_counts_df, results_df, gene_name_map=None, n_to
             fig.add_trace(go.Scatter(
                 x=[None], y=[None], mode="markers",
                 marker=dict(size=10, color=color),
-                name=str(group_name),
+                name=str(_display_group(group_name)),
                 showlegend=True,
             ))
     else:
@@ -2810,6 +3088,18 @@ def render():
         color_by = st.selectbox("Color points by:", options=color_options, key="pca_color_select")
         group_values = sorted(pca_df[color_by].astype(str).unique())
 
+        # --- Custom display labels for this color-by column's group values ---
+        # e.g. relabeling a raw metadata value like "untreated" to
+        # "Vehicle Control" for the legend -- see
+        # _render_group_label_renaming_controls's docstring. Computed
+        # ONCE here (rather than separately for the Before/After/Single
+        # views below) so a rename is applied consistently everywhere
+        # this same color_by column's values appear on this page.
+        pca_group_label_map = _render_group_label_renaming_controls(
+            f"pca_{color_by}", group_values,
+            label=f"Rename `{color_by}` group labels shown in the legend (optional)",
+        )
+
         pca_adj_df, pct_var_adj = (None, None)
         if batch_column:
             pca_adj_df, pct_var_adj = _load_pca_coordinates(deseq2_out_dir, batch_adjusted=True)
@@ -2845,6 +3135,9 @@ def render():
                 fig_before, pca_before_style,
                 default_title="PCA: Sample Similarity — Before Batch Correction",
             )
+            _apply_group_label_renaming(fig_before, pca_group_label_map)
+            for es in ellipse_stats_before:
+                es["group"] = pca_group_label_map.get(es["group"], es["group"])
             _render_plotly_chart(fig_before)
             _render_ellipse_stats(ellipse_stats_before, "pca_before")
             _render_pdf_export(fig_before, "pca_before", "pca_before_batch_correction")
@@ -2867,6 +3160,9 @@ def render():
                 fig_after, pca_after_style,
                 default_title="PCA: Sample Similarity — After Batch Correction (Visualization Only)",
             )
+            _apply_group_label_renaming(fig_after, pca_group_label_map)
+            for es in ellipse_stats_after:
+                es["group"] = pca_group_label_map.get(es["group"], es["group"])
             _render_plotly_chart(fig_after)
             _render_ellipse_stats(ellipse_stats_after, "pca_after")
             _render_pdf_export(fig_after, "pca_after", "pca_after_batch_correction")
@@ -2933,6 +3229,9 @@ def render():
             )
             pca_single_style = _render_plot_style_controls("pca_single", group_values=group_values)
             _apply_plot_style(fig_single, pca_single_style, default_title="PCA: Sample Similarity")
+            _apply_group_label_renaming(fig_single, pca_group_label_map)
+            for es in ellipse_stats_single:
+                es["group"] = pca_group_label_map.get(es["group"], es["group"])
             _render_plotly_chart(fig_single)
             _render_ellipse_stats(ellipse_stats_single, "pca_single")
             _render_pdf_export(fig_single, "pca_single", "pca_sample_similarity")
@@ -2967,10 +3266,12 @@ def render():
             "at the first few principal components. Samples are grouped "
             "by similarity (hierarchical clustering) so any expected -- "
             "or unexpected -- grouping is easy to spot at a glance. "
-            "Darker cells mean more similar samples. Each sample's group "
-            "(picked below) is also shown as a colored strip alongside "
-            "the heatmap and appended to its label, so groupings are "
-            "readable even without recognizing every sample name."
+            "By default, darker cells mean more similar samples (pick a "
+            "different color scale below if you prefer). Each sample's "
+            "group (picked below) is also shown as a colored strip "
+            "alongside the heatmap and appended to its label, so "
+            "groupings are readable even without recognizing every "
+            "sample name."
         )
 
     distance_df = _load_sample_distance_matrix(deseq2_out_dir)
@@ -3004,9 +3305,23 @@ def render():
                     help="Removes the color-coded strip and legend from the plot below, showing plain sample names instead -- the metadata column selected above is still used for the clustering-mismatch check further down.",
                 )
 
+        # --- Color scale + group label renaming controls ---
+        dist_colorscale, dist_reverse = _render_heatmap_color_controls(
+            "sample_dist", SEQUENTIAL_COLORSCALE_OPTIONS, default="Blues", default_reverse=True,
+        )
+        dist_group_label_map = {}
+        if heatmap_group_column and heatmap_show_group_annotation:
+            dist_group_values = sorted(meta_df[heatmap_group_column].astype(str).unique())
+            dist_group_label_map = _render_group_label_renaming_controls(
+                f"sample_dist_{heatmap_group_column}", dist_group_values,
+                label=f"Rename `{heatmap_group_column}` group labels shown on this heatmap (optional)",
+            )
+
         dist_fig = _plot_sample_distance_heatmap(
             distance_df, meta_df=meta_df, group_column=heatmap_group_column,
             show_group_annotation=heatmap_show_group_annotation,
+            group_label_map=dist_group_label_map,
+            colorscale=dist_colorscale, reverse_colorscale=dist_reverse,
         )
         dist_style = _render_plot_style_controls("sample_dist", group_values=None, show_legend_controls=False)
         _apply_plot_style(dist_fig, dist_style, default_title="Sample-to-Sample Distance")
@@ -3145,6 +3460,18 @@ def render():
         n_sig = ((results_df["padj"] < padj_cutoff) & (results_df["log2FoldChange"].abs() >= lfc_cutoff)).sum()
         st.caption(f"**{n_sig:,}** significant genes at padj < {padj_cutoff} and |log2FC| >= {lfc_cutoff}.")
 
+        # --- Custom display labels for Up-/Down-regulated/Not significant ---
+        # Shared between the volcano plot, the MA plot, AND the results
+        # table's "Regulation" column below -- computed once here so a
+        # rename is applied consistently everywhere these three category
+        # labels appear on this page, rather than needing to be set
+        # separately in three different places.
+        regulation_label_map = _render_group_label_renaming_controls(
+            f"regulation_{selected_contrast}",
+            ["Up-regulated", "Down-regulated", "Not significant"],
+            label="Rename Up-regulated/Down-regulated/Not-significant labels (optional)",
+        )
+
         volcano_fig, volcano_df = _plot_volcano(results_df, padj_cutoff, lfc_cutoff, gene_name_map=gene_name_map)
         volcano_style = _render_plot_style_controls(
             f"volcano_{selected_contrast}",
@@ -3159,6 +3486,7 @@ def render():
             volcano_fig, volcano_style,
             default_title=f"Volcano Plot: {selected_contrast}",
         )
+        _apply_group_label_renaming(volcano_fig, regulation_label_map)
 
         # --- Gene labeling: "Label All" + search + per-gene style controls ---
         # Built (and its resulting annotations attached to volcano_fig)
@@ -3218,7 +3546,9 @@ def render():
         # Reuses the exact same padj_cutoff/lfc_cutoff (and gene_name_map)
         # already set above via the sliders next to the volcano plot, so
         # this plot's coloring/hover names always match your current
-        # selection with no separate controls needed here.
+        # selection with no separate controls needed here. Also reuses
+        # the exact same regulation_label_map as the volcano plot (built
+        # once, above), so a rename applies consistently to both plots.
         st.markdown("##### 📉 MA Plot")
         with st.expander("ℹ️ How to read this plot, and why it's different from the volcano plot"):
             st.markdown(
@@ -3244,6 +3574,7 @@ def render():
             },
         )
         _apply_plot_style(ma_fig, ma_style, default_title=f"MA Plot: {selected_contrast}")
+        _apply_group_label_renaming(ma_fig, regulation_label_map)
         _render_plotly_chart(ma_fig)
         _render_pdf_export(ma_fig, f"ma_{selected_contrast}", f"ma_plot_{selected_contrast}")
 
@@ -3312,8 +3643,9 @@ def render():
                 "those top genes' ACTUAL expression pattern looks like "
                 "across every sample. Each row is one gene, each column "
                 "is one sample, and color shows that gene's expression "
-                "relative to its own average (a **z-score**: red = "
-                "higher than usual for that gene, blue = lower), so "
+                "relative to its own average (a **z-score**: by default, "
+                "red = higher than usual for that gene, blue = lower -- "
+                "pick a different color scale below if you prefer), so "
                 "genes with very different absolute expression levels "
                 "are still shown on a comparable scale. Genes are "
                 "reordered by similarity (hierarchical clustering); by "
@@ -3362,9 +3694,23 @@ def render():
                         help="By default, samples are physically grouped together by the column above, clustering only within each group. Check this to instead order every sample purely by expression similarity across the whole dataset, ignoring group membership.",
                     )
 
+            # --- Color scale + group label renaming controls ---
+            top_genes_colorscale, top_genes_reverse = _render_heatmap_color_controls(
+                f"top_genes_{selected_contrast}", DIVERGING_COLORSCALE_OPTIONS, default="RdBu", default_reverse=True,
+            )
+            top_genes_label_map = {}
+            if top_genes_group_column and top_genes_group_samples:
+                tg_group_values = sorted(meta_df[top_genes_group_column].astype(str).unique())
+                top_genes_label_map = _render_group_label_renaming_controls(
+                    f"top_genes_{selected_contrast}_{top_genes_group_column}", tg_group_values,
+                    label=f"Rename `{top_genes_group_column}` group labels shown on this heatmap (optional)",
+                )
+
             top_genes_fig, top_genes_z_df = _plot_top_genes_heatmap(
                 norm_counts_df, results_df, gene_name_map=gene_name_map, n_top=n_top_genes,
                 meta_df=meta_df, group_column=top_genes_group_column, group_samples=top_genes_group_samples,
+                group_label_map=top_genes_label_map,
+                colorscale=top_genes_colorscale, reverse_colorscale=top_genes_reverse,
             )
             top_genes_style = _render_plot_style_controls(
                 f"top_genes_{selected_contrast}", group_values=None, show_legend_controls=False,
@@ -3421,13 +3767,38 @@ def render():
         annotated_results_df = results_df.copy()
         annotated_results_df["Regulation"] = dm.classify_regulation(annotated_results_df, padj_cutoff, lfc_cutoff)
 
-        st.dataframe(annotated_results_df.head(200), use_container_width=True, hide_index=True)
+        # --- On-screen display formatting (never applied to the CSV
+        # export below, which always keeps full-precision raw values) ---
+        # Very small p-values (common in a well-powered real dataset)
+        # would otherwise show as either a wall of zeros or silently
+        # round down to a meaningless "0.000000" -- switching to
+        # scientific notation below a user-chosen threshold keeps them
+        # legible. The same threshold/formatting is reused for the
+        # clusterProfiler export preview table further down.
+        sci_notation_threshold = st.select_slider(
+            "Switch very small p-values to scientific notation below:",
+            options=[1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-8, 1e-10],
+            value=1e-4,
+            format_func=lambda v: f"{v:.0e}",
+            key=f"sci_notation_threshold_{selected_contrast}",
+            help="Only affects how p-values/adjusted p-values are DISPLAYED in the table below -- downloaded CSV files always keep the full-precision original numbers.",
+        )
+        display_results_df = _format_pvalues_for_display(
+            annotated_results_df, columns=("pvalue", "padj"), sci_notation_threshold=sci_notation_threshold,
+        )
+        if regulation_label_map:
+            display_results_df["Regulation"] = display_results_df["Regulation"].map(
+                lambda r: regulation_label_map.get(r, r)
+            )
+
+        st.dataframe(display_results_df.head(200), use_container_width=True, hide_index=True)
         st.caption(
             "Showing top 200 rows (sorted by adjusted p-value). The "
             "**Regulation** column reflects the significance threshold "
             "and fold-change cutoff sliders above. Download the full, "
             "unfiltered table (all genes, every DESeq2 statistic, plus "
-            "this Regulation column) below."
+            "this Regulation column, with FULL-PRECISION numeric "
+            "p-values) below."
         )
 
         _render_csv_download(
@@ -3453,7 +3824,10 @@ def render():
             )
             export_df = dm.build_clusterprofiler_export(deseq2_out_dir, selected_contrast)
             if export_df is not None:
-                st.dataframe(export_df.head(20), use_container_width=True, hide_index=True)
+                display_export_df = _format_pvalues_for_display(
+                    export_df, columns=("pvalue", "padj"), sci_notation_threshold=sci_notation_threshold,
+                )
+                st.dataframe(display_export_df.head(20), use_container_width=True, hide_index=True)
                 _render_csv_download(
                     export_df, f"clusterprofiler_ranked_{selected_contrast}", f"clusterprofiler_{selected_contrast}",
                     expander_label="⬇️ Download clusterProfiler-Ready Gene List (.csv)",

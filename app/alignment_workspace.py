@@ -1235,6 +1235,69 @@ def render():
     _render_counts_matrix_step(project, method, samplesheet_df, reference_dir)
 
 
+def _render_mapping_rate_qc(results_df, rate_column):
+    """
+    Render the 3-tier plain-language mapping-rate quality summary for a
+    just-completed (or previously completed) quantification run --
+    surfaces every sample that ISN'T a clean "good" result explicitly,
+    with a plain-language explanation, rather than relying on the
+    results table's per-row status icon alone.
+
+    This exists specifically because of a real usability-testing
+    finding: a non-bioinformatics user's quantification run had every
+    sample mapping at well under 50% (caused by an organism/strain
+    mismatch between their samples and the selected reference genome),
+    yet every row in the results table still showed a plain "✅
+    Success" -- "Success" here only ever meant "the tool ran without
+    crashing", not "the result looks biologically sound", but that
+    distinction was not obvious to a user with no prior reference point
+    for what a mapping rate even measures. This function makes a badly
+    mismatched reference impossible to silently overlook.
+
+    rate_column: the results_df column holding each sample's mapping-
+        rate percentage as a plain float/None (e.g. "Mapping Rate (%)"
+        for Salmon, "Uniquely Mapped (%)" for STAR) -- kept separate
+        from the DISPLAY-formatted "Mapping Rate"/"Uniquely Mapped %"
+        string column already shown in the main results table, so this
+        function can classify the real numeric value directly rather
+        than needing to re-parse a "92.3%" string.
+    """
+    poor_samples = []
+    caution_samples = []
+
+    for _, row in results_df.iterrows():
+        rate = row.get(rate_column)
+        classification = qm.classify_mapping_rate(rate)
+        if classification["tier"] == "poor":
+            poor_samples.append((row["Sample"], classification))
+        elif classification["tier"] == "caution":
+            caution_samples.append((row["Sample"], classification))
+
+    if poor_samples:
+        sample_lines = "\n".join(
+            f"- **{sample_name}**: {cls['message']}" for sample_name, cls in poor_samples
+        )
+        st.error(
+            f"🔴 **{len(poor_samples)} sample(s) have a very low mapping "
+            f"rate (below 50%)** -- this is a strong signal something "
+            f"doesn't match, most commonly the wrong reference organism "
+            f"OR the wrong STRAIN of the right organism:\n\n{sample_lines}"
+        )
+
+    if caution_samples:
+        sample_lines = "\n".join(
+            f"- **{sample_name}**: {cls['message']}" for sample_name, cls in caution_samples
+        )
+        st.warning(
+            f"🟡 **{len(caution_samples)} sample(s) have a lower-than-"
+            f"ideal mapping rate (50-79%)** -- not necessarily wrong, "
+            f"but worth double-checking:\n\n{sample_lines}"
+        )
+
+    if not poor_samples and not caution_samples and len(results_df) > 0:
+        st.success("🟢 All samples have a healthy mapping rate (80%+).")
+
+
 def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest):
     """Step 3 UI for the Salmon path: index check/build, then quantify."""
     if not qm.salmon_tool_available():
@@ -1432,10 +1495,20 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
             progress_bar.progress(i / n_samples, text=f"Quantifying {i + 1}/{n_samples}: {entry['sample']}...")
             success, log, sample_out_dir = qm.run_salmon_quant(entry, index_dir, quant_dir, threads=quant_threads)
             mapping_rate = qm.parse_salmon_mapping_rate(sample_out_dir) if success else None
+            # A tool run that completes without crashing ("✅ Success")
+            # does NOT by itself mean the biological result is sound --
+            # see classify_mapping_rate's docstring and
+            # _render_mapping_rate_qc above for the real-world usability
+            # finding that motivated separating these two concepts
+            # explicitly, rather than only showing a single "Success"/
+            # "Failed" status regardless of mapping quality.
+            quality = qm.classify_mapping_rate(mapping_rate) if success else None
             results.append({
                 "Sample": entry["sample"],
                 "Status": "✅ Success" if success else "❌ Failed",
                 "Mapping Rate": f"{mapping_rate}%" if mapping_rate is not None else "—",
+                "Mapping Rate (%)": mapping_rate,  # raw numeric value, used by _render_mapping_rate_qc below -- not displayed directly in this table
+                "Quality": f"{quality['icon']} {quality['short_label']}" if quality else "—",
             })
             if not success:
                 with st.expander(f"Error details for {entry['sample']}"):
@@ -1443,18 +1516,25 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
 
         progress_bar.progress(1.0, text="Quantification complete.")
         results_df = pd.DataFrame(results)
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
+        # "Mapping Rate (%)" is the raw numeric column used only for
+        # classification below -- hidden from the displayed table since
+        # the "Mapping Rate" (formatted with a % sign) and new "Quality"
+        # columns already convey everything a user needs to see.
+        st.dataframe(
+            results_df.drop(columns=["Mapping Rate (%)"]),
+            use_container_width=True, hide_index=True,
+        )
 
         if (results_df["Status"] == "✅ Success").any():
             pm.mark_step_complete(project, "quantification_complete")
             st.success("✅ Quantification complete for at least one sample.")
-            st.caption(
-                "**Mapping Rate** shows the % of reads that matched a "
-                "known transcript. Rates above ~70-80% are typically "
-                "considered good for well-annotated organisms; lower "
-                "rates can indicate contamination, wrong species "
-                "reference, or degraded samples."
-            )
+
+        # Plain-language, impossible-to-miss QC summary -- see
+        # _render_mapping_rate_qc's docstring for the real usability-
+        # testing finding that motivated this (every sample silently
+        # shown as "✅ Success" despite all being under 50% mapped due
+        # to a reference/strain mismatch).
+        _render_mapping_rate_qc(results_df, rate_column="Mapping Rate (%)")
 
 
 def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
@@ -1750,10 +1830,21 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
                 add_strand_field=add_strand_field,
             )
             mapping_rate = qm.parse_star_mapping_rate(sample_out_dir, entry["sample"]) if success else None
+            # See _render_salmon_quantification's matching comment above
+            # -- a tool run completing without crashing does NOT by
+            # itself mean the biological result is sound. Confirmed via
+            # real usability testing: every sample previously showed a
+            # plain "✅ Success" regardless of actual mapping rate, even
+            # when every single sample mapped under 50% (a reference/
+            # strain mismatch) -- classify_mapping_rate + the QC summary
+            # below make this impossible to silently overlook now.
+            quality = qm.classify_mapping_rate(mapping_rate) if success else None
             results.append({
                 "Sample": entry["sample"],
                 "Status": "✅ Success" if success else "❌ Failed",
                 "Uniquely Mapped %": f"{mapping_rate}%" if mapping_rate is not None else "—",
+                "Uniquely Mapped (%)": mapping_rate,  # raw numeric value, used by _render_mapping_rate_qc below -- not displayed directly in this table
+                "Quality": f"{quality['icon']} {quality['short_label']}" if quality else "—",
             })
             if not success:
                 with st.expander(f"Error details for {entry['sample']}"):
@@ -1761,15 +1852,16 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
         progress_bar.progress(1.0, text="Alignment complete.")
         results_df = pd.DataFrame(results)
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
+        st.dataframe(
+            results_df.drop(columns=["Uniquely Mapped (%)"]),
+            use_container_width=True, hide_index=True,
+        )
 
         if (results_df["Status"] == "✅ Success").any():
             pm.mark_step_complete(project, "quantification_complete")
             st.success("✅ Alignment & gene counting complete for at least one sample.")
-            st.caption(
-                "**Uniquely Mapped %** shows the % of reads that aligned "
-                "to exactly one location in the genome. Rates above "
-                "~70-80% are typically considered good; lower rates can "
-                "indicate contamination, wrong species reference, or "
-                "degraded samples."
-            )
+
+        # Plain-language, impossible-to-miss QC summary -- see
+        # _render_mapping_rate_qc's docstring for the real usability-
+        # testing finding that motivated this.
+        _render_mapping_rate_qc(results_df, rate_column="Uniquely Mapped (%)")

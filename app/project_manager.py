@@ -315,7 +315,24 @@ def deseq2_output_dir(project_name):
 def deseq2_work_dir(project_name):
     """Scratch directory for the temporary R script + job spec JSON."""
     return os.path.join(deseq2_dir(project_name), "work")
+def ontology_dir(project_name):
+    """Where Ontology Analysis (GO/KEGG/Reactome enrichment) inputs/outputs live for this project."""
+    return os.path.join(project_dir(project_name), "ontology")
 
+
+def ontology_output_dir(project_name):
+    """
+    Root directory for Ontology Analysis result files. ontology_workspace.py
+    further nests this by analysis type (ora/gsea/compareCluster) and
+    contrast/comparison name -- this function only needs to return the
+    shared root those nested paths are built under.
+    """
+    return os.path.join(ontology_dir(project_name), "output")
+
+
+def ontology_work_dir(project_name):
+    """Scratch directory for Ontology Analysis's temporary R scripts + input gene list CSVs."""
+    return os.path.join(ontology_dir(project_name), "work")
 
 def save_deseq2_config(project_name, config):
     """
@@ -349,7 +366,24 @@ def get_reference_choice(project_name):
     info = load_info(project_name)
     return info.get("reference_species"), info.get("reference_is_custom", False)
 
+def save_ontology_species_override(project_name, species_key):
+    """
+    Remember a manually-confirmed organism choice for Ontology Analysis,
+    used when a project's actual alignment reference was a custom
+    upload (so its normal reference_species/reference_is_custom choice
+    doesn't map to a usable annotation package) but the data is really
+    one of this app's supported preset species. Kept completely
+    separate from reference_species/reference_is_custom, which continue
+    to correctly describe the ACTUAL alignment reference used.
+    """
+    info = load_info(project_name)
+    info["ontology_species_override"] = species_key
+    save_info(project_name, info)
 
+
+def get_ontology_species_override(project_name):
+    info = load_info(project_name)
+    return info.get("ontology_species_override")
 def save_alignment_method(project_name, method):
     """
     Remember which alignment/quantification method ("salmon" or "star")

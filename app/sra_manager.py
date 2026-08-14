@@ -45,6 +45,19 @@ older tools/tutorials reference has been deprecated by NCBI and now
 returns "400 Bad Request" for any query — E-utilities is the correct
 modern replacement and is what this module uses.
 
+--- Multiple accessions at once ---
+esearch's term syntax does not reliably support treating a raw,
+comma-separated list of accession numbers as an OR-query the way one
+might expect (e.g. "SRR1,SRR2" is not guaranteed to behave as "SRR1 OR
+SRR2") -- so looking up a BATCH of individual accessions (as opposed to
+one study/BioProject accession that itself expands to many runs) is
+handled by lookup_multiple_accessions() below: each individual term is
+esearch'd separately (cheap, and NCBI's default rate limit of ~3
+requests/second comfortably supports a batch of even a few dozen
+accessions), but every term's resulting UIDs are combined into a single
+efetch call, so a batch of many accessions still only costs ONE
+metadata-fetch request rather than one per accession.
+
 Kept as its own module for the same reason as reference_manager.py and
 quantification_manager.py: this involves network requests, XML parsing,
 and subprocess execution that is logically distinct from the Streamlit
@@ -53,9 +66,11 @@ UI/workflow code.
 
 import gzip
 import os
+import re
 import shutil
 import ssl
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -77,6 +92,48 @@ EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 # rate limit of ~3 requests/second, which is more than sufficient here.
 TOOL_NAME = "spatial-tissue-atlas-rnaseq-portal"
 
+# NCBI's E-utilities rate limit for unauthenticated requests (no API
+# key) is ~3 requests/second -- but this is NOT simply a long-run
+# average a client can freely burst against; firing several requests
+# back-to-back in a tight loop (e.g. one esearch call per accession in
+# a batch lookup -- see lookup_multiple_accessions below) can trigger a
+# "429 Too Many Requests" response even when comfortably under the
+# long-run average, since NCBI's rate limiter appears to also consider
+# short-term burstiness. This was hit directly during real testing with
+# a batch of 8 accessions looked up in quick succession. Two measures
+# address this together:
+#   1. A minimum delay is enforced between consecutive E-utilities
+#      requests (see _rate_limit_wait below) -- proactively spacing
+#      requests out rather than firing them as fast as Python can loop,
+#      which is what caused the burst in the first place.
+#   2. Any request that still gets a 429 despite the proactive spacing
+#      is automatically retried with exponential backoff (see
+#      _fetch_url_with_retry below) -- a 429 is an explicitly transient,
+#      recoverable condition per NCBI's own semantics (unlike a 400/404,
+#      which indicate a genuinely malformed/nonexistent request and
+#      should NOT be retried), so silently giving up on the very first
+#      429 -- as the previous version of this module did -- needlessly
+#      fails a request that would very likely succeed moments later.
+_MIN_SECONDS_BETWEEN_REQUESTS = 0.4  # a bit under 3/second, with headroom
+_MAX_429_RETRIES = 5
+_last_request_time = [0.0]  # mutable single-element list -- simple, GIL-safe module-level "shared" state
+
+
+def _rate_limit_wait():
+    """
+    Block, if necessary, so that at least _MIN_SECONDS_BETWEEN_REQUESTS
+    has elapsed since the last E-utilities request this process made --
+    a simple, proactive throttle to avoid bursting requests at NCBI
+    faster than its rate limit tolerates (see the rate-limit comment
+    above for why this matters even when the long-run average request
+    rate is comfortably under NCBI's stated 3/second limit).
+    """
+    elapsed = time.time() - _last_request_time[0]
+    if elapsed < _MIN_SECONDS_BETWEEN_REQUESTS:
+        time.sleep(_MIN_SECONDS_BETWEEN_REQUESTS - elapsed)
+    _last_request_time[0] = time.time()
+
+
 # fasterq-dump's default --disk-limit-tmp is conservative and can be
 # exceeded by larger (e.g. human) RNA-seq runs, which need substantial
 # temporary scratch space during extraction/decompression — this was
@@ -89,9 +146,37 @@ FASTERQ_DISK_LIMIT_BYTES = 500_000_000_000
 
 
 def _fetch_url(url, timeout=30):
-    """Fetch a URL's raw bytes, using the certifi-backed SSL context."""
-    with urllib.request.urlopen(url, timeout=timeout, context=_SSL_CONTEXT) as response:
-        return response.read()
+    """
+    Fetch a URL's raw bytes, using the certifi-backed SSL context.
+
+    Every call is preceded by a proactive rate-limit wait (see
+    _rate_limit_wait), and a "429 Too Many Requests" response is
+    automatically retried with exponential backoff up to
+    _MAX_429_RETRIES times before finally propagating the error to the
+    caller -- see the module-level rate-limit comment above for the
+    full rationale (a 429 is explicitly a transient/recoverable
+    condition per NCBI's own semantics, unlike other HTTP errors like
+    400/404 which indicate a genuinely malformed/nonexistent request
+    and are correctly NOT retried here, propagating immediately as
+    before).
+    """
+    attempt = 0
+    while True:
+        _rate_limit_wait()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout, context=_SSL_CONTEXT) as response:
+                return response.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < _MAX_429_RETRIES:
+                # Exponential backoff: 1s, 2s, 4s, 8s, 16s -- generous
+                # enough to reliably clear a transient rate-limit
+                # window without making a genuinely failed batch lookup
+                # hang for an unreasonably long time.
+                backoff_seconds = 2 ** attempt
+                time.sleep(backoff_seconds)
+                attempt += 1
+                continue
+            raise
 
 
 def tools_available():
@@ -301,6 +386,13 @@ def lookup_accession(term):
     ScientificName, spots, size_MB, SRAStudy, BioProject, SampleTitle,
     GEOAccession, and a nested "attributes" dict of depositor-provided
     sample characteristics (used to auto-build metadata).
+
+    For looking up MULTIPLE individual accessions at once (e.g. a batch
+    of SRR run numbers pasted or uploaded together), use
+    lookup_multiple_accessions() instead -- see that function's
+    docstring and the module docstring's "Multiple accessions at once"
+    section for why a single combined term string isn't the right tool
+    for that case.
     """
     term = term.strip()
     if not term:
@@ -332,6 +424,187 @@ def lookup_accession(term):
         )
 
     return True, rows, f"Found {len(rows)} run(s)."
+
+
+def _split_accession_list_text(text):
+    """
+    Split a raw text blob containing one or more NCBI accessions into a
+    clean list of individual accession strings. Accepts accessions
+    separated by any combination of commas, whitespace (spaces, tabs),
+    semicolons, and newlines -- e.g. "SRR1, SRR2\\nSRR3" and
+    "SRR1 SRR2,SRR3" both parse into ["SRR1", "SRR2", "SRR3"], so a user
+    can paste a list in essentially any reasonable format (one per line,
+    comma-separated, space-separated, or a mix) without needing to know
+    which exact format this tool expects.
+
+    Returns a list of non-empty, stripped accession strings, in the
+    order they first appeared, with exact duplicates removed
+    (order-preserving) -- safe to call with an empty/whitespace-only
+    string, returning [] in that case.
+    """
+    if not text or not text.strip():
+        return []
+    raw_tokens = re.split(r"[,\s;]+", text.strip())
+    seen = set()
+    result = []
+    for tok in raw_tokens:
+        tok = tok.strip()
+        if tok and tok not in seen:
+            seen.add(tok)
+            result.append(tok)
+    return result
+
+
+def parse_accessions_from_file(file_or_path):
+    """
+    Extract a list of accession strings from an uploaded file -- .txt or
+    .csv (read as plain text, then split using the exact same rule as a
+    pasted text blob -- see _split_accession_list_text -- so a
+    one-accession-per-line file, a comma-separated file, or any mix of
+    the two all work without needing real CSV-dialect parsing) -- or
+    .xlsx/.xls (every non-empty cell across every row/column is
+    collected as a potential accession; deliberately permissive, so
+    accessions pasted into a single column, spread across multiple
+    columns, or with a stray header/title row all work -- a header cell
+    like "Run" or "Accession" just becomes one harmless "accession" that
+    later returns zero SRA results, rather than causing a parsing
+    failure).
+
+    file_or_path: either a Streamlit UploadedFile object (or any
+    file-like object exposing .name and .read()) OR a plain path string
+    -- matching the same dual-input convention used by
+    bulk_rnaseq_workspace.py's other file inputs (e.g.
+    _read_metadata_file), so this function works identically whether the
+    accession list came from a browser upload or the server-side file
+    browser.
+
+    Returns (accession_list, error_message_or_None). accession_list is
+    always a plain list (possibly empty) even when an error occurred, so
+    callers can safely iterate it either way.
+    """
+    filename = (
+        file_or_path.name if hasattr(file_or_path, "name") else os.path.basename(file_or_path)
+    ).lower()
+
+    try:
+        if filename.endswith((".xlsx", ".xls")):
+            import pandas as pd
+            df = pd.read_excel(file_or_path, header=None)
+            tokens = []
+            for value in df.values.flatten():
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text and text.lower() != "nan":
+                    tokens.extend(_split_accession_list_text(text))
+            seen = set()
+            result = []
+            for tok in tokens:
+                if tok not in seen:
+                    seen.add(tok)
+                    result.append(tok)
+            return result, None
+        else:
+            # .txt, .csv, or anything else not recognized as Excel --
+            # read as plain text and split the same way as a pasted
+            # text blob. This handles a simple one-accession-per-line
+            # .csv perfectly well without needing a real CSV parser,
+            # since comma-splitting is already part of
+            # _split_accession_list_text.
+            if hasattr(file_or_path, "read"):
+                raw = file_or_path.read()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="ignore")
+            else:
+                with open(file_or_path, "r", errors="ignore") as f:
+                    raw = f.read()
+            return _split_accession_list_text(raw), None
+    except Exception as e:
+        return [], f"Could not read this file: {e}"
+
+
+def lookup_multiple_accessions(terms):
+    """
+    Query NCBI for metadata about MULTIPLE accessions/search terms at
+    once -- e.g. a batch of individual SRR run accessions pasted or
+    uploaded together, as opposed to lookup_accession's single term
+    (which is still the right tool for a single study/BioProject
+    accession that itself expands to many runs).
+
+    Each individual term is looked up via esearch separately (esearch's
+    query syntax does not reliably support OR-ing a raw comma-separated
+    list of accessions together the way one might expect), but every
+    term's resulting UIDs are combined into ONE single efetch call --
+    so a batch of, say, 8 run accessions still only costs 8 cheap
+    esearch requests (well within NCBI's ~3/second unauthenticated rate
+    limit for a batch of this size) plus exactly ONE metadata-fetch
+    request, rather than 8 of each.
+
+    terms: list of accession/search term strings (e.g. ["SRR1039508",
+        "SRR1039509", ...]) -- duplicates and blank entries are safe to
+        include; they're deduplicated automatically before any network
+        request is made.
+
+    Returns (success: bool, rows: list[dict] or None, message: str,
+    not_found: list[str]).
+        - rows has the exact same shape as lookup_accession's rows.
+        - not_found lists any individual term that returned zero
+          esearch results (e.g. a typo'd or invalid accession), so the
+          caller can surface EXACTLY which entries in a pasted/uploaded
+          batch didn't resolve, rather than only reporting a vague
+          aggregate failure/success count.
+    """
+    cleaned_terms = []
+    seen = set()
+    for t in terms:
+        t = (t or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            cleaned_terms.append(t)
+
+    if not cleaned_terms:
+        return False, None, "No accessions were provided.", []
+
+    all_uids = []
+    uid_seen = set()
+    not_found = []
+
+    for term in cleaned_terms:
+        uid_list, error = _esearch_sra(term)
+        if error:
+            return False, None, error, []
+        if not uid_list:
+            not_found.append(term)
+            continue
+        for uid in uid_list:
+            if uid not in uid_seen:
+                uid_seen.add(uid)
+                all_uids.append(uid)
+
+    if not all_uids:
+        return False, None, (
+            f"None of the {len(cleaned_terms)} accession(s) provided "
+            "returned any results. Double-check they're correct (e.g. "
+            "SRR12345678, PRJNA123456, SRP123456)."
+        ), not_found
+
+    root, error = _efetch_sra_full_xml(all_uids)
+    if error:
+        return False, None, error, not_found
+
+    rows = []
+    for pkg in root.findall("EXPERIMENT_PACKAGE"):
+        rows.extend(_parse_experiment_package(pkg))
+
+    if not rows:
+        return False, None, (
+            "Found matching records, but couldn't extract run-level "
+            "details from NCBI's response."
+        ), not_found
+
+    n_resolved = len(cleaned_terms) - len(not_found)
+    message = f"Found {len(rows)} run(s) from {n_resolved} of {len(cleaned_terms)} accession(s)."
+    return True, rows, message, not_found
 
 
 def is_rna_seq(row):
