@@ -10,13 +10,14 @@ uploaded file and result together, so a user can:
     counts using the same fixed set of files and sample matches
 
 This module only manages the project's *identity* and folder structure.
-It doesn't know anything about FASTQ files, QC, trimming, or alignment —
+It doesn't know anything about FASTQ files, QC, trimming, or alignment --
 that logic stays in each workspace module. Those modules ask this one for
 "where do my files live for project X" and "what's already been done".
 """
 
 import json
 import os
+import shutil
 from datetime import datetime
 
 import streamlit as st
@@ -25,7 +26,7 @@ PROJECTS_ROOT = "data/projects"
 
 
 # ---------------------------------------------------------------------------
-# Path helpers — every workspace step should get its file locations from
+# Path helpers -- every workspace step should get its file locations from
 # these functions rather than hardcoding paths, so everything stays
 # scoped correctly to the active project.
 # ---------------------------------------------------------------------------
@@ -130,6 +131,10 @@ def reference_dir(project_name):
 # rename into place only on full success) -- these path helpers only
 # define WHERE the shared resource lives, not how concurrent access to
 # it is made safe.
+#
+# IMPORTANT for delete_project() below: this root is deliberately OUTSIDE
+# PROJECTS_ROOT / project_dir(), so deleting any single project's folder
+# can never touch another project's (or its own) shared reference files.
 SHARED_REFERENCES_ROOT = "data/shared_references"
 
 
@@ -253,12 +258,6 @@ def get_gene_id_mapping_meta(project_name):
     info = load_info(project_name)
     return info.get("gene_id_mapping_meta")
 
-# --- Additions needed in project_manager.py for the Differential Expression workspace ---
-# Add these functions alongside the existing path helpers (e.g. near counts_matrix_path).
-# --- Addition for project_manager.py ---
-# Add this function alongside the other shared utility functions (not
-# project-specific, so it doesn't need a project_name argument).
-
 
 def get_recommended_thread_count(reserve_cores=1, max_default=8):
     """
@@ -270,14 +269,14 @@ def get_recommended_thread_count(reserve_cores=1, max_default=8):
     unnecessarily conservative for a large one.
 
     reserve_cores: how many cores to leave free for the OS, the
-        Streamlit process itself, and general system responsiveness —
+        Streamlit process itself, and general system responsiveness --
         default 1, so a tool never recommends using literally every
         available core.
     max_default: an upper cap on the *recommended* value, independent of
         how many cores are actually detected. This exists because tools
         like fastp are documented to see no real benefit (and some
         internally hard-cap) beyond ~16 threads due to I/O bottlenecks
-        rather than CPU availability — recommending an extremely high
+        rather than CPU availability -- recommending an extremely high
         default on a big server would not meaningfully speed things up
         and could cause resource contention if several tools/samples run
         concurrently. Users with genuinely large machines can still
@@ -290,16 +289,14 @@ def get_recommended_thread_count(reserve_cores=1, max_default=8):
     (e.g. "Detected 8 CPU cores on this machine").
 
     Falls back to 1 core detected / 1 recommended if os.cpu_count()
-    can't determine the core count at all (returns None) — this can
-    happen in some restricted/containerized environments — rather than
+    can't determine the core count at all (returns None) -- this can
+    happen in some restricted/containerized environments -- rather than
     crashing or recommending an arbitrary guessed value.
     """
     total_cores = os.cpu_count() or 1
     recommended = max(1, total_cores - reserve_cores)
     recommended = min(recommended, max_default)
     return total_cores, recommended
-
-
 
 
 def deseq2_dir(project_name):
@@ -315,6 +312,8 @@ def deseq2_output_dir(project_name):
 def deseq2_work_dir(project_name):
     """Scratch directory for the temporary R script + job spec JSON."""
     return os.path.join(deseq2_dir(project_name), "work")
+
+
 def ontology_dir(project_name):
     """Where Ontology Analysis (GO/KEGG/Reactome enrichment) inputs/outputs live for this project."""
     return os.path.join(project_dir(project_name), "ontology")
@@ -333,6 +332,7 @@ def ontology_output_dir(project_name):
 def ontology_work_dir(project_name):
     """Scratch directory for Ontology Analysis's temporary R scripts + input gene list CSVs."""
     return os.path.join(ontology_dir(project_name), "work")
+
 
 def save_deseq2_config(project_name, config):
     """
@@ -366,6 +366,7 @@ def get_reference_choice(project_name):
     info = load_info(project_name)
     return info.get("reference_species"), info.get("reference_is_custom", False)
 
+
 def save_ontology_species_override(project_name, species_key):
     """
     Remember a manually-confirmed organism choice for Ontology Analysis,
@@ -384,11 +385,13 @@ def save_ontology_species_override(project_name, species_key):
 def get_ontology_species_override(project_name):
     info = load_info(project_name)
     return info.get("ontology_species_override")
+
+
 def save_alignment_method(project_name, method):
     """
     Remember which alignment/quantification method ("salmon" or "star")
     the user chose for this project, so re-opening it doesn't require
-    re-selecting — the reference setup and execution steps differ
+    re-selecting -- the reference setup and execution steps differ
     significantly between the two methods.
     """
     info = load_info(project_name)
@@ -476,6 +479,38 @@ def get_sample_column(project_name):
     return info.get("metadata_sample_column")
 
 
+def delete_project(project_name):
+    """
+    Permanently delete a project's ENTIRE folder from disk -- uploaded
+    FASTQs, matched sample sheet/metadata, FastQC/MultiQC reports,
+    trimmed reads + post-trim QC, any custom-uploaded reference/index
+    (reference_dir()), Salmon/STAR alignment output, the gene counts
+    matrix, DESeq2 results, and Ontology Analysis results all live
+    under project_dir() and are removed together.
+
+    Deliberately NOT affected: SHARED_REFERENCES_ROOT (preset organism
+    genomes/indices). That tree lives entirely outside project_dir(),
+    by design (see the comment above SHARED_REFERENCES_ROOT), so
+    deleting any one project can never remove a shared reference/index
+    that other projects still depend on.
+
+    Returns True if the project directory existed and was removed,
+    False if there was nothing to delete (e.g. it was already deleted,
+    perhaps from a stale/duplicate session_state reference).
+
+    This is a destructive, irreversible operation with no recycle bin/
+    trash step -- callers (see render_project_selector's delete UI
+    below) are expected to have already obtained explicit, unambiguous
+    user confirmation (e.g. requiring the user to type the exact
+    project name) before calling this function.
+    """
+    d = project_dir(project_name)
+    if not os.path.isdir(d):
+        return False
+    shutil.rmtree(d)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Reusable UI: project creation / selection widget
 # ---------------------------------------------------------------------------
@@ -492,8 +527,8 @@ def render_project_selector(workspace_key="bulk_rnaseq"):
     """
     st.header("Step 0: Set Up Your Project")
     st.markdown(
-        "A **project** keeps all your files together — uploaded reads, "
-        "matched samples, and quality control results — in one place. "
+        "A **project** keeps all your files together -- uploaded reads, "
+        "matched samples, and quality control results -- in one place. "
         "This lets you pick up exactly where you left off, and lets "
         "later steps (like adapter trimming) automatically find the "
         "right files without needing to re-upload anything."
@@ -513,7 +548,7 @@ def render_project_selector(workspace_key="bulk_rnaseq"):
     if mode == "🆕 Start a new project":
         new_name = st.text_input(
             "Name your project (e.g. 'LiverStudy2026' or 'TCellExperiment'):",
-            help="Use letters, numbers, dashes, or underscores — spaces and special characters will be removed automatically.",
+            help="Use letters, numbers, dashes, or underscores -- spaces and special characters will be removed automatically.",
             key=f"{workspace_key}_new_project_name",
         )
         if new_name:
@@ -556,8 +591,87 @@ def render_project_selector(workspace_key="bulk_rnaseq"):
         completed = info.get("steps_completed", [])
         if completed:
             st.caption(f"✔️ Steps completed so far: {', '.join(completed)}")
-        if st.button("🔄 Switch to a different project", key=f"{workspace_key}_switch_project_btn"):
-            del st.session_state[session_key]
-            st.rerun()
+
+        col_switch, col_delete = st.columns(2)
+        with col_switch:
+            if st.button("🔄 Switch to a different project", key=f"{workspace_key}_switch_project_btn"):
+                del st.session_state[session_key]
+                st.rerun()
+        with col_delete:
+            if st.button("🗑️ Delete this project", key=f"{workspace_key}_delete_project_btn"):
+                st.session_state[f"{workspace_key}_delete_pending"] = True
+                st.rerun()
+
+        _render_delete_confirmation(workspace_key, selected_project, session_key)
 
     return selected_project
+
+
+def _render_delete_confirmation(workspace_key, selected_project, session_key):
+    """
+    Two-step destructive-action confirmation UI for permanently deleting
+    a project, shown only after the user has clicked "Delete this
+    project" above (step 1). Requires BOTH of the following before the
+    delete actually happens:
+        Step 2a: typing the exact project name into a confirmation box
+                 (guards against a stray/accidental click actually
+                 deleting the wrong or currently-open project)
+        Step 2b: clicking a second, clearly-labeled destructive button
+                 that only becomes enabled once step 2a matches
+    A "Cancel" option is always available to back out without deleting
+    anything.
+    """
+    pending_key = f"{workspace_key}_delete_pending"
+    confirm_text_key = f"{workspace_key}_delete_confirm_text"
+
+    if not st.session_state.get(pending_key):
+        return
+
+    st.error(
+        f"⚠️ **This will permanently delete project `{selected_project}`.**\n\n"
+        "This removes **all** files for this project, including:\n"
+        "- Uploaded FASTQ files and the matched sample sheet/metadata\n"
+        "- FastQC/MultiQC quality control reports\n"
+        "- Trimmed reads and post-trim QC reports\n"
+        "- Any custom-uploaded reference/index files for this project\n"
+        "- Salmon/STAR alignment output and the gene counts matrix\n"
+        "- DESeq2 differential expression results\n"
+        "- Ontology Analysis (GO/KEGG/Reactome) results\n\n"
+        "**This action cannot be undone.** Shared preset reference genomes/"
+        "indices used by other projects are not affected."
+    )
+
+    confirm_text = st.text_input(
+        f"Type the project name (`{selected_project}`) to confirm deletion:",
+        key=confirm_text_key,
+    )
+    names_match = confirm_text.strip() == selected_project
+
+    col_cancel, col_confirm = st.columns(2)
+    with col_cancel:
+        if st.button("❌ Cancel", key=f"{workspace_key}_delete_cancel_btn"):
+            # Intentionally leave confirm_text_key's value as-is rather
+            # than popping it: it's a plain text widget whose content is
+            # only ever displayed while pending_key is True, so leaving
+            # a stale value around is harmless (and conveniently
+            # pre-fills the box if the user reopens deletion for the
+            # same project a moment later).
+            st.session_state[pending_key] = False
+            st.rerun()
+    with col_confirm:
+        if st.button(
+            "⚠️ Permanently Delete Project",
+            key=f"{workspace_key}_delete_confirm_btn",
+            disabled=not names_match,
+        ):
+            deleted = delete_project(selected_project)
+            st.session_state.pop(session_key, None)
+            st.session_state.pop(pending_key, None)
+            if deleted:
+                st.success(f"Project `{selected_project}` has been permanently deleted.")
+            else:
+                st.warning(f"Project `{selected_project}` was already gone.")
+            st.rerun()
+
+    if confirm_text and not names_match:
+        st.caption("Project name doesn't match exactly -- please retype it to enable deletion.")

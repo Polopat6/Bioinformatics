@@ -9,72 +9,6 @@ This picks up where differential_expression_workspace.py leaves off,
 reusing the same active project and the clusterProfiler-ready gene list
 CSVs already exported there.
 
-Design goal: same as the other workspaces -- assume the user has little
-to no bioinformatics/statistics background, explain each step (and each
-plot) in plain language via help expanders, while still exposing real
-analytical choices rather than hiding them.
-
-Plot customization: every plot in this workspace reuses the styling
-system already built for differential_expression_workspace.py (themes,
-fonts, colors, draggable legends, PDF export), PLUS several ontology-
-specific customizations:
-  - Colorscale pickers (sequential/diverging) for every plot with a
-    continuous color axis.
-  - Sort-by and x-axis-value controls for the dot/bar plots -- these
-    are rendered INDIVIDUALLY, immediately above each specific plot
-    they affect (rather than once, shared, above a group of plots),
-    since a user may reasonably want different settings for e.g. a
-    dot plot vs. a bar plot of the SAME result.
-  - A term-label editor (and, for network plots, a GENE-label editor
-    too) scoped to exactly the terms/genes currently shown in that
-    specific plot -- since GO/KEGG/Reactome term names (and sometimes
-    gene symbols) are often long, this lets a user shorten/rename any
-    displayed label purely for display, without touching the
-    underlying data.
-  - Draggable node LABELS (not node positions) for the network plots
-    -- BOTH term labels and, in the gene-concept network, gene labels
-    too. See the module-level note further below for why this, rather
-    than literal draggable nodes-with-following-edges, is what's
-    achievable and offered here, plus a "try a different layout"
-    control as a complementary way to reduce visual clutter.
-  - An optional GO term "simplify" step, available only where it's
-    statistically meaningful (single GO sub-ontology).
-
---- ORA: up- and down-regulated genes analyzed separately (default) ---
-Per ontology_manager.py's module docstring: by default, ORA runs each
-enabled database's enrichment TWICE -- once against only up-regulated
-significant genes, once against only down-regulated significant genes
--- since mixing both directions into one gene list can flag a term as
-"enriched" without it representing one coherent, directional signal.
-This workspace renders each direction as its own clearly-labeled
-section, and additionally offers a "compare Up vs Down side-by-side"
-view using one shared set of settings for a direct visual comparison.
-The original combined (single mixed-direction list) behavior remains
-available as an explicit, clearly-labeled non-default option.
-
---- Combined multi-database view: category-shaded backgrounds ---
-When viewing GO + KEGG + Reactome results together on one combined dot
-plot, each row's BACKGROUND is now shaded according to its category
-(GO's own BP/MF/CC sub-ontology when available, or the database name
-for KEGG/Reactome) -- freeing up dot COLOR to represent something else
-(here, significance/adjusted p-value, matching every other dot plot in
-this workspace) rather than needing to spend the color channel on
-which database/category a term came from.
-
---- On "draggable nodes" for the network plots ---
-Plotly's client-side editing API only supports dragging ANNOTATIONS,
-LEGENDS, SHAPES, and TITLES -- it has no equivalent for dragging a
-Scatter trace's actual marker points, and any connected edges (drawn as
-separate, fixed-coordinate line traces) would NOT visually follow a
-dragged marker in a static, one-way-rendered Plotly figure. What IS
-achievable, and implemented below: every node's TEXT LABEL (both term
-labels AND, in the gene-concept network, gene labels) is rendered as a
-separate, individually draggable annotation, anchored to that node's
-fixed position -- so overlapping/cluttered labels can be dragged apart
-for readability, while the underlying node stays exactly where the
-layout algorithm placed it. A "try a different layout" button
-complements this by re-running the layout with a new seed.
-
 This module is fully self-contained beyond the DE-workspace styling
 import -- all Ontology Analysis development should happen here.
 """
@@ -90,7 +24,6 @@ import deseq2_manager as dm
 import reference_manager as rm
 import gene_id_mapper as gim
 import ontology_manager as om
-
 import differential_expression_workspace as dew
 
 WORKSPACE_KEY = "bulk_rnaseq"
@@ -98,10 +31,6 @@ WORKSPACE_KEY = "bulk_rnaseq"
 SEQUENTIAL_COLORSCALE_OPTIONS = dew.SEQUENTIAL_COLORSCALE_OPTIONS
 DIVERGING_COLORSCALE_OPTIONS = dew.DIVERGING_COLORSCALE_OPTIONS
 
-# Pale background-shading colors for the combined view's category bands
-# -- same base palette as the rest of the app's default qualitative
-# colors, converted to a low-opacity rgba so dots plotted on top remain
-# clearly readable.
 _CATEGORY_BAND_PALETTE = dew._DEFAULT_COLOR_PALETTE
 
 
@@ -117,15 +46,6 @@ def _hex_to_rgba(hex_color, alpha=0.15):
 # ---------------------------------------------------------------------------
 
 def _compute_network_layout(node_ids, edges_df, seed=42):
-    """
-    Compute 2D (x, y) positions for a set of node IDs, given a
-    DataFrame of edges connecting them.
-
-    Falls back to a simple, deterministic (but seed-responsive)
-    circular layout if networkx isn't installed.
-
-    Returns a dict {node_id: (x, y)}.
-    """
     node_ids = list(node_ids)
     try:
         import networkx as nx
@@ -156,13 +76,6 @@ def _compute_network_layout(node_ids, edges_df, seed=42):
 
 
 def _render_layout_seed_control(key_prefix):
-    """
-    Render a "🔀 Try a different layout" button that advances a
-    per-plot seed counter in session_state, so each click produces a
-    genuinely different force-directed arrangement.
-
-    Returns the current seed (int) to use for this render.
-    """
     seed_key = f"{key_prefix}_layout_seed"
     if seed_key not in st.session_state:
         st.session_state[seed_key] = 42
@@ -174,21 +87,6 @@ def _render_layout_seed_control(key_prefix):
 
 def _build_node_label_annotations(node_ids, positions, display_labels, colors=None, font_size=11,
                                    ax=25, ay=-20):
-    """
-    Build one draggable Plotly annotation per node: an arrow anchored
-    to the node's actual (fixed) position, with its text end freely
-    draggable via this app's existing annotationTail chart-edit config.
-
-    ax, ay: default label OFFSET from its node (in pixels) -- exposed as
-        parameters (rather than hardcoded) so callers plotting two
-        different node "layers" on the same figure (e.g. term labels
-        vs. gene labels in the gene-concept network) can offset them
-        differently, reducing the chance labels from different layers
-        start out overlapping each other before the user drags anything.
-
-    Returns a list of annotation dicts, ready to be merged into a
-    figure's existing annotations via fig.update_layout(annotations=...).
-    """
     colors = colors or ["black"] * len(node_ids)
     annotations = []
     for i, nid in enumerate(node_ids):
@@ -213,14 +111,6 @@ def _build_node_label_annotations(node_ids, positions, display_labels, colors=No
 
 def _render_term_label_editor(display_df, key_prefix, id_col="ID", desc_col="Description",
                                label="✏️ Shorten/rename term labels shown on this plot (optional)"):
-    """
-    Render a "shorten/rename term labels" editor for exactly the
-    term(s) currently being displayed in a plot. Purely cosmetic -- the
-    underlying ID/Description data is never modified.
-
-    Returns a dict {term_id: custom_label} -- only including terms
-    whose custom label actually differs from the original Description.
-    """
     if display_df is None or display_df.empty:
         return {}
 
@@ -255,19 +145,6 @@ def _render_term_label_editor(display_df, key_prefix, id_col="ID", desc_col="Des
 
 
 def _render_gene_label_editor(gene_ids, key_prefix):
-    """
-    Render a "shorten/rename gene labels" editor for exactly the gene
-    ID(s) currently shown in a gene-concept network plot -- the
-    gene-node equivalent of _render_term_label_editor above. Since
-    gene symbols/IDs are usually already short, this is offered as a
-    separate, clearly-labeled optional editor rather than folded into
-    the term-label editor (which operates on a different ID namespace
-    entirely -- term IDs like "GO:0006955" vs. gene IDs/symbols like
-    "TP53").
-
-    Returns a dict {gene_id: custom_label} -- only entries that
-    actually differ from the original gene_id.
-    """
     if not gene_ids:
         return {}
 
@@ -336,12 +213,6 @@ def _get_x_axis_options(is_gsea, has_generatio):
 
 
 def _prepare_ranked_plot_df(result_df, sort_column, ascending, n_top):
-    """
-    Clean, sort, and limit result_df to exactly the rows a dot/bar plot
-    should display, ending with the best-ranked term LAST (so it ends
-    up at the visual TOP of a horizontal chart, since Plotly renders
-    the first categorical y-axis entry at the bottom).
-    """
     import math
 
     df = result_df.copy()
@@ -353,23 +224,12 @@ def _prepare_ranked_plot_df(result_df, sort_column, ascending, n_top):
 
 
 def _render_ranked_plot_controls(result_df, is_gsea, key_prefix):
-    """
-    Render the FULL set of per-graph controls a dot/bar plot needs --
-    "number of top terms", "rank/sort by", and "x-axis value" -- all
-    scoped to key_prefix (i.e. specific to ONE particular plot
-    instance, not shared across multiple plots), per the design
-    requirement that these controls live immediately next to the graph
-    they affect rather than once, shared, further up the page.
-
-    Returns (prepared_df, x_column, x_label) -- prepared_df is already
-    cleaned/sorted/limited (see _prepare_ranked_plot_df) and ready to
-    plot directly.
-    """
     has_generatio = "GeneRatio_numeric" in result_df.columns
 
     n_top = st.slider(
         "Number of top terms to show:", min_value=5, max_value=50, value=20, step=5,
         key=f"{key_prefix}_n_top",
+        help="How many terms are plotted, selected using the 'rank/select top terms by' choice below. Increasing this shows more (and less significant) terms; decreasing it focuses the plot on only the strongest hits.",
     )
 
     sort_options = _get_sort_options(is_gsea, has_generatio)
@@ -389,6 +249,7 @@ def _render_ranked_plot_controls(result_df, is_gsea, key_prefix):
     x_label = st.selectbox(
         "X-axis value:", options=list(x_axis_options.keys()),
         key=f"{key_prefix}_x_axis",
+        help="What each term's horizontal position represents -- purely a display choice, does not change which terms are shown or their significance.",
     )
     x_column = x_axis_options[x_label]
 
@@ -460,9 +321,11 @@ def _plot_barplot(df, x_column, x_label, colorscale="Blues"):
 
 
 def _plot_enrichment_map(result_df, n_top=30, similarity_threshold=0.2, label_map=None,
-                          colorscale="Viridis", reverse_colorscale=True, layout_seed=42):
+                          colorscale="Viridis", reverse_colorscale=True, layout_seed=42,
+                          similarity_method="JC", orgdb_package=None, go_ontology=None):
     nodes_df, edges_df = om.build_term_similarity_network(
         result_df, n_top=n_top, similarity_threshold=similarity_threshold,
+        similarity_method=similarity_method, orgdb_package=orgdb_package, go_ontology=go_ontology,
     )
     if nodes_df.empty or len(nodes_df) < 2:
         return None, []
@@ -529,22 +392,6 @@ def _plot_enrichment_map(result_df, n_top=30, similarity_threshold=0.2, label_ma
 def _plot_gene_concept_network(result_df, gene_fc_map=None, n_top=10, term_label_map=None,
                                 gene_label_map=None, colorscale="RdBu", reverse_colorscale=True,
                                 layout_seed=42):
-    """
-    Build a "gene-concept network" -- a bipartite graph connecting
-    enriched TERMS (larger nodes) to the individual GENES (smaller
-    nodes) that belong to them.
-
-    BOTH term labels AND gene labels are rendered as individually
-    draggable annotations (see this module's docstring) -- gene labels
-    use a fixed neutral dark color regardless of that gene's own
-    fold-change marker color, since Plotly annotations don't support a
-    continuous colorscale the way a Scatter trace's markers do; the
-    node's OWN color still conveys fold-change direction/magnitude, the
-    label text itself is just for identifying which gene is which.
-
-    Returns (figure, term_ids_for_label_editor, gene_ids_for_label_editor),
-    or (None, [], []) if there's no data to draw.
-    """
     term_nodes_df, gene_nodes_df, edges_df = om.build_gene_concept_network(
         result_df, gene_fc_map=gene_fc_map, n_top=n_top,
     )
@@ -574,7 +421,7 @@ def _plot_gene_concept_network(result_df, gene_fc_map=None, n_top=10, term_label
     term_x = [positions[tid][0] for tid in term_nodes_df["ID"]]
     term_y = [positions[tid][1] for tid in term_nodes_df["ID"]]
     fig.add_trace(go.Scatter(
-        x=term_x, y=term_y, mode="markers",  # no "+text" -- term labels are draggable annotations below
+        x=term_x, y=term_y, mode="markers",
         marker=dict(size=32, color="#FDBF6F", line=dict(width=1.5, color="DarkSlateGrey")),
         hovertext=[f"{row['Description']}<br>padj: {row['p.adjust']:.2e}" for _, row in term_nodes_df.iterrows()],
         hovertemplate="%{hovertext}<extra></extra>",
@@ -585,7 +432,7 @@ def _plot_gene_concept_network(result_df, gene_fc_map=None, n_top=10, term_label
     gene_y = [positions[gid][1] for gid in gene_nodes_df["gene_id"]]
     has_fc = gene_nodes_df["log2FoldChange"].notna().any()
     fig.add_trace(go.Scatter(
-        x=gene_x, y=gene_y, mode="markers",  # no "+text" -- gene labels are ALSO draggable annotations now
+        x=gene_x, y=gene_y, mode="markers",
         marker=dict(
             size=14,
             color=gene_nodes_df["log2FoldChange"] if has_fc else "#AEC6CF",
@@ -605,12 +452,6 @@ def _plot_gene_concept_network(result_df, gene_fc_map=None, n_top=10, term_label
     gene_label_map = gene_label_map or {}
     gene_display_labels = [gene_label_map.get(g, g) for g in gene_nodes_df["gene_id"]]
 
-    # Term labels get one offset (ax=25, ay=-20); gene labels get a
-    # DIFFERENT offset (ax=-15, ay=15) -- purely so the two label
-    # "layers" don't all start out stacked in the exact same relative
-    # position around their (typically nearby, in a bipartite layout)
-    # nodes, reducing how much initial overlap the user has to drag
-    # apart by hand.
     term_label_annotations = _build_node_label_annotations(
         term_nodes_df["ID"].tolist(), positions,
         term_nodes_df["Description"].astype(str).str.slice(0, 28).tolist(),
@@ -781,30 +622,58 @@ def _plot_compare_cluster_dotplot(cc_df, n_top_per_cluster=10, label_map=None,
     return fig
 
 
-def _plot_combined_multi_database(combined_df, label_map=None, colorscale="Viridis", reverse_colorscale=True):
-    """
-    Build a combined dot plot spanning GO, KEGG, and/or Reactome
-    results together. Each row's BACKGROUND is shaded according to its
-    CATEGORY (GO's own BP/MF/CC sub-ontology when available, via
-    ontology_manager.derive_category_column -- or the database name for
-    KEGG/Reactome, which have no further sub-division) -- this frees up
-    dot COLOR to represent significance (adjusted p-value) instead,
-    consistent with every other dot plot in this workspace, rather than
-    "spending" the color channel on which database/category a term
-    came from.
+def _render_category_filter_and_label_controls(combined_df, key_prefix):
+    if combined_df is None or combined_df.empty or "Category" not in combined_df.columns:
+        return set(), {}
 
-    Returns (figure, category_legend) -- category_legend is a dict
-    {category: rgba_band_color} for building a manual legend/caption
-    explaining the background shading, or (None, {}) if there's nothing
-    to plot.
-    """
+    available_categories = sorted(combined_df["Category"].unique())
+
+    st.markdown("**Which categories should be included?**")
+    st.caption(
+        "Unchecking a category removes its terms from the plot "
+        "entirely (not just its color) -- the plot adjusts "
+        "automatically to only the categories you keep checked."
+    )
+    selected_categories = set()
+    cols = st.columns(min(len(available_categories), 5))
+    for i, cat in enumerate(available_categories):
+        with cols[i % len(cols)]:
+            if st.checkbox(cat, value=True, key=f"{key_prefix}_category_checkbox_{cat}"):
+                selected_categories.add(cat)
+
+    category_label_map = {}
+    with st.expander("✏️ Rename category labels shown in the legend (optional)"):
+        st.caption(
+            "Edit the \"Custom Label\" column below to rename how each "
+            "category appears in the plot's legend (e.g. \"BP\" -> "
+            "\"Biological Process\") -- this only changes what's "
+            "DISPLAYED, it does not affect which terms are included."
+        )
+        editor_df = pd.DataFrame({"Category": available_categories})
+        editor_df["Custom Label"] = editor_df["Category"]
+
+        edited = st.data_editor(
+            editor_df, use_container_width=True, hide_index=True,
+            disabled=["Category"], key=f"{key_prefix}_category_label_editor",
+        )
+        for _, row in edited.iterrows():
+            custom = str(row["Custom Label"]).strip()
+            original = str(row["Category"]).strip()
+            if custom and custom != original:
+                category_label_map[row["Category"]] = custom
+
+    return selected_categories, category_label_map
+
+
+def _plot_combined_multi_database(combined_df, label_map=None, category_label_map=None,
+                                   colorscale="Viridis", reverse_colorscale=True):
     import math
 
     if combined_df is None or combined_df.empty:
         return None, {}
 
     combined_df = _apply_term_labels(combined_df, label_map)
-    combined_df = om.derive_category_column(combined_df)
+    category_label_map = category_label_map or {}
 
     df = combined_df.dropna(subset=["p.adjust"]).sort_values("p.adjust").copy()
     df["neg_log10_padj"] = -df["p.adjust"].clip(lower=1e-300).apply(math.log10)
@@ -825,6 +694,9 @@ def _plot_combined_multi_database(combined_df, label_map=None, colorscale="Virid
         for i, cat in enumerate(unique_categories)
     }
 
+    def _display_category(cat):
+        return category_label_map.get(cat, cat)
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=df["neg_log10_padj"], y=labels,
@@ -835,17 +707,14 @@ def _plot_combined_multi_database(combined_df, label_map=None, colorscale="Virid
             colorbar=dict(title="Adjusted<br>p-value"),
             line=dict(width=1, color="DarkSlateGrey"),
         ),
-        text=[f"{row['Database']} / {row['Category']}<br>padj: {row['p.adjust']:.2e}" for _, row in df.iterrows()],
+        text=[
+            f"{row['Database']} / {_display_category(row['Category'])}<br>padj: {row['p.adjust']:.2e}"
+            for _, row in df.iterrows()
+        ],
         hovertemplate="%{y}<br>%{text}<extra></extra>",
         showlegend=False,
     ))
 
-    # Category background bands: one shape per ROW (not per category
-    # group), spanning the full plot WIDTH via paper x-coordinates (so
-    # it stays correct regardless of x-axis zoom/range) -- this works
-    # correctly whether or not same-category rows happen to be
-    # contiguous, since each row independently gets its own category's
-    # color regardless of the rows around it.
     shapes = [
         dict(
             type="rect", xref="paper", yref="y",
@@ -857,13 +726,26 @@ def _plot_combined_multi_database(combined_df, label_map=None, colorscale="Virid
     ]
     fig.update_layout(shapes=shapes)
 
+    displayed_category_colors = {}
+    for cat in unique_categories:
+        display_name = _display_category(cat)
+        displayed_category_colors[display_name] = category_colors[cat]
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=14, color=category_colors[cat], symbol="square"),
+            name=display_name,
+            showlegend=True,
+            hoverinfo="skip",
+        ))
+
     fig.update_layout(
         xaxis_title="-log10(adjusted p-value)",
         yaxis_title="",
         height=max(400, 28 * len(df)),
         margin=dict(l=10),
+        legend=dict(title="Category"),
     )
-    return fig, category_colors
+    return fig, displayed_category_colors
 
 
 # ---------------------------------------------------------------------------
@@ -971,12 +853,14 @@ def _render_gene_set_size_controls(key_prefix):
             "Minimum gene set size:", min_value=1, max_value=1000,
             value=om.DEFAULT_MIN_GS_SIZE, step=1,
             key=f"{key_prefix}_min_gs_size",
+            help="Raising this excludes small, statistically unstable gene sets from being tested at all -- fewer total terms tested, but each result is more reliable.",
         )
     with col2:
         max_gs_size = st.number_input(
             "Maximum gene set size:", min_value=1, max_value=10000,
             value=om.DEFAULT_MAX_GS_SIZE, step=10,
             key=f"{key_prefix}_max_gs_size",
+            help="Lowering this excludes very large, generic gene sets from being tested -- helps prevent a handful of huge, uninformative categories from dominating your results.",
         )
     if min_gs_size >= max_gs_size:
         st.warning("⚠️ Minimum gene set size must be smaller than the maximum. Using the defaults (10-500) instead.")
@@ -985,14 +869,6 @@ def _render_gene_set_size_controls(key_prefix):
 
 
 def _render_direction_split_control(key_prefix):
-    """
-    Render the "analyze up- and down-regulated genes separately"
-    checkbox for ORA -- see ontology_manager.py's module docstring for
-    the full statistical rationale. Defaults to True (the recommended
-    setting).
-
-    Returns True/False.
-    """
     with st.expander("ℹ️ Why analyze up- and down-regulated genes separately? (click to learn more)"):
         st.markdown(
             "By default, this workspace runs ORA **twice** for each "
@@ -1042,30 +918,256 @@ def _render_qvalue_threshold_control(key_prefix):
     return st.slider(
         "Q-value significance threshold:", 0.01, 0.20, 0.05, step=0.01,
         key=f"{key_prefix}_qvalue_threshold",
+        help="Lowering this makes the significance summary stricter (fewer terms count as significant); raising it is more lenient (more terms count). This only affects the significance SUMMARY caption -- it does not remove any rows from the underlying result table or plots.",
     )
 
 
 def _render_simplify_control(key_prefix, go_ontology):
-    available = om.simplify_available_for_ontology(go_ontology)
+    """
+    Render the "simplify GO results" checkbox, ALONGSIDE a proactive
+    GOSemSim availability check, a similarity-measure picker (WHICH
+    GOSemSim measure decides which terms count as redundant), and a
+    similarity-cutoff slider (HOW similar two terms must be before
+    they're collapsed together).
+
+    Returns (simplify_go: bool, simplify_measure: str, simplify_cutoff:
+    float) -- simplify_measure/simplify_cutoff default to
+    om.DEFAULT_SIMPLIFY_MEASURE / om.DEFAULT_SIMPLIFY_CUTOFF and are
+    only meaningful when simplify_go is True, but are always returned
+    so callers can unconditionally unpack the tuple.
+    """
+    available_ontology = om.simplify_available_for_ontology(go_ontology)
     with st.expander("ℹ️ What does 'simplify GO results' do? (click to learn more)"):
         st.markdown(
             "GO terms are organized in a hierarchy, so a real result "
             "often contains many terms that are highly REDUNDANT with "
-            "each other. Checking this option collapses semantically "
-            "similar terms down to just the single most significant "
-            "representative from each group (similarity cutoff 0.7, "
-            "clusterProfiler's own standard default).\n\n"
+            "each other -- e.g. \"immune response\" and \"regulation of "
+            "immune response\" both showing up separately, when really "
+            "they're describing the same underlying signal. Checking "
+            "this option collapses semantically similar terms down to "
+            "just the single most significant representative from each "
+            "group, using:\n\n"
+            "- **which similarity measure** decides whether two terms "
+            "count as \"similar enough\" (picker below), and\n"
+            "- **how similar is similar enough** (cutoff slider below).\n\n"
             "**Only available for a single GO sub-ontology at a time "
             "(BP, MF, or CC)** -- not available when \"All three (BP + "
-            "MF + CC)\" is selected."
+            "MF + CC)\" is selected, since there's no single similarity "
+            "measure that meaningfully compares terms across different "
+            "sub-ontologies."
         )
-    return st.checkbox(
-        "🧹 Simplify GO results (remove redundant/highly similar terms)",
-        value=False,
-        disabled=not available,
-        key=f"{key_prefix}_simplify_go",
-        help="Requires the GOSemSim package -- if missing, the analysis still completes successfully using un-simplified results." if available else "Only available when a single GO sub-ontology (BP, MF, or CC) is selected.",
+
+    gosemsim_ok, gosemsim_detail = om.check_gosemsim_available()
+
+    col_checkbox, col_status = st.columns([3, 2])
+    with col_checkbox:
+        simplify_go = st.checkbox(
+            "🧹 Simplify GO results (remove redundant/highly similar terms)",
+            value=False,
+            disabled=not available_ontology,
+            key=f"{key_prefix}_simplify_go",
+            help="Requires the GOSemSim package -- if missing, the analysis still completes successfully using un-simplified results." if available_ontology else "Only available when a single GO sub-ontology (BP, MF, or CC) is selected.",
+        )
+    with col_status:
+        if available_ontology:
+            if gosemsim_ok:
+                st.caption("✅ GOSemSim detected")
+            else:
+                st.caption("⚠️ GOSemSim not detected")
+
+    simplify_measure = om.DEFAULT_SIMPLIFY_MEASURE
+    simplify_cutoff = om.DEFAULT_SIMPLIFY_CUTOFF
+    if available_ontology:
+        measure_display_names = list(om.SIMPLIFY_MEASURE_OPTIONS.keys())
+        default_measure_display = next(
+            (k for k, v in om.SIMPLIFY_MEASURE_OPTIONS.items() if v == om.DEFAULT_SIMPLIFY_MEASURE),
+            measure_display_names[0],
+        )
+        chosen_measure_display = st.selectbox(
+            "Similarity measure used to detect redundant GO terms:",
+            options=measure_display_names,
+            index=measure_display_names.index(default_measure_display),
+            key=f"{key_prefix}_simplify_measure",
+            help="Only affects the result if the checkbox above is checked. Different measures can merge a different number/set of terms -- see the explanation panel below for what to expect from each.",
+        )
+        simplify_measure = om.SIMPLIFY_MEASURE_OPTIONS[chosen_measure_display]
+
+        measure_info = om.SIMILARITY_MEASURE_INFO[simplify_measure]
+        with st.expander(f"ℹ️ About \"{chosen_measure_display}\" ({measure_info['category']})"):
+            st.latex(measure_info["formula"])
+            st.markdown(f"**What it computes:** {measure_info['summary']}")
+            st.markdown(f"**Background:** {measure_info['details']}")
+            st.markdown(f"**What to expect in YOUR results:** {measure_info['practical_effect']}")
+            st.caption(
+                "📊 Requires computing Information Content over the GO corpus first (done automatically)"
+                if measure_info["requires_compute_ic"]
+                else "⚡ No Information Content computation needed -- uses only GO graph structure"
+            )
+            st.caption(f"Reference: {measure_info['citation']}")
+
+        simplify_cutoff = st.slider(
+            "Similarity cutoff (how similar is 'redundant'?):",
+            min_value=0.1, max_value=1.0, value=om.DEFAULT_SIMPLIFY_CUTOFF, step=0.05,
+            key=f"{key_prefix}_simplify_cutoff",
+            help=(
+                "Two GO terms are collapsed into one (keeping only the more "
+                "significant of the pair) when their similarity score, using "
+                "the measure chosen above, is at or above this value.\n\n"
+                "• LOWER cutoff (e.g. 0.4) = STRICTER redundancy check -- more "
+                "terms get merged/removed, leaving a shorter, more curated list.\n\n"
+                "• HIGHER cutoff (e.g. 0.9) = LOOSER redundancy check -- only "
+                "near-identical terms get merged, leaving more terms in the "
+                "final result.\n\n"
+                "clusterProfiler's own standard default is 0.7."
+            ),
+        )
+
+    if available_ontology and not gosemsim_ok:
+        st.warning(
+            f"⚠️ {gosemsim_detail} Checking the box above will NOT "
+            "actually simplify your results -- the analysis will "
+            "still complete successfully, just using the un-simplified "
+            "GO terms (this is expected, graceful behavior, not an "
+            "error). Install GOSemSim in this environment to enable "
+            "simplification, then re-check below."
+        )
+
+    if available_ontology:
+        with st.expander("🔬 Run a deeper GOSemSim check (optional, slower)"):
+            st.caption(
+                "The status above only confirms whether the GOSemSim "
+                "package is *installed*. This runs a genuinely deeper "
+                "test -- actually simplifying a small real result for "
+                "your organism -- to catch a different, rarer failure "
+                "mode: GOSemSim installed but unable to build its "
+                "semantic-similarity data for this specific organism/"
+                "ontology. This can take anywhere from a few seconds to "
+                "over a minute (longer the first time, since GOSemSim "
+                "caches this data after building it once)."
+            )
+            col_recheck, col_functional = st.columns(2)
+            with col_recheck:
+                if st.button("🔄 Re-check availability", key=f"{key_prefix}_recheck_gosemsim_btn"):
+                    om.check_gosemsim_available(force_recheck=True)
+                    st.rerun()
+            with col_functional:
+                run_functional_check = st.button(
+                    "🧪 Run live functional test", key=f"{key_prefix}_run_functional_check_btn",
+                )
+            if run_functional_check:
+                orgdb_package = st.session_state.get("_ontology_orgdb_package_for_gosemsim_check")
+                test_ontology = go_ontology if go_ontology != "ALL" else "BP"
+                if not orgdb_package:
+                    st.error("⚠️ Could not determine which organism to test against -- select an organism above first.")
+                else:
+                    with st.spinner(f"Running a live GOSemSim test for {orgdb_package} ({test_ontology})..."):
+                        functional, detail = om.verify_gosemsim_functional(orgdb_package, test_ontology)
+                    if functional:
+                        st.success(f"✅ {detail}")
+                    else:
+                        st.error(f"⚠️ {detail}")
+
+    return simplify_go, simplify_measure, simplify_cutoff
+
+
+def _render_similarity_method_control(key_prefix, database):
+    """
+    Render the "how should term similarity be measured?" control for the
+    enrichment map plot -- an INDEPENDENT setting from the "simplify GO
+    results" measure above (a user might simplify with Wang but still
+    view the map with the original gene-overlap similarity, or vice
+    versa).
+
+    For GO results, offers the full choice between gene-overlap (JC --
+    this workspace's original, unchanged default) and GOSemSim's five
+    semantic-similarity measures (Resnik/Lin/Rel/Jiang/Wang). For KEGG/
+    Reactome results, GOSemSim's measures don't apply (no GO graph
+    structure to use), so no dropdown is rendered at all -- gene-overlap
+    similarity is used silently, exactly as this workspace has always
+    done for those databases.
+
+    Returns the chosen measure key (e.g. "JC", "Wang", "Rel", ...).
+    """
+    if database != "GO":
+        return "JC"
+
+    display_names = list(om.SIMILARITY_METHOD_OPTIONS.keys())
+    default_display = next(
+        (k for k, v in om.SIMILARITY_METHOD_OPTIONS.items() if v == om.DEFAULT_SIMILARITY_METHOD),
+        display_names[0],
     )
+    chosen_display = st.selectbox(
+        "How should term similarity be measured?",
+        options=display_names,
+        index=display_names.index(default_display),
+        key=f"{key_prefix}_similarity_method",
+        help="Determines which terms are drawn close together and connected in the network below. Changing this can noticeably change the plot's layout and which connections appear -- see the explanation panel for what to expect.",
+    )
+    method = om.SIMILARITY_METHOD_OPTIONS[chosen_display]
+
+    info = om.SIMILARITY_MEASURE_INFO[method]
+    with st.expander(f"ℹ️ About \"{chosen_display}\" ({info['category']})"):
+        st.latex(info["formula"])
+        st.markdown(f"**What it computes:** {info['summary']}")
+        st.markdown(f"**Background:** {info['details']}")
+        st.markdown(f"**What to expect in YOUR plot:** {info['practical_effect']}")
+        st.caption(
+            "📊 Requires building GO semantic-similarity data (GOSemSim)"
+            if method != "JC"
+            else "⚡ No GOSemSim/R call needed -- computed directly from each term's gene list"
+        )
+        st.caption(f"Reference: {info['citation']}")
+
+    if method != "JC":
+        st.caption(
+            "If GOSemSim isn't installed/available (or the computation "
+            "fails for any reason), this plot will automatically fall "
+            "back to gene-overlap (Jaccard) similarity instead."
+        )
+
+    return method
+
+
+def _render_simplify_status(output_dir, direction=None):
+    outcomes = om.load_simplify_status(output_dir)
+    if not outcomes:
+        return
+
+    if direction is not None:
+        outcomes = [o for o in outcomes if o.get("direction") == direction]
+        if not outcomes:
+            return
+
+    n_simplified = sum(1 for o in outcomes if o["outcome"] == "simplified")
+    n_fallback = sum(1 for o in outcomes if o["outcome"] == "fallback")
+
+    if n_fallback == 0:
+        st.success(
+            f"✅ GO term simplification was applied successfully "
+            f"({n_simplified} of {len(outcomes)} GO result(s) simplified)."
+        )
+    elif n_simplified == 0:
+        st.warning(
+            f"⚠️ GO term simplification did **not** run for this result "
+            f"({n_fallback} of {len(outcomes)} GO result(s)) -- GOSemSim "
+            "may not be installed in this environment. The GO results "
+            "shown below are the full, UN-simplified set (this is "
+            "expected, graceful behavior -- the analysis itself "
+            "completed successfully either way)."
+        )
+        with st.expander("Show technical detail"):
+            for o in outcomes:
+                st.code(o["detail"])
+    else:
+        st.warning(
+            f"⚠️ GO term simplification partially applied: "
+            f"{n_simplified} of {len(outcomes)} GO result(s) were "
+            f"simplified, but {n_fallback} fell back to un-simplified "
+            "results (see technical detail below)."
+        )
+        with st.expander("Show technical detail"):
+            for o in outcomes:
+                st.code(f"[{o['outcome']}] {o['detail']}")
 
 
 # ---------------------------------------------------------------------------
@@ -1074,29 +1176,12 @@ def _render_simplify_control(key_prefix, go_ontology):
 
 def _render_single_database_results(output_dir, analysis_type, database, key_prefix,
                                      padj_threshold, gene_fc_map=None, direction=None,
-                                     section_label=None):
+                                     section_label=None, orgdb_package=None, go_ontology=None):
     """
-    Render the full results section for ONE database's ORA or GSEA
-    result: a plain-language summary, the checkbox plot-selection gate,
-    then whichever plots were checked.
-
-    IMPORTANT -- per-graph controls: unlike an earlier version of this
-    function, "number of top terms"/"rank by"/"x-axis value"/the term-
-    label editor are each rendered INDIVIDUALLY, immediately above the
-    specific dot or bar plot they affect, rather than once, shared,
-    above the whole checkbox gate -- this means a user can freely set
-    DIFFERENT settings for e.g. the dot plot vs. the bar plot of the
-    exact same underlying result, and the controls always appear
-    directly next to (not several plots away from) the graph they
-    actually change.
-
-    direction: None (legacy combined-mode result), "up", or "down" --
-        which ORA gene-list direction's result file to read (ignored
-        for GSEA, which has no direction concept). Threaded through to
-        om.read_enrichment_result.
-    section_label: optional override for the section header (e.g.
-        "GO results — Up-regulated genes") -- defaults to a plain
-        "{database} results" if not given.
+    orgdb_package, go_ontology: forwarded from render()'s Step 2 state --
+        used only by the enrichment-map section's (new) similarity-method
+        picker, when database == "GO" and a GOSemSim measure (rather than
+        the default gene-overlap "JC") is selected.
     """
     read_direction = direction if analysis_type == "ora" else None
     result_df = om.read_enrichment_result(output_dir, analysis_type, database, direction=read_direction)
@@ -1105,6 +1190,9 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
         return
 
     st.markdown(f"#### {section_label or f'{database} results'}")
+
+    if database == "GO":
+        _render_simplify_status(output_dir, direction=direction)
 
     qvalue_threshold = _render_qvalue_threshold_control(f"{key_prefix}_qval")
     st.caption(om.summarize_enrichment_result(result_df, padj_threshold=padj_threshold, qvalue_threshold=qvalue_threshold))
@@ -1184,10 +1272,10 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
         st.markdown("##### Enrichment map")
         with st.expander("ℹ️ How to read this plot"):
             st.markdown(
-                "Each node is one enriched term. Terms that share MANY "
-                "of the same genes are drawn close together and "
-                "connected by a line. Node size = gene count; node "
-                "color = significance.\n\n"
+                "Each node is one enriched term. Terms that are similar "
+                "to each other (however similarity is defined below) are "
+                "drawn close together and connected by a line. Node size "
+                "= gene count; node color = significance.\n\n"
                 "💡 **Labels are individually draggable** -- click and "
                 "drag any term's label to reposition it if labels "
                 "overlap. The node itself stays fixed at its computed "
@@ -1199,18 +1287,38 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
         n_top_emap = st.slider(
             "Number of top terms to include:", min_value=5, max_value=50, value=30, step=5,
             key=f"{key_prefix}_emap_n_top",
+            help="How many of the most significant terms are included as nodes. More terms = a bigger, potentially busier network; fewer terms = a smaller, more focused one.",
         )
         emap_colorscale, emap_reverse = dew._render_heatmap_color_controls(
             f"{key_prefix}_emap", SEQUENTIAL_COLORSCALE_OPTIONS, default="Viridis", default_reverse=True,
         )
+        emap_similarity_method = _render_similarity_method_control(f"{key_prefix}_emap", database)
+        emap_threshold_label = (
+            "Minimum semantic similarity to draw a connection:"
+            if emap_similarity_method != "JC"
+            else "Minimum gene overlap (Jaccard similarity) to draw a connection:"
+        )
         similarity_threshold = st.slider(
-            "Minimum gene overlap (Jaccard similarity) to draw a connection:",
+            emap_threshold_label,
             0.0, 1.0, 0.2, step=0.05, key=f"{key_prefix}_emap_threshold",
+            help=(
+                "Two terms are only connected by a line if their similarity "
+                "score (using the method chosen above) is at or above this "
+                "value.\n\n"
+                "• LOWER threshold (e.g. 0.05) = MORE connections drawn -- "
+                "denser network, easier to spot broad clusters, but can look "
+                "cluttered.\n\n"
+                "• HIGHER threshold (e.g. 0.5) = FEWER connections drawn -- "
+                "sparser network showing only the strongest relationships; "
+                "some terms may end up with no connections at all (isolated "
+                "nodes) if nothing else is similar enough."
+            ),
         )
         emap_seed = _render_layout_seed_control(f"{key_prefix}_emap")
         fig, emap_node_ids = _plot_enrichment_map(
             result_df, n_top=n_top_emap, similarity_threshold=similarity_threshold,
             colorscale=emap_colorscale, reverse_colorscale=emap_reverse, layout_seed=emap_seed,
+            similarity_method=emap_similarity_method, orgdb_package=orgdb_package, go_ontology=go_ontology,
         )
         if fig is None:
             st.info("Not enough overlapping terms to draw a meaningful network at this threshold -- try lowering the similarity slider above.")
@@ -1223,6 +1331,7 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
                     result_df, n_top=n_top_emap, similarity_threshold=similarity_threshold,
                     label_map=emap_label_map, colorscale=emap_colorscale,
                     reverse_colorscale=emap_reverse, layout_seed=emap_seed,
+                    similarity_method=emap_similarity_method, orgdb_package=orgdb_package, go_ontology=go_ontology,
                 )
             style = dew._render_plot_style_controls(f"{key_prefix}_emap", group_values=None, show_legend_controls=False)
             dew._apply_plot_style(fig, style, default_title=f"{database} {analysis_type.upper()} -- Enrichment Map")
@@ -1248,6 +1357,7 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
         n_cnet_terms = st.slider(
             "Number of top terms to include:", min_value=3, max_value=20, value=8, step=1,
             key=f"{key_prefix}_cnet_n_top",
+            help="How many of the most significant terms are included. More terms pull in more genes too (since every gene belonging to an included term is shown), which can make the network larger and busier.",
         )
         cnet_seed = _render_layout_seed_control(f"{key_prefix}_cnet")
         fig, cnet_term_ids, cnet_gene_ids = _plot_gene_concept_network(
@@ -1312,6 +1422,7 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
         n_ridge = st.slider(
             "Number of gene sets to show:", min_value=3, max_value=20, value=10, step=1,
             key=f"{key_prefix}_ridge_n_top",
+            help="How many of the most significant gene sets get their own ridge. More gene sets = a taller plot with more ridges to compare.",
         )
         ridge_data = om.build_ridge_plot_data(output_dir, database, result_df, n_top=n_ridge)
         if not ridge_data:
@@ -1335,6 +1446,7 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
         n_upset_terms = st.slider(
             "Number of top terms to include:", min_value=3, max_value=15, value=8, step=1,
             key=f"{key_prefix}_upset_n_top",
+            help="How many of the most significant terms are compared for overlap. More terms means more possible combinations shown, which can make the plot longer.",
         )
         upset_data = om.build_upset_data(result_df, n_top=n_upset_terms)
         fig = _plot_upset(upset_data, bar_color=upset_color)
@@ -1356,17 +1468,6 @@ def _render_single_database_results(output_dir, analysis_type, database, key_pre
 
 
 def _render_ora_up_down_comparison(output_dir, database, key_prefix):
-    """
-    Render a "compare Up vs Down side-by-side" section for one ORA
-    database that has BOTH direction result files available -- offers
-    ONE shared set of settings (number of top terms, rank-by,
-    colorscale) applied identically to both directions' dot plots,
-    displayed in two columns for a direct visual comparison. This is
-    the "set a graph from up that is the same as down, next to each
-    other" comparison view -- deliberately a separate, simpler section
-    from each direction's own FULL results section (which each keep
-    their own independent, fully-customizable set of controls).
-    """
     up_df = om.read_enrichment_result(output_dir, "ora", database, direction="up")
     down_df = om.read_enrichment_result(output_dir, "ora", database, direction="down")
     if (up_df is None or up_df.empty) or (down_df is None or down_df.empty):
@@ -1457,6 +1558,8 @@ def render():
         if not orgdb_package:
             return
 
+    st.session_state["_ontology_orgdb_package_for_gosemsim_check"] = orgdb_package
+
     db_availability = om.databases_available_for_species(species_key)
     kegg_organism = om.get_kegg_organism_code(species_key)
     reactome_organism = om.get_reactome_organism_name(species_key)
@@ -1524,6 +1627,8 @@ def render():
 
     go_ontology = "BP"
     simplify_go = False
+    simplify_measure = om.DEFAULT_SIMPLIFY_MEASURE
+    simplify_cutoff = om.DEFAULT_SIMPLIFY_CUTOFF
     if run_go:
         with st.expander("ℹ️ What's the difference between Biological Process, Molecular Function, and Cellular Component? (click for a detailed explanation)"):
             st.markdown(
@@ -1557,7 +1662,7 @@ def render():
         go_ontology = om.GO_ONTOLOGY_OPTIONS[go_ontology_label]
 
         if not analysis_approach.startswith("compareCluster"):
-            simplify_go = _render_simplify_control("ontology_step2", go_ontology)
+            simplify_go, simplify_measure, simplify_cutoff = _render_simplify_control("ontology_step2", go_ontology)
 
     if not (run_go or run_kegg or run_reactome):
         st.warning("⚠️ Select at least one database to continue.")
@@ -1577,14 +1682,16 @@ def render():
             )
         col_p, col_l = st.columns(2)
         with col_p:
-            padj_threshold = st.slider("Significance threshold (adjusted p-value):", 0.01, 0.20, 0.05, step=0.01, key="ontology_padj_slider")
+            padj_threshold = st.slider(
+                "Significance threshold (adjusted p-value):", 0.01, 0.20, 0.05, step=0.01, key="ontology_padj_slider",
+                help="Genes must have an adjusted p-value BELOW this to count as significant. Lowering it (e.g. 0.01) is stricter -- fewer, more confident genes go into the enrichment test. Raising it (e.g. 0.10) is more lenient -- more genes are included, which can surface more (but potentially noisier) enriched terms.",
+            )
         with col_l:
-            lfc_threshold = st.slider("Minimum |log2 fold change|:", 0.0, 4.0, 1.0, step=0.1, key="ontology_lfc_slider")
+            lfc_threshold = st.slider(
+                "Minimum |log2 fold change|:", 0.0, 4.0, 1.0, step=0.1, key="ontology_lfc_slider",
+                help="Genes must change by at least this much (in either direction) to count as significant. Raising it keeps only genes with a LARGER effect size, giving a smaller, more strongly-changed gene list; lowering it (down to 0) includes genes with any detectable change, however small.",
+            )
 
-        # Direction splitting only applies to ORA (single contrast) --
-        # compareCluster is out of scope for this (see
-        # ontology_manager.py's module docstring), and GSEA has no
-        # "significant gene list" to split in the first place.
         if analysis_approach.startswith("ORA"):
             split_by_direction = _render_direction_split_control("ontology_step2")
 
@@ -1640,7 +1747,9 @@ def render():
                     padj_threshold, lfc_threshold, run_go, go_ontology,
                     run_kegg, kegg_organism, run_reactome, reactome_organism,
                     min_gs_size=min_gs_size, max_gs_size=max_gs_size,
-                    simplify_go=simplify_go, split_by_direction=split_by_direction,
+                    simplify_go=simplify_go, simplify_measure=simplify_measure,
+                    simplify_cutoff=simplify_cutoff,
+                    split_by_direction=split_by_direction,
                 )
             elif analysis_type == "gsea":
                 export_df = dm.build_clusterprofiler_export(deseq2_out_dir, selected_contrasts[0])
@@ -1651,7 +1760,8 @@ def render():
                     input_path, output_dir, work_dir, orgdb_package, from_type,
                     run_go, go_ontology, run_kegg, kegg_organism, run_reactome, reactome_organism,
                     min_gs_size=min_gs_size, max_gs_size=max_gs_size,
-                    simplify_go=simplify_go,
+                    simplify_go=simplify_go, simplify_measure=simplify_measure,
+                    simplify_cutoff=simplify_cutoff,
                 )
             else:  # compareCluster
                 os.makedirs(work_dir, exist_ok=True)
@@ -1674,6 +1784,12 @@ def render():
             return
         else:
             st.success("✅ Analysis completed successfully.")
+
+            if simplify_go and run_go:
+                simplify_outcomes = om.parse_simplify_outcomes_from_log(log)
+                if simplify_outcomes:
+                    om.save_simplify_status(output_dir, simplify_outcomes)
+
             with st.expander("View run log"):
                 st.code(log)
             results_already_exist = True
@@ -1715,6 +1831,7 @@ def render():
             n_top_cc = st.slider(
                 f"Top terms per contrast ({db}):", min_value=3, max_value=30, value=10, step=1,
                 key=f"cc_{db}_n_top",
+                help="How many of the most significant terms are shown PER contrast column. More terms per contrast = a taller plot showing more of each contrast's results.",
             )
             cc_label_map = _render_term_label_editor(
                 cc_df.sort_values("p.adjust").groupby("Cluster").head(n_top_cc).drop_duplicates("ID"),
@@ -1757,14 +1874,6 @@ def render():
 
         gene_fc_map = _get_gene_fc_map_for_contrast(deseq2_out_dir, selected_contrasts[0], gene_name_map=gene_name_map)
 
-        # Track, per database, which "direction" DataFrames end up
-        # available -- feeds the combined-view section further below,
-        # which (for simplicity, avoiding an explosion of combined-view
-        # variants) always combines using "up" direction results if a
-        # database used split mode, since that's the more commonly
-        # inspected direction; a user who specifically wants the
-        # DOWN-direction combined view can still get it by reading the
-        # per-database, per-direction sections above it directly.
         combined_view_direction_by_db = {}
 
         for db in available_dbs:
@@ -1782,12 +1891,14 @@ def render():
                     output_dir, "ora", db, f"ora_{db}_up", padj_threshold,
                     gene_fc_map=gene_fc_map, direction="up",
                     section_label=f"{db} results — Up-regulated genes",
+                    orgdb_package=orgdb_package, go_ontology=go_ontology,
                 )
                 st.markdown("---")
                 _render_single_database_results(
                     output_dir, "ora", db, f"ora_{db}_down", padj_threshold,
                     gene_fc_map=gene_fc_map, direction="down",
                     section_label=f"{db} results — Down-regulated genes",
+                    orgdb_package=orgdb_package, go_ontology=go_ontology,
                 )
                 st.markdown("---")
                 _render_ora_up_down_comparison(output_dir, db, f"ora_{db}")
@@ -1796,18 +1907,16 @@ def render():
                 _render_single_database_results(
                     output_dir, "ora", db, f"ora_{db}", padj_threshold,
                     gene_fc_map=gene_fc_map, direction=None,
+                    orgdb_package=orgdb_package, go_ontology=go_ontology,
                 )
                 combined_view_direction_by_db[db] = "combined"
             else:
-                # Only one direction happened to have results (the
-                # other had zero significant genes for this database
-                # and was skipped -- see ontology_manager.py's guarded
-                # per-direction blocks). Render whichever one exists.
                 only_direction = directions[0]
                 _render_single_database_results(
                     output_dir, "ora", db, f"ora_{db}_{only_direction}", padj_threshold,
                     gene_fc_map=gene_fc_map, direction=only_direction,
                     section_label=f"{db} results — {'Up' if only_direction == 'up' else 'Down'}-regulated genes",
+                    orgdb_package=orgdb_package, go_ontology=go_ontology,
                 )
                 combined_view_direction_by_db[db] = only_direction
 
@@ -1821,9 +1930,12 @@ def render():
                     "a different angle. Seeing your top hits from all "
                     "three together, on one plot -- with each row's "
                     "BACKGROUND shaded by its category (GO's BP/MF/CC, "
-                    "or KEGG/Reactome) -- can reveal a more complete "
-                    "picture, while dot color is free to show "
-                    "significance directly."
+                    "or KEGG/Reactome, explained in the plot's own "
+                    "legend) -- can reveal a more complete picture, "
+                    "while dot color is free to show significance "
+                    "directly. You can check/uncheck which categories "
+                    "to include, and rename each category's legend "
+                    "text, below."
                 )
             show_combined = st.checkbox(
                 "📊 Show combined dot plot across selected databases", key="ora_combined_checkbox",
@@ -1836,6 +1948,7 @@ def render():
                 n_top_combined = st.slider(
                     "Top terms per database:", min_value=3, max_value=20, value=10, step=1,
                     key="ora_combined_n_top",
+                    help="How many of the most significant terms are pulled in FROM EACH database before combining. More terms per database = a longer combined plot.",
                 )
                 combined_colorscale, combined_reverse = dew._render_heatmap_color_controls(
                     "ora_combined", SEQUENTIAL_COLORSCALE_OPTIONS, default="Viridis", default_reverse=True,
@@ -1851,16 +1964,26 @@ def render():
                         frames.append(df)
                 combined_df = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
-                combined_label_map = _render_term_label_editor(combined_df, "ora_combined_labels")
-                fig, category_colors = _plot_combined_multi_database(
-                    combined_df, label_map=combined_label_map,
-                    colorscale=combined_colorscale, reverse_colorscale=combined_reverse,
+                combined_df_categorized = om.derive_category_column(combined_df)
+                selected_categories, category_label_map = _render_category_filter_and_label_controls(
+                    combined_df_categorized, "ora_combined",
                 )
-                if fig is None:
-                    st.info("No data available to combine.")
+                combined_df_filtered = combined_df_categorized[
+                    combined_df_categorized["Category"].isin(selected_categories)
+                ]
+
+                combined_label_map = _render_term_label_editor(combined_df_filtered, "ora_combined_labels")
+                if combined_df_filtered.empty:
+                    fig, category_colors = None, {}
                 else:
-                    if category_colors:
-                        st.caption(f"Background shading by category: {', '.join(category_colors.keys())}")
+                    fig, category_colors = _plot_combined_multi_database(
+                        combined_df_filtered, label_map=combined_label_map,
+                        category_label_map=category_label_map,
+                        colorscale=combined_colorscale, reverse_colorscale=combined_reverse,
+                    )
+                if fig is None:
+                    st.info("No data available to combine -- check at least one category above.")
+                else:
                     style = dew._render_plot_style_controls(
                         "ora_combined", group_values=None, show_legend_controls=False,
                     )
@@ -1868,7 +1991,7 @@ def render():
                     dew._render_plotly_chart(fig)
                     dew._render_pdf_export(fig, "ora_combined", "combined_multi_database")
                     dew._render_csv_download(
-                        combined_df, "combined_ora_results", "ora_combined_table",
+                        combined_df_filtered, "combined_ora_results", "ora_combined_table",
                         expander_label="⬇️ Download Combined Results (.csv)",
                     )
 
@@ -1884,6 +2007,7 @@ def render():
             _render_single_database_results(
                 output_dir, analysis_type, db, f"{analysis_type}_{db}",
                 padj_threshold, gene_fc_map=gene_fc_map,
+                orgdb_package=orgdb_package, go_ontology=go_ontology,
             )
             st.markdown("---")
 
@@ -1894,8 +2018,11 @@ def render():
                     "GO, KEGG, and Reactome each describe biology from "
                     "a different angle. Seeing your top hits from all "
                     "three together, on one plot -- with each row's "
-                    "BACKGROUND shaded by its category -- can reveal a "
-                    "more complete picture."
+                    "BACKGROUND shaded by its category, explained in "
+                    "the plot's own legend -- can reveal a more "
+                    "complete picture. You can check/uncheck which "
+                    "categories to include, and rename each category's "
+                    "legend text, below."
                 )
             show_combined = st.checkbox(
                 "📊 Show combined dot plot across selected databases", key=f"{analysis_type}_combined_checkbox",
@@ -1908,21 +2035,33 @@ def render():
                 n_top_combined = st.slider(
                     "Top terms per database:", min_value=3, max_value=20, value=10, step=1,
                     key=f"{analysis_type}_combined_n_top",
+                    help="How many of the most significant terms are pulled in FROM EACH database before combining. More terms per database = a longer combined plot.",
                 )
                 combined_colorscale, combined_reverse = dew._render_heatmap_color_controls(
                     f"{analysis_type}_combined", SEQUENTIAL_COLORSCALE_OPTIONS, default="Viridis", default_reverse=True,
                 )
                 combined_df = om.build_combined_results(output_dir, analysis_type, combine_dbs, n_top_per_db=n_top_combined)
-                combined_label_map = _render_term_label_editor(combined_df, f"{analysis_type}_combined_labels")
-                fig, category_colors = _plot_combined_multi_database(
-                    combined_df, label_map=combined_label_map,
-                    colorscale=combined_colorscale, reverse_colorscale=combined_reverse,
+
+                combined_df_categorized = om.derive_category_column(combined_df)
+                selected_categories, category_label_map = _render_category_filter_and_label_controls(
+                    combined_df_categorized, f"{analysis_type}_combined",
                 )
-                if fig is None:
-                    st.info("No data available to combine.")
+                combined_df_filtered = combined_df_categorized[
+                    combined_df_categorized["Category"].isin(selected_categories)
+                ]
+
+                combined_label_map = _render_term_label_editor(combined_df_filtered, f"{analysis_type}_combined_labels")
+                if combined_df_filtered.empty:
+                    fig, category_colors = None, {}
                 else:
-                    if category_colors:
-                        st.caption(f"Background shading by category: {', '.join(category_colors.keys())}")
+                    fig, category_colors = _plot_combined_multi_database(
+                        combined_df_filtered, label_map=combined_label_map,
+                        category_label_map=category_label_map,
+                        colorscale=combined_colorscale, reverse_colorscale=combined_reverse,
+                    )
+                if fig is None:
+                    st.info("No data available to combine -- check at least one category above.")
+                else:
                     style = dew._render_plot_style_controls(
                         f"{analysis_type}_combined", group_values=None, show_legend_controls=False,
                     )
@@ -1930,7 +2069,7 @@ def render():
                     dew._render_plotly_chart(fig)
                     dew._render_pdf_export(fig, f"{analysis_type}_combined", "combined_multi_database")
                     dew._render_csv_download(
-                        combined_df, f"combined_{analysis_type}_results", f"{analysis_type}_combined_table",
+                        combined_df_filtered, f"combined_{analysis_type}_results", f"{analysis_type}_combined_table",
                         expander_label="⬇️ Download Combined Results (.csv)",
                     )
 

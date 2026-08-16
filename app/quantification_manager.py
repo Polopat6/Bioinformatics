@@ -707,3 +707,183 @@ def classify_mapping_rate(rate_pct):
                 "2 before proceeding to use these results."
             ),
         }
+
+
+# ---------------------------------------------------------------------------
+# Salmon: transcript-level -> gene-level collapsing via tximport (R)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS: Salmon quantifies against a TRANSCRIPTOME, so its
+# quant.sf output is inherently transcript-level -- for any organism
+# with alternative splicing (i.e. more than one transcript per gene),
+# a gene's true count is the sum of its isoforms' counts, not any single
+# row in quant.sf. merge_salmon_counts() above does a direct, naive
+# merge and is only actually correct for no-intron organisms (see its
+# own docstring) where transcript IDs already equal gene IDs one-to-one.
+# For everything else (human, mouse, and most eukaryotes), the standard,
+# statistically correct way to collapse isoform-level estimated counts
+# up to gene-level counts is tximport's countsFromAbundance="lengthScaledTPM"
+# path, which -- unlike a plain groupby().sum() -- also corrects for
+# average-transcript-length shifts between samples/conditions (e.g. a
+# gene's dominant isoform getting shorter or longer between treatment
+# and control would otherwise bias a naive sum). See tximport's own
+# documentation for why "lengthScaledTPM" specifically is the
+# recommended choice when the caller (this codebase's DESeq2 step, via
+# deseq2_manager.run_deseq2_analysis) consumes a plain integer counts
+# matrix via DESeqDataSetFromMatrix rather than the offset-aware
+# DESeqDataSetFromTximport path.
+
+def tximport_tools_available():
+    """
+    Check whether Rscript AND the R "tximport" package are both
+    available. Distinct from deseq2_tools_available() (which only
+    checks Rscript itself) since tximport is a separate optional
+    Bioconductor package that may not be installed even when R/DESeq2
+    are -- this runs a cheap `Rscript -e 'requireNamespace(...)'` probe
+    rather than trying a real tximport() call.
+    """
+    if shutil.which("Rscript") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["Rscript", "-e", "quit(status = if (requireNamespace('tximport', quietly = TRUE)) 0 else 1)"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+# This script is written to a temp file and executed via Rscript,
+# mirroring the exact job-spec-JSON-as-single-CLI-arg pattern used by
+# deseq2_manager.py's _DESEQ2_R_SCRIPT (see that module for the
+# rationale -- too many/too nested parameters for plain positional CLI
+# args). job$sample_quant_paths is a NAMED list (sample_name -> quant.sf
+# path); jsonlite's fromJSON() correctly parses a JSON object (as
+# opposed to a JSON array) into a named R list, which is exactly the
+# "files" argument shape tximport() expects when also given "names=".
+_TXIMPORT_R_SCRIPT = r'''
+suppressMessages({
+  library(jsonlite)
+  library(tximport)
+})
+args <- commandArgs(trailingOnly = TRUE)
+job_spec_path <- args[1]
+job <- fromJSON(job_spec_path)
+
+tx2gene <- read.csv(job$tx2gene_path, check.names = FALSE)
+
+files <- unlist(job$sample_quant_paths)
+sample_names <- names(job$sample_quant_paths)
+if (is.null(sample_names) || any(sample_names == "")) {
+  stop("sample_quant_paths must be a name -> path mapping (sample name missing for one or more entries).")
+}
+
+missing_files <- files[!file.exists(files)]
+if (length(missing_files) > 0) {
+  stop(paste0("quant.sf file(s) not found: ", paste(missing_files, collapse = ", ")))
+}
+
+# ignoreTxVersion strips any ".N" version suffix from transcript IDs
+# before matching against tx2gene -- a common real-world mismatch when
+# quant.sf's transcript IDs retain Ensembl version suffixes (e.g.
+# "ENST00000456328.2") but tx2gene was built without them, or vice
+# versa. Harmless no-op when versions already match on both sides.
+txi <- tximport(
+  files,
+  type = "salmon",
+  tx2gene = tx2gene,
+  countsFromAbundance = "lengthScaledTPM",
+  ignoreTxVersion = TRUE
+)
+
+# lengthScaledTPM-derived counts are bias-corrected but not
+# necessarily integers -- DESeq2 (via the downstream, offset-agnostic
+# DESeqDataSetFromMatrix path this pipeline uses) requires integer
+# counts, so round here, same as the standard pre-DESeqDataSetFromTximport
+# tximport usage pattern.
+counts_df <- round(txi$counts)
+colnames(counts_df) <- sample_names
+
+out_df <- data.frame(gene_id = rownames(counts_df), counts_df, check.names = FALSE, row.names = NULL)
+write.csv(out_df, job$counts_path, row.names = FALSE)
+
+cat(sprintf(
+  "tximport gene-collapse complete: %d transcript(s) -> %d gene(s) across %d sample(s).\n",
+  nrow(tx2gene), nrow(out_df), length(sample_names)
+))
+'''
+
+
+def run_tximport_gene_collapse(sample_quant_paths, tx2gene_path, counts_path, work_dir):
+    """
+    Collapse per-sample Salmon quant.sf (transcript-level) output into
+    ONE gene-level counts matrix CSV, using tximport's
+    countsFromAbundance="lengthScaledTPM" method -- see the module-
+    level comment above this function for why this (rather than a
+    plain groupby-sum of transcript counts) is the statistically
+    correct way to do this collapse.
+
+    sample_quant_paths: dict of {sample_name: quant.sf_path} -- e.g.
+        built by the caller from a project's known sample list and
+        salmon_quant_dir layout (see advanced_mode_orchestrator.py's
+        _run_counts_matrix for the calling convention).
+    tx2gene_path: path to a CSV with TXNAME, GENEID columns (see
+        reference_manager.save_tx2gene_csv) describing which
+        transcript belongs to which gene for this reference.
+    counts_path: destination path for the merged gene-level counts
+        matrix CSV. Written with the SAME column shape as
+        merge_salmon_counts/merge_star_counts above (first column
+        "gene_id", one column per sample named after sample_quant_paths'
+        keys), so callers can treat all three merge paths
+        interchangeably afterward.
+    work_dir: scratch directory for the temporary R script + job spec
+        JSON (mirrors deseq2_manager.run_deseq2_analysis's work_dir
+        convention).
+
+    Returns (success: bool, log: str).
+    """
+    if not tximport_tools_available():
+        return False, (
+            "Rscript and/or the R \"tximport\" package were not found on "
+            "this system. tximport needs to be installed in your R "
+            "environment before gene-level collapsing of Salmon output "
+            "can run (transcript-level counts can still be used directly "
+            "for organisms with one transcript per gene, e.g. E. coli)."
+        )
+
+    if not sample_quant_paths:
+        return False, "No sample quant.sf paths were provided to collapse."
+
+    if not os.path.exists(tx2gene_path):
+        return False, f"tx2gene mapping file not found: {tx2gene_path}"
+
+    os.makedirs(work_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(counts_path)) or ".", exist_ok=True)
+
+    job_spec = {
+        "sample_quant_paths": {
+            sample: os.path.abspath(path) for sample, path in sample_quant_paths.items()
+        },
+        "tx2gene_path": os.path.abspath(tx2gene_path),
+        "counts_path": os.path.abspath(counts_path),
+    }
+
+    job_spec_path = os.path.join(work_dir, "tximport_job_spec.json")
+    with open(job_spec_path, "w") as f:
+        json.dump(job_spec, f, indent=2)
+
+    r_script_path = os.path.join(work_dir, "run_tximport.R")
+    with open(r_script_path, "w") as f:
+        f.write(_TXIMPORT_R_SCRIPT)
+
+    cmd = ["Rscript", r_script_path, job_spec_path]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=3600
+        )
+        return True, result.stdout + result.stderr
+    except subprocess.CalledProcessError as e:
+        return False, f"tximport gene-collapse failed: {(e.stdout or '') + (e.stderr or '')}"
+    except subprocess.TimeoutExpired:
+        return False, "tximport gene-collapse timed out after 1 hour."
