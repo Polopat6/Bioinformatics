@@ -17,58 +17,17 @@ in three flavors:
 
 Design decision -- ALL PLOTTING HAPPENS IN PYTHON (Plotly), not R: see
 ontology_workspace.py's module docstring for the full rationale.
-
---- ORA: up- and down-regulated genes analyzed SEPARATELY (default) ---
-Running ORA on a single gene list that MIXES up- and down-regulated
-genes together is a real statistical/interpretive problem: a GO term
-could be flagged as "enriched" purely because it happens to contain a
-mix of genes going in both directions, without that term actually
-representing a single, coherent, DIRECTIONAL biological signal (e.g. a
-pathway that's genuinely activated, vs. one that's genuinely
-suppressed, can get conflated into one ambiguous "changed somehow"
-result). To address this, run_ora_analysis/build_ora_r_script default
-to split_by_direction=True: two independent gene lists (up-regulated
-only: padj < threshold AND log2FC >= lfc_threshold; down-regulated
-only: padj < threshold AND log2FC <= -lfc_threshold) are each run
-through enrichGO/enrichKEGG/enrichPathway SEPARATELY, producing two
-distinct result files per database (suffixed "_up"/"_down" -- see
-_result_file_path). If one direction has zero significant genes at the
-chosen threshold, that direction's enrichment is skipped for that
-database (with a clear note in the run log) WITHOUT aborting the other
-direction's analysis or any other requested database -- each
-direction/database combination is independently guarded in the
-generated R script.
-
-split_by_direction=False preserves the ORIGINAL combined behavior (one
-mixed-direction gene list, one result file per database, no suffix) --
-offered as an explicit, clearly-labeled non-default option in the UI
-for anyone who specifically wants the old behavior or needs to compare
-directly against a combined-gene-list result.
-
---- Gene set size bounds, GO simplification, permutations note ---
-(Preserved from earlier design -- see min_gs_size/max_gs_size and
-simplify_go parameters below for the same rationale as before: gene
-sets that are too small produce unstable statistics; too large are
-often generic/uninformative; GO's own redundant hierarchy benefits from
-optional semantic-similarity-based simplification via GOSemSim, only
-meaningful for a single GO sub-ontology at a time.)
-
-Kept as its own module for the same reason as deseq2_manager.py: R
-subprocess execution and file I/O that's logically distinct from the
-Streamlit UI/workflow code.
 """
 
 import itertools
+import json
 import os
+import re
 import shutil
 import subprocess
 
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# Organism resolution: species_key -> KEGG organism code / Reactome name
-# ---------------------------------------------------------------------------
 
 KEGG_ORGANISM_CODES = {
     "human": "hsa",
@@ -99,10 +58,198 @@ DEFAULT_MIN_GS_SIZE = 10
 DEFAULT_MAX_GS_SIZE = 500
 DEFAULT_SIMPLIFY_CUTOFF = 0.7
 
-# The three directions a single database's ORA result can come in.
-# "combined" is the legacy/non-recommended mode (one mixed gene list);
-# "up"/"down" are the default, statistically-preferred split mode.
 ORA_DIRECTIONS = ["up", "down", "combined"]
+
+# ---------------------------------------------------------------------------
+# Semantic-/term-similarity measures
+#
+# The SAME five GOSemSim measures (plus, for the network/emap step only, a
+# sixth "JC" gene-overlap option) show up at TWO separate points in this
+# pipeline:
+#   1. clusterProfiler::simplify()   -- collapses redundant GO terms in a
+#      single database's result table (_build_simplify_snippet below).
+#   2. The term-similarity network feeding the "enrichment map" plot
+#      (build_term_similarity_network below) -- this workspace's existing
+#      implementation already computes one of these ("JC", gene-set
+#      Jaccard overlap) natively in Python; the other five require a live
+#      GOSemSim call (compute_go_semantic_similarity_matrix) since they
+#      depend on GO's own graph structure/annotation statistics, which
+#      only clusterProfiler/GOSemSim (R) has access to.
+#
+# Both call sites accept the SAME "Resnik"/"Lin"/"Rel"/"Jiang"/"Wang"
+# measure keys so a user only has to learn one small vocabulary, even
+# though which function actually consumes that measure differs.
+# ---------------------------------------------------------------------------
+
+# clusterProfiler's OWN default for simplify() has drifted across package
+# versions -- "Rel" in older releases, "Wang" in current ones. Rather than
+# relying on whatever the installed version happens to default to (which
+# would silently change this app's behavior on a clusterProfiler upgrade),
+# this app pins its own explicit default here.
+DEFAULT_SIMPLIFY_MEASURE = "Wang"
+DEFAULT_SIMILARITY_METHOD = "JC"
+
+# Measures valid for BOTH simplify() and the network-similarity step.
+SEMANTIC_SIMILARITY_MEASURES = ["Resnik", "Lin", "Rel", "Jiang", "Wang"]
+
+# Measures that require GOSemSim to compute Information Content (IC) over
+# the GO annotation corpus first (godata(..., computeIC = TRUE)). "Wang" is
+# the only GOSemSim measure that does NOT need this -- it only uses GO
+# graph topology -- so it can be built faster (computeIC = FALSE).
+IC_BASED_SIMILARITY_MEASURES = ["Resnik", "Lin", "Rel", "Jiang"]
+
+# Dropdown options for the simplify() measure picker (ontology_workspace.py).
+SIMPLIFY_MEASURE_OPTIONS = {
+    "Wang (graph-based -- fastest, current clusterProfiler default)": "Wang",
+    "Rel / Relevance (Schlicker -- former clusterProfiler default)": "Rel",
+    "Resnik": "Resnik",
+    "Lin": "Lin",
+    "Jiang & Conrath": "Jiang",
+}
+
+# Dropdown options for the network-similarity (enrichment map) method
+# picker -- includes "JC", which is NOT valid for simplify().
+SIMILARITY_METHOD_OPTIONS = {
+    "Gene overlap / Jaccard (default -- fast, works for GO/KEGG/Reactome)": "JC",
+    "Wang (GO semantic similarity, graph-based)": "Wang",
+    "Rel / Relevance (GO semantic similarity)": "Rel",
+    "Resnik (GO semantic similarity)": "Resnik",
+    "Lin (GO semantic similarity)": "Lin",
+    "Jiang & Conrath (GO semantic similarity)": "Jiang",
+}
+
+# Plain-language explanations shown next to each measure's picker in the
+# UI (ontology_workspace.py) -- formula strings are plain-text/LaTeX-ish
+# (renderable via st.latex if desired) rather than markdown, since they're
+# meant to be read as math.
+#
+# "practical_effect": a SECOND, non-mathematical explanation focused on
+# what a user should expect to SEE change in their results/plot if they
+# switch TO this measure from another one -- distinct from "summary"
+# (which explains the math) and "details" (which explains the theory) --
+# added specifically so a non-statistician user has a concrete, actionable
+# sense of "what happens if I pick this" rather than only a formula.
+SIMILARITY_MEASURE_INFO = {
+    "Resnik": {
+        "category": "Information-content (IC) based",
+        "requires_compute_ic": True,
+        "formula": r"sim_{Resnik}(t_1, t_2) = IC(MICA)",
+        "summary": "Similarity = information content of the terms' most informative common ancestor (MICA).",
+        "details": (
+            "The oldest, simplest information-content method. Looks only at how "
+            "specific (rare) the SHARED ancestor term is -- it ignores how "
+            "specific t1 and t2 themselves are, which is its well-known "
+            "weakness (motivated the Lin/Rel corrections below)."
+        ),
+        "practical_effect": (
+            "Tends to be the most GENEROUS measure -- it can call two terms "
+            "\"similar\" even if they're fairly different in scope, as long as "
+            "they share a reasonably specific ancestor. Expect MORE terms "
+            "merged together by simplify(), or MORE connections drawn on the "
+            "enrichment map, compared to Lin/Rel/Jiang."
+        ),
+        "citation": "Resnik, P. (1999). Semantic Similarity in a Taxonomy. J. Artif. Intell. Res., 11, 95-130.",
+    },
+    "Lin": {
+        "category": "Information-content (IC) based",
+        "requires_compute_ic": True,
+        "formula": r"sim_{Lin}(t_1, t_2) = \dfrac{2 \cdot IC(MICA)}{IC(t_1) + IC(t_2)}",
+        "summary": "Resnik's MICA score, normalized by how specific t1 and t2 individually are.",
+        "details": (
+            "Fixes Resnik's main blind spot by normalizing against the sum of "
+            "the two terms' own information content, penalizing pairs where "
+            "t1/t2 are very generic even if they share a specific ancestor."
+        ),
+        "practical_effect": (
+            "STRICTER than Resnik -- two broad/generic terms will no longer "
+            "look similar just because they share an ancestor. Expect FEWER "
+            "terms merged by simplify(), and a SPARSER enrichment map, than "
+            "with Resnik."
+        ),
+        "citation": "Lin, D. (1998). An Information-Theoretic Definition of Similarity. ICML.",
+    },
+    "Rel": {
+        "category": "Information-content (IC) based",
+        "requires_compute_ic": True,
+        "formula": r"sim_{Rel}(t_1, t_2) = \dfrac{2 \cdot IC(MICA)\,(1 - p(MICA))}{IC(t_1) + IC(t_2)}",
+        "summary": "Lin's formula plus a (1 - p(MICA)) term that further discounts overly generic ancestors.",
+        "details": (
+            "Proposed by Schlicker et al. (2006) as a hybrid of Resnik and Lin. "
+            "This was clusterProfiler::simplify()'s default in older package "
+            "versions (current versions default to Wang instead)."
+        ),
+        "practical_effect": (
+            "Similar in spirit to Lin, but pushes similarity scores down "
+            "further whenever the shared ancestor is a very COMMON GO term "
+            "(e.g. \"biological_process\"). A safe middle-ground choice if "
+            "you want IC-based results but distrust an overly generic shared "
+            "ancestor driving the outcome."
+        ),
+        "citation": "Schlicker, A. et al. (2006). BMC Bioinformatics, 7, 302.",
+    },
+    "Jiang": {
+        "category": "Information-content (IC) based",
+        "requires_compute_ic": True,
+        "formula": r"sim_{Jiang}(t_1, t_2) = 1 - \min(1,\; IC(t_1) + IC(t_2) - 2\cdot IC(MICA))",
+        "summary": "A distance-based reformulation: penalizes the 'extra' information each term carries beyond its shared ancestor.",
+        "details": (
+            "Instead of a ratio (like Lin/Rel), sums each term's 'private' "
+            "information content beyond the shared MICA and converts that "
+            "distance back into a bounded similarity."
+        ),
+        "practical_effect": (
+            "Behaves similarly to Lin/Rel in most cases, but reacts "
+            "differently when t1 and t2 have very UNEQUAL specificity (e.g. "
+            "one broad term, one narrow term) -- can produce a noticeably "
+            "different set of \"redundant\" terms in that specific situation. "
+            "Worth trying if Lin/Rel results look off for your data."
+        ),
+        "citation": "Jiang, J.J. & Conrath, D.W. (1997). ROCLING X.",
+    },
+    "Wang": {
+        "category": "Graph-structure based",
+        "requires_compute_ic": False,
+        "formula": r"S_{GO}(A,B) = \dfrac{\sum_{t \in T_A \cap T_B} (S_A(t) + S_B(t))}{SV(A) + SV(B)}",
+        "summary": "No information content needed -- uses only the GO graph topology and edge-type weights.",
+        "details": (
+            "The only measure here that skips GO annotation-frequency "
+            "statistics entirely (no computeIC step needed) -- each term's "
+            "'semantic value' is built by propagating weighted contributions "
+            "from its ancestors in the GO graph. Fastest to prepare, and the "
+            "current clusterProfiler::simplify() default."
+        ),
+        "practical_effect": (
+            "Similarity is based purely on shared POSITION in the GO "
+            "hierarchy, not on how common/rare terms are in your organism's "
+            "annotations -- so results won't shift if your organism's "
+            "annotation database is unusually sparse or dense. Generally "
+            "gives a balanced, moderate amount of term-merging/connections -- "
+            "a reasonable default if you're not sure which to pick."
+        ),
+        "citation": "Wang, J.Z. et al. (2007). Bioinformatics, 23(10), 1274-1281.",
+    },
+    "JC": {
+        "category": "Gene-overlap based",
+        "requires_compute_ic": False,
+        "formula": r"J(t_1, t_2) = \dfrac{|Genes(t_1) \cap Genes(t_2)|}{|Genes(t_1) \cup Genes(t_2)|}",
+        "summary": "Not a GOSemSim measure at all -- pure gene-set overlap (Jaccard). Works for GO, KEGG, and Reactome alike.",
+        "details": (
+            "Ignores GO graph structure entirely -- just measures how much two "
+            "enriched terms' underlying gene sets overlap. This is what this "
+            "workspace's enrichment map has always used, and needs no R/"
+            "GOSemSim call at all, unlike the other five measures here."
+        ),
+        "practical_effect": (
+            "Two terms connect ONLY if they were triggered by many of the "
+            "SAME genes in YOUR specific result -- completely independent of "
+            "GO's hierarchy/wording. This is the only measure that also "
+            "works for KEGG/Reactome. It can miss connections between terms "
+            "that are conceptually/hierarchically related but happen to be "
+            "driven by different genes in your data."
+        ),
+        "citation": "Jaccard, P. (1912). New Phytologist, 11(2), 37-50.",
+    },
+}
 
 
 def get_kegg_organism_code(species_key):
@@ -138,54 +285,206 @@ def simplify_available_for_ontology(go_ontology):
     return go_ontology != "ALL"
 
 
-# ---------------------------------------------------------------------------
-# R script: per-database block builders (shared by ORA's combined/split modes)
-# ---------------------------------------------------------------------------
-#
-# Rather than maintaining separate large R template strings for every
-# combination of {database} x {combined/split} x {simplify on/off}, each
-# database's R snippet is built dynamically in Python from small,
-# composable pieces -- this keeps the actual R logic for "run enrichGO
-# and save the result" defined in exactly ONE place per database,
-# regardless of how many different (gene_var, out_name, guard) contexts
-# it's used in.
+_gosemsim_availability_cache = {}
 
-def _build_simplify_snippet(result_var, go_ontology, simplify_go, simplify_cutoff):
+
+def check_gosemsim_available(force_recheck=False):
+    if not force_recheck and "result" in _gosemsim_availability_cache:
+        return _gosemsim_availability_cache["result"]
+
+    if not clusterprofiler_tools_available():
+        result = (False, "Rscript was not found on this system, so GOSemSim's availability could not be checked.")
+        _gosemsim_availability_cache["result"] = result
+        return result
+
+    check_script = (
+        'suppressMessages(ok <- requireNamespace("GOSemSim", quietly = TRUE)); '
+        'if (ok) { '
+        'cat("AVAILABLE version=", as.character(utils::packageVersion("GOSemSim")), "\\n", sep="") '
+        '} else { '
+        'cat("NOT_AVAILABLE\\n") '
+        '}'
+    )
+    try:
+        proc = subprocess.run(
+            ["Rscript", "-e", check_script],
+            capture_output=True, text=True, timeout=60,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        if "AVAILABLE version=" in output:
+            version_match = re.search(r"AVAILABLE version=([\w.\-]+)", output)
+            version = version_match.group(1) if version_match else "unknown version"
+            outcome = (True, f"GOSemSim is installed (version {version}).")
+        elif "NOT_AVAILABLE" in output:
+            outcome = (False, "GOSemSim does not appear to be installed in this R environment.")
+        else:
+            outcome = (False, f"Could not determine GOSemSim availability from Rscript's output: {output.strip()[:300]!r}")
+    except subprocess.TimeoutExpired:
+        outcome = (False, "Timed out while checking GOSemSim availability.")
+    except OSError as e:
+        outcome = (False, f"Error while checking GOSemSim availability: {e}")
+
+    _gosemsim_availability_cache["result"] = outcome
+    return outcome
+
+
+def verify_gosemsim_functional(orgdb_package, go_ontology="BP", timeout=180):
+    if not clusterprofiler_tools_available():
+        return False, "Rscript was not found on this system, so this check could not be run."
+
+    script = f'''
+suppressMessages(library(clusterProfiler))
+suppressMessages(library({orgdb_package}))
+tryCatch({{
+  suppressMessages(library(GOSemSim))
+  toy_universe <- AnnotationDbi::keys({orgdb_package}, keytype = "ENTREZID")
+  toy_genes <- head(toy_universe, 50)
+  toy_result <- suppressMessages(enrichGO(
+    gene = toy_genes, universe = toy_universe, OrgDb = {orgdb_package},
+    keyType = "ENTREZID", ont = "{go_ontology}",
+    pvalueCutoff = 1, qvalueCutoff = 1
+  ))
+  if (!is.null(toy_result) && nrow(as.data.frame(toy_result)) > 1) {{
+    invisible(clusterProfiler::simplify(toy_result, cutoff = 0.7, by = "p.adjust", select_fun = min))
+    cat("FUNCTIONAL\\n")
+  }} else {{
+    cat("INCONCLUSIVE: the toy gene list did not produce enough enriched terms to meaningfully test simplify() in this environment.\\n")
+  }}
+}}, error = function(e) {{
+  cat(paste0("NOT_FUNCTIONAL: ", conditionMessage(e)), "\\n")
+}})
+'''
+    try:
+        proc = subprocess.run(["Rscript", "-e", script], capture_output=True, text=True, timeout=timeout)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        if "FUNCTIONAL" in output and "NOT_FUNCTIONAL" not in output:
+            return True, "GOSemSim successfully simplified a live test result for this organism/ontology."
+        if "INCONCLUSIVE" in output:
+            detail_match = re.search(r"INCONCLUSIVE: (.*)", output)
+            detail = detail_match.group(1) if detail_match else output.strip()[:500]
+            return False, f"Inconclusive: {detail}"
+        detail_match = re.search(r"NOT_FUNCTIONAL: (.*)", output)
+        detail = detail_match.group(1) if detail_match else output.strip()[:500]
+        return False, f"GOSemSim failed a live functional test: {detail}"
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"Functional check timed out after {timeout}s -- this can happen on "
+            "the very first check while GOSemSim builds/caches its semantic "
+            "similarity data for this organism. Trying again may be faster."
+        )
+    except OSError as e:
+        return False, f"Error while running functional check: {e}"
+
+
+def _direction_from_result_var(result_var):
+    if result_var is None:
+        return None
+    if result_var.endswith("_up"):
+        return "up"
+    if result_var.endswith("_down"):
+        return "down"
+    return None
+
+
+def parse_simplify_outcomes_from_log(log_text):
+    outcomes = []
+    for line in log_text.splitlines():
+        simplified_match = re.search(r"GO terms simplified for (go_result\w*): (\d+) -> (\d+) term", line)
+        if simplified_match:
+            result_var, n_before, n_after = simplified_match.groups()
+            outcomes.append({
+                "outcome": "simplified", "detail": line.strip(),
+                "direction": _direction_from_result_var(result_var),
+                "n_before": int(n_before), "n_after": int(n_after),
+            })
+            continue
+        if "Note: could not simplify GO results for " in line:
+            match = re.search(r"for (go_result\w*) \(GOSemSim", line)
+            result_var = match.group(1) if match else None
+            outcomes.append({
+                "outcome": "fallback", "detail": line.strip(),
+                "direction": _direction_from_result_var(result_var),
+                "n_before": None, "n_after": None,
+            })
+    return outcomes
+
+
+def save_simplify_status(output_dir, outcomes):
+    path = os.path.join(output_dir, "simplify_status.json")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(outcomes, f, indent=2)
+
+
+def load_simplify_status(output_dir):
+    path = os.path.join(output_dir, "simplify_status.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _build_semdata_setup_snippet(orgdb_package, go_ontology, measure, semdata_var):
     """
-    Build the (possibly empty) R snippet that calls
-    clusterProfiler::simplify() on result_var, IF simplify_go is True
-    AND go_ontology is a single sub-ontology (not "ALL" -- see module
-    docstring). Wrapped in tryCatch so a missing GOSemSim package
-    degrades gracefully (analysis still completes using the
-    un-simplified result) rather than hard-failing.
+    Build the R snippet that prepares the ONE shared GOSemSim semData
+    object a script run's simplify() call(s) will use, assigned to
+    semdata_var (e.g. ".simplify_semdata") -- built ONCE per script run
+    (not once per direction block), since up/down-split ORA runs
+    otherwise would have redundantly rebuilt this twice.
+
+    "Wang" does not need Information Content (IC) statistics at all, so
+    it's built with computeIC = FALSE (materially faster); the other
+    four measures (Resnik/Lin/Rel/Jiang) require computeIC = TRUE.
+
+    Wrapped in tryCatch so a missing/broken GOSemSim install degrades
+    to semdata_var being NULL, rather than aborting the whole script --
+    _build_simplify_snippet's own tryCatch below then reports this
+    (via its existing "Note: could not simplify..." fallback message)
+    without affecting any other database/direction block.
+    """
+    needs_ic = "TRUE" if measure in IC_BASED_SIMILARITY_MEASURES else "FALSE"
+    return f'''
+{semdata_var} <- tryCatch({{
+  suppressMessages(library(GOSemSim))
+  GOSemSim::godata("{orgdb_package}", ont = "{go_ontology}", computeIC = {needs_ic})
+}}, error = function(e) {{
+  cat(paste("Note: could not prepare GOSemSim data for simplify() (measure={measure}) --", conditionMessage(e)), "\\n")
+  NULL
+}})
+'''
+
+
+def _build_simplify_snippet(result_var, go_ontology, simplify_go, simplify_cutoff,
+                             measure=DEFAULT_SIMPLIFY_MEASURE, semdata_var=".simplify_semdata"):
+    """
+    measure: one of SEMANTIC_SIMILARITY_MEASURES ("Resnik", "Lin", "Rel",
+        "Jiang", "Wang") -- passed straight through to
+        clusterProfiler::simplify()'s own measure= argument. Explicitly
+        pinned rather than left to simplify()'s own (version-dependent)
+        default -- see DEFAULT_SIMPLIFY_MEASURE's comment above.
+    semdata_var: name of the R variable holding the shared semData
+        object built once per script run by _build_semdata_setup_snippet
+        -- reused across every simplify() call in this run rather than
+        rebuilt per direction/database block.
     """
     if not (simplify_go and simplify_available_for_ontology(go_ontology)):
         return ""
     return f'''
 if (!is.null({result_var}) && nrow(as.data.frame({result_var})) > 0) {{
   tryCatch({{
-    suppressMessages(library(GOSemSim))
-    {result_var} <- clusterProfiler::simplify({result_var}, cutoff = {simplify_cutoff}, by = "p.adjust", select_fun = min)
-    cat(paste("GO terms simplified (redundancy removed): now", nrow(as.data.frame({result_var})), "term(s)"), "\\n")
+    if (is.null({semdata_var})) stop("GOSemSim semantic data is not available for measure '{measure}' (see earlier note).")
+    n_before_simplify <- nrow(as.data.frame({result_var}))
+    {result_var} <- clusterProfiler::simplify({result_var}, cutoff = {simplify_cutoff}, by = "p.adjust", select_fun = min, measure = "{measure}", semData = {semdata_var})
+    n_after_simplify <- nrow(as.data.frame({result_var}))
+    cat(paste("GO terms simplified for {result_var}:", n_before_simplify, "->", n_after_simplify, "term(s)"), "\\n")
   }}, error = function(e) {{
-    cat(paste("Note: could not simplify GO results (GOSemSim may not be installed) --", conditionMessage(e)), "\\n")
+    cat(paste("Note: could not simplify GO results for {result_var} (GOSemSim may not be installed) --", conditionMessage(e)), "\\n")
   }})
 }}
 '''
 
 
 def _wrap_with_direction_guard(body, gene_var, out_name, database_label):
-    """
-    Wrap a per-database R block in a `if (length(gene_var) >= 1) {...}
-    else {...}` guard -- used for split-direction ORA, where one
-    direction (up or down) genuinely having zero significant genes at
-    the chosen threshold is an EXPECTED, non-fatal outcome for that one
-    database/direction combination specifically, and should not abort
-    any other direction or database's analysis (unlike combined mode,
-    where zero total significant genes is treated as a fatal,
-    top-level stop() -- see the top-level guard in
-    build_ora_r_script's script template).
-    """
     return f'''
 if (length({gene_var}) >= 1) {{
 {body}
@@ -196,8 +495,12 @@ if (length({gene_var}) >= 1) {{
 
 
 def _build_go_ora_block(result_var, gene_var, out_name, orgdb_package, go_ontology,
-                         min_gs_size, max_gs_size, simplify_go, simplify_cutoff, guarded):
-    simplify_snippet = _build_simplify_snippet(result_var, go_ontology, simplify_go, simplify_cutoff)
+                         min_gs_size, max_gs_size, simplify_go, simplify_cutoff, guarded,
+                         simplify_measure=DEFAULT_SIMPLIFY_MEASURE, semdata_var=".simplify_semdata"):
+    simplify_snippet = _build_simplify_snippet(
+        result_var, go_ontology, simplify_go, simplify_cutoff,
+        measure=simplify_measure, semdata_var=semdata_var,
+    )
     body = f'''
 {result_var} <- enrichGO(
   gene = {gene_var}, universe = universe, OrgDb = {orgdb_package},
@@ -239,10 +542,6 @@ write_result({result_var}, "{out_name}")
     return _wrap_with_direction_guard(body, gene_var, out_name, "Reactome") if guarded else body
 
 
-# ---------------------------------------------------------------------------
-# R script: ORA (enrichGO / enrichKEGG / enrichPathway)
-# ---------------------------------------------------------------------------
-
 _R_ORA_SCRIPT_TEMPLATE = r'''
 suppressMessages(library(clusterProfiler))
 suppressMessages(library({orgdb_package}))
@@ -270,6 +569,8 @@ df <- df[!duplicated(df$ENTREZID), ]
 universe <- unique(df$ENTREZID)
 
 {gene_list_block}
+
+{semdata_setup_block}
 
 write_result <- function(result_obj, out_name) {{
   if (is.null(result_obj) || nrow(as.data.frame(result_obj)) == 0) {{
@@ -310,28 +611,13 @@ def build_ora_r_script(orgdb_package, from_type, padj_threshold, lfc_threshold,
                         run_reactome, reactome_organism,
                         min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE,
                         simplify_go=False, simplify_cutoff=DEFAULT_SIMPLIFY_CUTOFF,
+                        simplify_measure=DEFAULT_SIMPLIFY_MEASURE,
                         split_by_direction=True):
     """
-    Build the complete R script text for an ORA run across whichever
-    of GO/KEGG/Reactome are requested.
-
-    split_by_direction: if True (the DEFAULT, and the statistically
-        recommended choice -- see module docstring), runs each enabled
-        database's enrichment TWICE: once against only the
-        up-regulated significant genes, once against only the
-        down-regulated significant genes, writing two separate result
-        files per database (e.g. "ora_GO_up.csv"/"ora_GO_down.csv").
-        Each direction/database combination is independently guarded --
-        a direction with zero significant genes for a given database is
-        cleanly skipped (logged, not fatal) without affecting any other
-        direction or database.
-
-        If False, reproduces the ORIGINAL combined behavior: one
-        mixed-direction significant-gene list, one result file per
-        database with no suffix (e.g. "ora_GO.csv") -- offered as an
-        explicit, non-default option for anyone who specifically wants
-        this or needs to compare directly against a combined-list
-        result.
+    simplify_measure: one of SEMANTIC_SIMILARITY_MEASURES ("Resnik",
+        "Lin", "Rel", "Jiang", "Wang") -- see _build_simplify_snippet's
+        docstring. Only relevant when simplify_go=True and run_go=True
+        and go_ontology is a single sub-ontology.
     """
     reactome_library_line = "suppressMessages(library(ReactomePA))" if run_reactome else ""
 
@@ -341,6 +627,17 @@ def build_ora_r_script(orgdb_package, from_type, padj_threshold, lfc_threshold,
     else:
         gene_list_block = _GENE_LIST_BLOCK_COMBINED.format(padj_threshold=padj_threshold, lfc_threshold=lfc_threshold)
         direction_specs = [(None, "sig_genes")]
+
+    # Build the shared semData object ONCE for the whole script run
+    # (reused by every direction block's simplify() call below) rather
+    # than once per direction -- see _build_semdata_setup_snippet's
+    # docstring. Only needed at all when GO + simplify are both active.
+    semdata_var = ".simplify_semdata"
+    needs_simplify_setup = run_go and simplify_go and simplify_available_for_ontology(go_ontology)
+    semdata_setup_block = (
+        _build_semdata_setup_snippet(orgdb_package, go_ontology, simplify_measure, semdata_var)
+        if needs_simplify_setup else ""
+    )
 
     run_blocks_parts = []
     for direction, gene_var in direction_specs:
@@ -353,6 +650,7 @@ def build_ora_r_script(orgdb_package, from_type, padj_threshold, lfc_threshold,
             run_blocks_parts.append(_build_go_ora_block(
                 result_var, gene_var, out_name, orgdb_package, go_ontology,
                 min_gs_size, max_gs_size, simplify_go, simplify_cutoff, guarded,
+                simplify_measure=simplify_measure, semdata_var=semdata_var,
             ))
         if run_kegg:
             result_var = f"kegg_result{suffix}"
@@ -370,22 +668,10 @@ def build_ora_r_script(orgdb_package, from_type, padj_threshold, lfc_threshold,
     return _R_ORA_SCRIPT_TEMPLATE.format(
         orgdb_package=orgdb_package, reactome_library_line=reactome_library_line,
         from_type=from_type, gene_list_block=gene_list_block,
+        semdata_setup_block=semdata_setup_block,
         run_blocks="\n".join(run_blocks_parts),
     )
 
-
-# ---------------------------------------------------------------------------
-# R script: GSEA (gseGO / gseKEGG / gsePathway)
-# ---------------------------------------------------------------------------
-#
-# GSEA does NOT need up/down direction splitting the way ORA does: its
-# entire method is built around a single, full ranking of every tested
-# gene (most up-regulated to most down-regulated), and a gene set's
-# Normalized Enrichment Score (NES) sign already directly tells you
-# whether that set skews up (positive NES) or down (negative NES) --
-# there's no equivalent "mixed-direction gene list" ambiguity to
-# correct for here, since NO gene list is ever constructed in the first
-# place; the whole ranked list is used as-is.
 
 _R_GSEA_SCRIPT_TEMPLATE = r'''
 suppressMessages(library(clusterProfiler))
@@ -416,6 +702,8 @@ names(gene_list) <- df$ENTREZID
 gene_list <- sort(gene_list, decreasing = TRUE)
 
 cat(paste("Ranked gene list size:", length(gene_list)), "\n")
+
+{semdata_setup_block}
 
 write_gsea_result <- function(result_obj, out_name) {{
   if (is.null(result_obj) || nrow(as.data.frame(result_obj)) == 0) {{
@@ -483,10 +771,21 @@ write_gsea_result(reactome_result, "gsea_Reactome")
 def build_gsea_r_script(orgdb_package, from_type, run_go, go_ontology,
                          run_kegg, kegg_organism, run_reactome, reactome_organism,
                          min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE,
-                         simplify_go=False, simplify_cutoff=DEFAULT_SIMPLIFY_CUTOFF):
+                         simplify_go=False, simplify_cutoff=DEFAULT_SIMPLIFY_CUTOFF,
+                         simplify_measure=DEFAULT_SIMPLIFY_MEASURE):
     reactome_library_line = "suppressMessages(library(ReactomePA))" if run_reactome else ""
 
-    simplify_block = _build_simplify_snippet("go_result", go_ontology, simplify_go, simplify_cutoff)
+    semdata_var = ".simplify_semdata"
+    needs_simplify_setup = run_go and simplify_go and simplify_available_for_ontology(go_ontology)
+    semdata_setup_block = (
+        _build_semdata_setup_snippet(orgdb_package, go_ontology, simplify_measure, semdata_var)
+        if needs_simplify_setup else ""
+    )
+
+    simplify_block = _build_simplify_snippet(
+        "go_result", go_ontology, simplify_go, simplify_cutoff,
+        measure=simplify_measure, semdata_var=semdata_var,
+    )
 
     run_go_block = _R_GSEA_GO_BLOCK.format(
         orgdb_package=orgdb_package, go_ontology=go_ontology,
@@ -504,22 +803,11 @@ def build_gsea_r_script(orgdb_package, from_type, run_go, go_ontology,
 
     return _R_GSEA_SCRIPT_TEMPLATE.format(
         orgdb_package=orgdb_package, reactome_library_line=reactome_library_line,
-        from_type=from_type, run_go_block=run_go_block, run_kegg_block=run_kegg_block,
+        from_type=from_type, semdata_setup_block=semdata_setup_block,
+        run_go_block=run_go_block, run_kegg_block=run_kegg_block,
         run_reactome_block=run_reactome_block,
     )
 
-
-# ---------------------------------------------------------------------------
-# R script: compareCluster (ORA across multiple contrasts/gene lists at once)
-# ---------------------------------------------------------------------------
-#
-# Note: compareCluster's result object is not compatible with
-# clusterProfiler::simplify(), and direction-splitting is NOT offered
-# here either (out of scope for this pass -- the user's request was
-# specifically about ORA; compareCluster's cross-contrast comparison
-# use case is different enough that mixing in a direction axis too
-# would substantially complicate the comparison view without being
-# explicitly requested).
 
 _R_COMPARE_CLUSTER_SCRIPT_TEMPLATE = r'''
 suppressMessages(library(clusterProfiler))
@@ -640,10 +928,6 @@ def build_compare_cluster_r_script(orgdb_package, from_type, padj_threshold, lfc
     )
 
 
-# ---------------------------------------------------------------------------
-# Subprocess execution
-# ---------------------------------------------------------------------------
-
 def _run_r_script(script_text, script_path, r_args, timeout=1800):
     os.makedirs(os.path.dirname(script_path), exist_ok=True)
     with open(script_path, "w") as f:
@@ -664,14 +948,15 @@ def run_ora_analysis(input_csv_path, output_dir, work_dir, orgdb_package, from_t
                       run_kegg, kegg_organism, run_reactome, reactome_organism,
                       min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE,
                       simplify_go=False, simplify_cutoff=DEFAULT_SIMPLIFY_CUTOFF,
+                      simplify_measure=DEFAULT_SIMPLIFY_MEASURE,
                       split_by_direction=True):
-    "Run an ORA analysis (enrichGO/enrichKEGG/enrichPathway) for one contrast. Returns (success, log)."
     os.makedirs(output_dir, exist_ok=True)
     script_text = build_ora_r_script(
         orgdb_package, from_type, padj_threshold, lfc_threshold,
         run_go, go_ontology, run_kegg, kegg_organism, run_reactome, reactome_organism,
         min_gs_size=min_gs_size, max_gs_size=max_gs_size,
         simplify_go=simplify_go, simplify_cutoff=simplify_cutoff,
+        simplify_measure=simplify_measure,
         split_by_direction=split_by_direction,
     )
     script_path = os.path.join(work_dir, "run_ora.R")
@@ -682,13 +967,15 @@ def run_gsea_analysis(input_csv_path, output_dir, work_dir, orgdb_package, from_
                        run_go, go_ontology, run_kegg, kegg_organism,
                        run_reactome, reactome_organism,
                        min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE,
-                       simplify_go=False, simplify_cutoff=DEFAULT_SIMPLIFY_CUTOFF):
+                       simplify_go=False, simplify_cutoff=DEFAULT_SIMPLIFY_CUTOFF,
+                       simplify_measure=DEFAULT_SIMPLIFY_MEASURE):
     os.makedirs(output_dir, exist_ok=True)
     script_text = build_gsea_r_script(
         orgdb_package, from_type, run_go, go_ontology, run_kegg, kegg_organism,
         run_reactome, reactome_organism,
         min_gs_size=min_gs_size, max_gs_size=max_gs_size,
         simplify_go=simplify_go, simplify_cutoff=simplify_cutoff,
+        simplify_measure=simplify_measure,
     )
     script_path = os.path.join(work_dir, "run_gsea.R")
     return _run_r_script(script_text, script_path, [input_csv_path, output_dir])
@@ -717,18 +1004,7 @@ def run_compare_cluster_analysis(contrast_input_paths, output_dir, work_dir, org
     return _run_r_script(script_text, script_path, [manifest_path, output_dir])
 
 
-# ---------------------------------------------------------------------------
-# Reading results back into Python
-# ---------------------------------------------------------------------------
-
 def _result_file_path(output_dir, analysis_type, database, direction=None):
-    """
-    direction: None (legacy/combined-mode filename, no suffix -- e.g.
-        "ora_GO.csv") or "up"/"down" (split-mode filenames -- e.g.
-        "ora_GO_up.csv"/"ora_GO_down.csv"). Only meaningful for
-        analysis_type == "ora"; GSEA and compareCluster never use a
-        direction suffix.
-    """
     suffix = f"_{direction}" if direction else ""
     return os.path.join(output_dir, f"{analysis_type}_{database}{suffix}.csv")
 
@@ -738,16 +1014,6 @@ def enrichment_result_exists(output_dir, analysis_type, database, direction=None
 
 
 def available_ora_directions(output_dir, database):
-    """
-    For a given database, return the list of ORA direction(s) that
-    actually have a saved result file in output_dir -- some subset of
-    ["up", "down", "combined"], in that fixed order. Used by the UI to
-    detect whether a given ORA run used split-by-direction mode (up/
-    down present) or the legacy combined mode (only "combined" present)
-    -- or, in principle, both if a project's history includes runs from
-    both modes at different times (each mode's files coexist safely on
-    disk since they use different filenames).
-    """
     available = []
     for direction in ("up", "down"):
         if enrichment_result_exists(output_dir, "ora", database, direction=direction):
@@ -785,28 +1051,14 @@ def read_gsea_running_score(output_dir, database, gene_set_id):
 
 
 def list_available_databases(output_dir, analysis_type):
-    "For GSEA/compareCluster (no direction concept). For ORA, prefer available_ora_directions per-database instead."
     return [db for db in DATABASE_OPTIONS if enrichment_result_exists(output_dir, analysis_type, db)]
 
 
 def list_available_ora_databases(output_dir):
-    "Return databases with AT LEAST ONE ora result (any direction: up, down, or combined)."
     return [db for db in DATABASE_OPTIONS if available_ora_directions(output_dir, db)]
 
 
-# ---------------------------------------------------------------------------
-# Combining results across GO/KEGG/Reactome for a single combined plot
-# ---------------------------------------------------------------------------
-
 def build_combined_results(output_dir, analysis_type, databases, n_top_per_db=10, direction=None):
-    """
-    direction: for ORA results specifically, which direction's file to
-        read for each database ("up", "down", "combined", or None --
-        None falls back to whatever enrichment_result_exists/
-        read_enrichment_result's own default resolves to, i.e. the
-        legacy no-suffix filename, which is correct for GSEA/
-        compareCluster or legacy-combined-mode ORA).
-    """
     read_direction = None if direction == "combined" else direction
     frames = []
     for db in databases:
@@ -823,26 +1075,6 @@ def build_combined_results(output_dir, analysis_type, databases, n_top_per_db=10
 
 
 def derive_category_column(df):
-    """
-    Add a "Category" column to a combined-results DataFrame (see
-    build_combined_results), used to drive the combined view's
-    background-shading-by-category feature (see
-    ontology_workspace.py's _plot_combined_multi_database).
-
-    Rather than lumping every GO row together under the generic label
-    "GO", this uses clusterProfiler's own "ONTOLOGY" column (present
-    on any GO result -- populated with "BP"/"MF"/"CC" per row,
-    regardless of whether the original query used a single sub-
-    ontology or ont="ALL") when available, so the combined view can
-    show BP/MF/CC as genuinely distinct categories, exactly as the user
-    would see them if they'd run each sub-ontology separately -- this
-    is strictly MORE informative than a flat "GO" bucket, whether or
-    not "All three" was actually selected. Non-GO rows (KEGG, Reactome)
-    simply keep their existing "Database" value as their category,
-    since KEGG/Reactome pathways have no equivalent sub-division.
-
-    Returns a NEW DataFrame (does not modify df in place).
-    """
     result = df.copy()
     if "ONTOLOGY" in result.columns:
         result["Category"] = result["ONTOLOGY"].fillna(result["Database"])
@@ -851,18 +1083,131 @@ def derive_category_column(df):
     return result
 
 
-# ---------------------------------------------------------------------------
-# Term-similarity network (for the enrichment map / "emapplot"-style plot)
-# ---------------------------------------------------------------------------
-
 def _parse_gene_id_list(gene_id_str, sep="/"):
     if pd.isna(gene_id_str) or not str(gene_id_str).strip():
         return set()
     return set(str(gene_id_str).split(sep))
 
 
+# ---------------------------------------------------------------------------
+# GOSemSim-based term similarity (for the enrichment map, as an alternative
+# to the gene-overlap/Jaccard similarity computed natively in Python below)
+# ---------------------------------------------------------------------------
+#
+# In-memory cache (lives for the Streamlit process's lifetime, same pattern
+# as _gosemsim_availability_cache above) keyed on the exact term list +
+# organism/ontology/measure combination -- avoids re-spawning an R
+# subprocess on every UI rerun (e.g. a user only tweaking a plot's color
+# scale, not its term list or similarity method) for what would otherwise
+# be an identical, expensive recomputation. A failed computation (None) is
+# NOT cached, so a transient error (or installing GOSemSim mid-session)
+# doesn't get "stuck" without a retry.
+_semantic_similarity_cache = {}
+
+_R_SEMANTIC_SIMILARITY_SCRIPT_TEMPLATE = r'''
+suppressMessages(library(GOSemSim))
+
+args <- commandArgs(trailingOnly = TRUE)
+term_ids_path <- args[1]
+output_path <- args[2]
+
+term_ids <- readLines(term_ids_path)
+
+semData <- {godata_call}
+
+sim_matrix <- GOSemSim::mgoSim(term_ids, term_ids, semData = semData, measure = "{measure}", combine = NULL)
+
+write.csv(sim_matrix, output_path, row.names = TRUE)
+cat("Semantic similarity matrix computed.\n")
+'''
+
+
+def compute_go_semantic_similarity_matrix(term_ids, orgdb_package, go_ontology,
+                                           measure="Wang", work_dir=None, timeout=300,
+                                           use_cache=True):
+    """
+    Compute a full pairwise GOSemSim similarity matrix for term_ids (GO
+    IDs, e.g. "GO:0006955") via a live Rscript call to
+    GOSemSim::mgoSim(), for use as an ALTERNATIVE to this workspace's
+    default gene-overlap/Jaccard term similarity (see
+    build_term_similarity_network below).
+
+    measure: one of SEMANTIC_SIMILARITY_MEASURES ("Resnik", "Lin",
+        "Rel", "Jiang", "Wang") -- NOT "JC", which is the gene-overlap
+        measure computed natively in Python and has no GOSemSim
+        equivalent to call out to here.
+
+    Only meaningful for GO term IDs specifically -- unlike gene-overlap
+    similarity (which works for any database's terms, since it only
+    needs each term's member gene list), these measures rely on GO's
+    own graph structure/annotation statistics, so KEGG/Reactome term
+    IDs cannot be passed here.
+
+    Returns a pandas DataFrame (term_ids x term_ids) of pairwise
+    similarity scores, or None if the computation failed for any
+    reason (Rscript missing, GOSemSim not installed, timeout, etc.) --
+    callers should treat None as "fall back to gene-overlap (JC)
+    similarity instead" rather than a hard error, consistent with this
+    module's general graceful-degradation philosophy for GOSemSim-
+    dependent features (see check_gosemsim_available's docstring).
+    """
+    if not term_ids or not clusterprofiler_tools_available():
+        return None
+
+    cache_key = (tuple(sorted(term_ids)), orgdb_package, go_ontology, measure)
+    if use_cache and cache_key in _semantic_similarity_cache:
+        return _semantic_similarity_cache[cache_key]
+
+    work_dir = work_dir or os.path.join(os.getcwd(), ".ontology_semsim_tmp")
+    os.makedirs(work_dir, exist_ok=True)
+    term_ids_path = os.path.join(work_dir, "term_ids.txt")
+    output_path = os.path.join(work_dir, "sim_matrix.csv")
+    with open(term_ids_path, "w") as f:
+        f.write("\n".join(term_ids))
+
+    needs_ic = "TRUE" if measure in IC_BASED_SIMILARITY_MEASURES else "FALSE"
+    godata_call = f'GOSemSim::godata("{orgdb_package}", ont = "{go_ontology}", computeIC = {needs_ic})'
+    script_text = _R_SEMANTIC_SIMILARITY_SCRIPT_TEMPLATE.format(measure=measure, godata_call=godata_call)
+    script_path = os.path.join(work_dir, "compute_semantic_similarity.R")
+
+    success, _log = _run_r_script(script_text, script_path, [term_ids_path, output_path], timeout=timeout)
+    if not success or not os.path.exists(output_path):
+        return None
+
+    try:
+        sim_df = pd.read_csv(output_path, index_col=0)
+        sim_df.index = sim_df.index.astype(str)
+        sim_df.columns = sim_df.columns.astype(str)
+    except Exception:
+        return None
+
+    if use_cache:
+        _semantic_similarity_cache[cache_key] = sim_df
+    return sim_df
+
+
 def build_term_similarity_network(result_df, n_top=30, similarity_threshold=0.2,
-                                   gene_id_column="geneID"):
+                                   gene_id_column="geneID", similarity_method="JC",
+                                   orgdb_package=None, go_ontology=None):
+    """
+    similarity_method: "JC" (DEFAULT -- gene-overlap/Jaccard, computed
+        directly in Python from each term's member gene list; this is
+        this workspace's original, unchanged behavior, and the only
+        option that works for GO, KEGG, AND Reactome results alike) or
+        one of SEMANTIC_SIMILARITY_MEASURES ("Resnik", "Lin", "Rel",
+        "Jiang", "Wang") -- these use GO's own graph structure/
+        annotation statistics INSTEAD of gene overlap, via a live
+        GOSemSim call (compute_go_semantic_similarity_matrix), and
+        therefore ONLY apply to GO results. Callers MUST pass
+        orgdb_package and go_ontology when using one of these five.
+
+    If a GOSemSim-based computation is requested but fails for any
+    reason (not installed, R error, timeout), this function gracefully
+    falls back to the same gene-overlap/Jaccard similarity "JC" would
+    have produced, rather than returning an empty network -- consistent
+    with this module's GOSemSim graceful-degradation philosophy
+    elsewhere (see check_gosemsim_available's docstring).
+    """
     if result_df is None or result_df.empty:
         return pd.DataFrame(), pd.DataFrame(columns=["source", "target", "weight"])
 
@@ -875,6 +1220,30 @@ def build_term_similarity_network(result_df, n_top=30, similarity_threshold=0.2,
     nodes_df = df[[c for c in nodes_cols if c in df.columns]].copy()
     if count_col and count_col != "Count":
         nodes_df = nodes_df.rename(columns={count_col: "Count"})
+
+    term_ids = df["ID"].tolist()
+
+    if similarity_method != "JC" and similarity_method in SEMANTIC_SIMILARITY_MEASURES:
+        if not (orgdb_package and go_ontology):
+            raise ValueError(
+                f"similarity_method='{similarity_method}' requires orgdb_package and "
+                "go_ontology (GOSemSim measures only apply to GO results)."
+            )
+        sim_matrix = compute_go_semantic_similarity_matrix(term_ids, orgdb_package, go_ontology, measure=similarity_method)
+        if sim_matrix is not None:
+            edges = []
+            for id_a, id_b in itertools.combinations(term_ids, 2):
+                try:
+                    score = float(sim_matrix.loc[id_a, id_b])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if pd.notna(score) and score >= similarity_threshold:
+                    edges.append({"source": id_a, "target": id_b, "weight": score})
+            edges_df = pd.DataFrame(edges, columns=["source", "target", "weight"])
+            return nodes_df, edges_df
+        # else: fall through to gene-overlap (JC) below -- GOSemSim
+        # computation failed/unavailable, degrade gracefully rather
+        # than returning an empty network.
 
     gene_sets = {row["ID"]: _parse_gene_id_list(row.get(gene_id_column, "")) for _, row in df.iterrows()}
 
@@ -892,10 +1261,6 @@ def build_term_similarity_network(result_df, n_top=30, similarity_threshold=0.2,
     edges_df = pd.DataFrame(edges, columns=["source", "target", "weight"])
     return nodes_df, edges_df
 
-
-# ---------------------------------------------------------------------------
-# Gene-concept network (for the "cnetplot"-style plot)
-# ---------------------------------------------------------------------------
 
 def build_gene_concept_network(result_df, gene_fc_map=None, n_top=10, gene_id_column="geneID"):
     if result_df is None or result_df.empty:
@@ -929,10 +1294,6 @@ def build_gene_concept_network(result_df, gene_fc_map=None, n_top=10, gene_id_co
     return term_nodes_df, gene_nodes_df, edges_df
 
 
-# ---------------------------------------------------------------------------
-# UpSet plot data (term/gene-set intersection sizes)
-# ---------------------------------------------------------------------------
-
 def build_upset_data(result_df, n_top=10, gene_id_column="geneID"):
     if result_df is None or result_df.empty:
         return pd.DataFrame(columns=["combination", "size", "term_ids"])
@@ -963,10 +1324,6 @@ def build_upset_data(result_df, n_top=10, gene_id_column="geneID"):
         return pd.DataFrame(columns=["combination", "size", "term_ids"])
     return result.sort_values("size", ascending=False).reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
-# Ridge plot data (GSEA rank-metric distribution per gene set)
-# ---------------------------------------------------------------------------
 
 def build_ridge_plot_data(output_dir, database, result_df, n_top=10):
     if result_df is None or result_df.empty:

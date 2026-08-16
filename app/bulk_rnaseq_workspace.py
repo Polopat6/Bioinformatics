@@ -18,10 +18,6 @@ Transcriptomics workspace (spatial_workspace.py).
 """
 
 import os
-import re
-import shutil
-import subprocess
-import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -29,75 +25,15 @@ import streamlit as st
 import project_manager as pm
 import sra_manager as sra
 import file_browser as fb
+import fastqc_manager as fastqc
+import ingestion_manager as ingest
 
-# Plain-language explanations for each FastQC module, shown when a sample
-# gets a WARN or FAIL for that module. Written for someone with little to
-# no bioinformatics background — explains what it means and what (if
-# anything) to do about it.
-FASTQC_MODULE_GUIDANCE = {
-    "Per base sequence quality": (
-        "Some positions in the reads have lower confidence scores. A dip "
-        "at the very end of reads is common and usually fine. If quality "
-        "is poor across most of the read, consider trimming low-quality "
-        "ends before alignment (e.g. with fastp or Trimmomatic)."
-    ),
-    "Per tile sequence quality": (
-        "Quality varied across the physical sequencer flowcell. This "
-        "usually points to a technical issue during sequencing rather "
-        "than something wrong with your sample."
-    ),
-    "Per sequence quality scores": (
-        "A portion of reads have low overall quality. These reads may "
-        "contribute noise to downstream analysis; a trimming/filtering "
-        "step can remove them."
-    ),
-    "Per base sequence content": (
-        "The proportion of A/T/G/C is uneven at certain read positions. "
-        "This is expected and normal for RNA-seq (especially at the start "
-        "of reads) and usually isn't a concern on its own."
-    ),
-    "Per sequence GC content": (
-        "The GC content distribution looks different than expected. This "
-        "can indicate contamination from another organism, or is simply "
-        "normal variation depending on your species/library type."
-    ),
-    "Per base N content": (
-        "Some positions have a high number of unresolved bases (N). A "
-        "small amount is normal; a large amount can indicate a sequencing "
-        "problem."
-    ),
-    "Sequence Length Distribution": (
-        "Reads vary in length. This is expected if adapter trimming was "
-        "already done upstream, and typically isn't a concern."
-    ),
-    "Sequence Duplication Levels": (
-        "A high proportion of duplicate reads was detected. Some "
-        "duplication is normal in RNA-seq (highly expressed genes "
-        "naturally produce many identical reads), so this is less "
-        "concerning than it would be for DNA sequencing."
-    ),
-    "Overrepresented sequences": (
-        "Some exact sequences appear far more often than expected. This "
-        "can be normal (highly expressed transcripts) or can indicate "
-        "leftover adapter sequences or contamination — worth a quick look "
-        "at the full report."
-    ),
-    "Adapter Content": (
-        "Leftover sequencing adapter fragments were detected in the "
-        "reads. It's recommended to trim adapters (e.g. with fastp or "
-        "Trimmomatic) before proceeding to alignment, as adapters can "
-        "interfere with accurate mapping."
-    ),
-}
+# Note: FASTQ_BROWSE_EXTENSIONS now lives in ingestion_manager.py
+# (accessed here as ingest.FASTQ_BROWSE_EXTENSIONS) since it's core
+# domain knowledge shared with the non-interactive ingestion pipeline,
+# not just a UI-rendering detail.
 
-# Extensions the server-side directory browser previews/matches against
-# when looking for FASTQ files -- includes the leading "." since
-# file_browser.py's extension filtering matches directly against
-# os.path.splitext-style suffixes (unlike st.file_uploader's `type`
-# argument, which expects no leading dot).
-FASTQ_BROWSE_EXTENSIONS = [".fastq", ".fastq.gz", ".fq", ".fq.gz"]
-
-# Same convention, for metadata files -- used by the metadata file
+# Extensions for metadata files -- used by the metadata file
 # browser option added alongside manual upload (see
 # _render_metadata_file_input below).
 METADATA_BROWSE_EXTENSIONS = [".csv", ".txt", ".xlsx", ".xls"]
@@ -124,42 +60,6 @@ def _build_example_metadata_xlsx():
     return buffer.getvalue()
 
 
-def _read_metadata_file(file_or_path):
-    """
-    Read a metadata file into a DataFrame, supporting both CSV
-    (.csv/.txt) and Excel (.xlsx/.xls) formats since users without a
-    bioinformatics background often work in Excel rather than plain text.
-
-    file_or_path: either a Streamlit UploadedFile object (from
-        st.file_uploader) OR a plain string path to an existing file on
-        disk (e.g. one selected via the server-side file browser, see
-        _render_metadata_file_input) -- pandas' read_csv/read_excel both
-        accept either a file-like object or a path string transparently,
-        so no special-casing is needed here beyond checking the
-        filename to decide CSV vs. Excel parsing.
-
-    Returns (dataframe_or_none, error_message_or_none). If reading fails,
-    a plain-language error message is returned instead of raising, so the
-    caller can show it directly in the UI.
-    """
-    filename = (
-        file_or_path.name if hasattr(file_or_path, "name") else os.path.basename(file_or_path)
-    ).lower()
-    try:
-        if filename.endswith((".xlsx", ".xls")):
-            # Reads the first sheet by default, which matches the guidance
-            # given to users in the help box above.
-            return pd.read_excel(file_or_path, sheet_name=0), None
-        else:
-            return pd.read_csv(file_or_path), None
-    except Exception as e:
-        return None, (
-            "⚠️ We couldn't read this file. Please double check that it's "
-            "a valid .csv or .xlsx file with your sample data on the first "
-            f"sheet/tab. (Technical detail: {e})"
-        )
-
-
 def _render_metadata_file_input():
     """
     Render the metadata file input point, offering a choice between
@@ -169,7 +69,7 @@ def _render_metadata_file_input():
     alignment_workspace.py's _render_reference_file_input for genome/GTF
     files, applied here to metadata spreadsheets.
 
-    Returns a value suitable for passing straight to _read_metadata_file:
+    Returns a value suitable for passing straight to ingest.read_metadata_file:
     either a Streamlit UploadedFile object (upload path) or a plain path
     string (browse path), or None if nothing has been provided this run.
     """
@@ -194,215 +94,6 @@ def _render_metadata_file_input():
         )
 
 
-def _validate_sample_pairs(filenames):
-    """
-    Group FASTQ filenames by sample name and detect R1/R2 mate pairs.
-    Supports multiple common naming conventions:
-      - Simple naming:      sample_R1.fastq.gz / sample_R2.fastq.gz
-      - Illumina-style:     sample_S1_L001_R1_001.fastq.gz
-      - SRA/EBI-style:      sample_1.fastq.gz / sample_2.fastq.gz
-
-    The "_1"/"_2" convention is only matched at the very end of the
-    filename (before the extension) to avoid false positives from sample
-    names that happen to contain a number, e.g. "Donor10.fastq.gz" is
-    correctly treated as single-end, not misread as a "_1" mate pair.
-
-    Takes a plain list of filename strings (not Streamlit UploadedFile
-    objects) so it can be used both for freshly uploaded files and for
-    files already sitting on disk from a previous session (including
-    files symlinked in via the server-side directory browser -- see
-    _symlink_fastq_files_from_directory).
-
-    Returns: { sample_name: {"R1": filename, "R2": filename} }
-             or { sample_name: {"SE": filename} } for single-end samples.
-    """
-    sample_pairs = {}
-    for name in filenames:
-        base = name.replace(".fastq.gz", "").replace(".fastq", "")
-
-        if "_R1" in base:
-            sample_name = base.split("_R1")[0]
-            sample_pairs.setdefault(sample_name, {})["R1"] = name
-        elif "_R2" in base:
-            sample_name = base.split("_R2")[0]
-            sample_pairs.setdefault(sample_name, {})["R2"] = name
-        elif re.search(r"_1$", base):
-            sample_name = base[: -len("_1")]
-            sample_pairs.setdefault(sample_name, {})["R1"] = name
-        elif re.search(r"_2$", base):
-            sample_name = base[: -len("_2")]
-            sample_pairs.setdefault(sample_name, {})["R2"] = name
-        else:
-            sample_pairs.setdefault(base, {})["SE"] = name
-
-    return sample_pairs
-
-
-def _list_existing_fastq(fastq_dir):
-    """
-    List FASTQ filenames already saved to disk for this project from a
-    previous session. Used so reopening a project shows previously
-    uploaded files instead of appearing empty.
-
-    Uses os.listdir + a plain name filter (not os.path.isfile), which
-    means this INTENTIONALLY also picks up symlinks to real FASTQ files
-    elsewhere on disk (e.g. ones created by the server-side "browse for
-    a directory of FASTQ files" option below) exactly the same as a
-    directly-uploaded, physically-copied file -- from this function's
-    (and every downstream consumer's) point of view, a valid symlink and
-    a real file are indistinguishable and equally usable.
-    """
-    if not os.path.isdir(fastq_dir):
-        return []
-    return sorted([
-        name for name in os.listdir(fastq_dir)
-        if name.endswith(".fastq") or name.endswith(".fastq.gz") or name.endswith(".gz")
-    ])
-
-
-def _save_uploaded_files(uploaded_files, fastq_dir):
-    """
-    Persist uploaded FASTQ files to disk inside the active project's
-    FASTQ folder. Streamlit's file_uploader only keeps files in memory;
-    downstream tools (FastQC, and eventually Nextflow) need real files
-    on disk.
-    """
-    os.makedirs(fastq_dir, exist_ok=True)
-    saved_paths = []
-    for f in uploaded_files:
-        dest_path = os.path.join(fastq_dir, f.name)
-        with open(dest_path, "wb") as out_file:
-            out_file.write(f.getbuffer())
-        saved_paths.append(dest_path)
-    return saved_paths
-
-
-def _symlink_fastq_files_from_directory(source_dir, fastq_dir):
-    """
-    Scan source_dir (a server-side directory the user confirmed via
-    file_browser.render_server_directory_browser -- e.g. a folder that
-    already contains a full set of raw FASTQ files for many samples)
-    for FASTQ files, and SYMLINK (never copy) each one directly into
-    fastq_dir under its original filename.
-
-    Symlinking (rather than copying) is the whole point of this feature:
-    raw FASTQ files are often large and numerous (dozens of samples x
-    paired-end files can easily total many tens or hundreds of GB), so
-    physically duplicating them into fastq_dir would be slow and waste
-    a large amount of disk space for no benefit when the files already
-    exist in a perfectly usable location on the very same machine
-    Streamlit is running on. A symlink is created essentially instantly
-    regardless of the target file's size, and every downstream piece of
-    code in this app (FastQC, trimming, alignment) reads through the
-    symlink exactly as if it were a real file -- no other code needed
-    to change to support this.
-
-    Skips (rather than erroring on) any filename that would collide
-    with a file/symlink already present in fastq_dir -- e.g. from an
-    earlier upload or a previous browse-and-symlink action for the same
-    project -- since silently overwriting a different, already-in-use
-    file under the same name could otherwise corrupt an existing
-    project's data unexpectedly.
-
-    Returns (n_linked: int, n_skipped: int, skipped_names: list[str]).
-    """
-    os.makedirs(fastq_dir, exist_ok=True)
-    _, matching_files = _find_fastq_filenames_in_directory(source_dir)
-
-    n_linked = 0
-    skipped_names = []
-
-    for filename in matching_files:
-        source_path = os.path.join(source_dir, filename)
-        dest_path = os.path.join(fastq_dir, filename)
-
-        if os.path.exists(dest_path) or os.path.islink(dest_path):
-            skipped_names.append(filename)
-            continue
-
-        os.symlink(source_path, dest_path)
-        n_linked += 1
-
-    return n_linked, len(skipped_names), skipped_names
-
-
-def _find_fastq_filenames_in_directory(source_dir):
-    """
-    List just the FASTQ-looking filenames directly inside source_dir
-    (non-recursive -- files in subdirectories are NOT included, matching
-    the same "immediate contents only" convention file_browser.py's own
-    directory listing uses, so what the user previewed while browsing
-    is exactly what gets matched here).
-
-    Returns (all_entries: list[str], fastq_filenames: list[str]) -- the
-    full raw listing (for diagnostic/empty-directory messaging) and the
-    subset that looks like a FASTQ file by extension.
-    """
-    try:
-        all_entries = sorted(os.listdir(source_dir))
-    except OSError:
-        return [], []
-
-    fastq_filenames = [
-        name for name in all_entries
-        if not name.startswith(".") and os.path.isfile(os.path.join(source_dir, name))
-        and any(name.lower().endswith(ext) for ext in FASTQ_BROWSE_EXTENSIONS)
-    ]
-    return all_entries, fastq_filenames
-
-
-def _remove_fastq_samples(fastq_dir, sample_pairs, sample_names_to_remove):
-    """
-    Remove every FASTQ file (R1, R2, and/or SE) belonging to the given
-    sample name(s) from fastq_dir -- the mechanism behind the new
-    "Remove a sample from this project" section (see
-    _render_fastq_removal_section), added specifically in response to a
-    real usability-testing finding: a non-bioinformatics user had no
-    easy way to remove a sample that had been downloaded by mistake
-    (e.g. the wrong SRA accession, or a duplicate/unwanted run) short of
-    manually locating and deleting files on disk themselves.
-
-    Uses os.remove (not shutil.rmtree or similar) on each individual
-    file/symlink path -- this is deliberately SAFE for the symlinked-
-    FASTQ case (see _symlink_fastq_files_from_directory above):
-    os.remove on a symlink deletes only the symlink itself, never the
-    file it points to, so removing a sample that was linked in from a
-    server-side directory (rather than uploaded/copied) never touches
-    or deletes the user's original data elsewhere on disk -- only this
-    project's reference to it.
-
-    sample_pairs: the dict returned by _validate_sample_pairs (i.e.
-        {sample_name: {"R1": filename, ...}}), used to look up exactly
-        which filename(s) belong to each sample being removed.
-    sample_names_to_remove: list/set of sample names (keys of
-        sample_pairs) to remove.
-
-    Returns (removed_filenames: list[str], errors: list[str]) -- the
-    filenames that were actually deleted, and any per-file error
-    messages encountered (e.g. a permissions issue) -- errors don't
-    stop the rest of the removal from proceeding, so one problematic
-    file doesn't block removing everything else that CAN be removed.
-    """
-    removed_filenames = []
-    errors = []
-
-    for sample_name in sample_names_to_remove:
-        reads = sample_pairs.get(sample_name, {})
-        for key in ("R1", "R2", "SE"):
-            if key not in reads:
-                continue
-            filename = reads[key]
-            path = os.path.join(fastq_dir, filename)
-            try:
-                if os.path.islink(path) or os.path.isfile(path):
-                    os.remove(path)
-                    removed_filenames.append(filename)
-            except OSError as e:
-                errors.append(f"{filename}: {e}")
-
-    return removed_filenames, errors
-
-
 def _render_fastq_removal_section(fastq_dir, sample_pairs):
     """
     Render a "Remove a sample from this project" expander, letting the
@@ -410,7 +101,7 @@ def _render_fastq_removal_section(fastq_dir, sample_pairs):
     whatever's currently sitting in fastq_dir) and remove all of that
     sample's FASTQ file(s) from the project in one click -- added
     specifically in response to a real usability-testing finding (see
-    _remove_fastq_samples' docstring): there was previously no
+    ingestion_manager.remove_fastq_samples' docstring): there was previously no
     in-app way to undo an accidental download/upload short of manually
     finding and deleting files on the server's filesystem directly,
     which is not a reasonable expectation for a non-bioinformatics user.
@@ -445,7 +136,7 @@ def _render_fastq_removal_section(fastq_dir, sample_pairs):
                 "sample again afterward if needed)."
             )
             if st.button("🗑️ Remove Selected Sample(s)", key="fastq_remove_btn"):
-                removed_filenames, errors = _remove_fastq_samples(fastq_dir, sample_pairs, samples_to_remove)
+                removed_filenames, errors = ingest.remove_fastq_samples(fastq_dir, sample_pairs, samples_to_remove)
                 if removed_filenames:
                     st.success(
                         f"✅ Removed {len(removed_filenames)} file(s) for "
@@ -460,237 +151,6 @@ def _render_fastq_removal_section(fastq_dir, sample_pairs):
                     st.rerun()
 
 
-def _build_match_table(sample_pairs, meta_df):
-    """
-    Build a plain-language matching table showing, for every sample
-    detected from FASTQ filenames AND every sample listed in the metadata
-    file, whether they successfully matched up.
-
-    This is the core beginner-friendly output: instead of a cryptic
-    error, the user sees exactly which samples matched, which FASTQ
-    samples had no metadata row, and which metadata rows had no FASTQ
-    files.
-    """
-    fastq_samples = set(sample_pairs.keys())
-    meta_samples = set(meta_df["sample"].astype(str)) if meta_df is not None and "sample" in meta_df.columns else set()
-
-    all_samples = sorted(fastq_samples | meta_samples)
-    rows = []
-    for sample_name in all_samples:
-        has_fastq = sample_name in fastq_samples
-        has_meta = sample_name in meta_samples
-
-        if has_fastq and has_meta:
-            status = "✅ Matched"
-        elif has_fastq and not has_meta:
-            status = "⚠️ FASTQ uploaded, no metadata row found"
-        else:
-            status = "⚠️ Metadata row found, no FASTQ uploaded"
-
-        reads = sample_pairs.get(sample_name, {})
-        if "R1" in reads and "R2" in reads:
-            read_type = "Paired-end (R1 + R2)"
-        elif "SE" in reads:
-            read_type = "Single-end"
-        elif "R1" in reads:
-            read_type = "⚠️ Missing R2 mate"
-        elif "R2" in reads:
-            read_type = "⚠️ Missing R1 mate"
-        else:
-            read_type = "—"
-
-        rows.append({
-            "Sample": sample_name,
-            "Status": status,
-            "Read Type": read_type,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def _write_matched_samplesheet(sample_pairs, meta_df, fastq_dir, samplesheet_path):
-    """
-    Write out only the samples that fully matched (have both FASTQ files
-    on disk AND a metadata row) to a clean samplesheet CSV inside the
-    active project. This is the file future steps (QC, trimming,
-    alignment) will read.
-    """
-    fastq_samples = set(sample_pairs.keys())
-    meta_samples = set(meta_df["sample"].astype(str)) if "sample" in meta_df.columns else set()
-    matched_samples = fastq_samples & meta_samples
-
-    rows = []
-    for sample_name in sorted(matched_samples):
-        reads = sample_pairs[sample_name]
-        row = {
-            "sample": sample_name,
-            "fastq_1": os.path.join(fastq_dir, reads.get("R1", reads.get("SE", ""))),
-            "fastq_2": os.path.join(fastq_dir, reads["R2"]) if "R2" in reads else "",
-        }
-        meta_row = meta_df[meta_df["sample"].astype(str) == sample_name]
-        for col in meta_df.columns:
-            if col != "sample":
-                row[col] = meta_row.iloc[0][col]
-        rows.append(row)
-
-    samplesheet_df = pd.DataFrame(rows)
-    os.makedirs(os.path.dirname(samplesheet_path), exist_ok=True)
-    samplesheet_df.to_csv(samplesheet_path, index=False)
-    return samplesheet_df
-
-
-def _tools_available():
-    """Check whether fastqc and multiqc are installed and on PATH."""
-    return shutil.which("fastqc") is not None, shutil.which("multiqc") is not None
-
-
-def _run_fastqc(fastq_paths, fastqc_dir, threads=4):
-    """
-    Run FastQC on the given list of FASTQ file paths, writing output
-    (an .html report and a _fastqc.zip per file) to the project's
-    fastqc_dir.
-
-    threads: FastQC's own built-in "-t" flag, which lets it process
-    multiple files *simultaneously within this single subprocess call*
-    (FastQC allocates one file per thread rather than splitting a single
-    file's work across threads). Defaults to 4, a reasonable middle
-    ground — high enough to meaningfully speed up multi-sample batches
-    (e.g. 16 samples / 32 paired-end files, as with larger datasets like
-    "airway"), without assuming the host machine has a large number of
-    CPU cores available. This is a real speedup, not just a cosmetic
-    flag: with only 1 effective thread (the previous implicit default),
-    32 files are processed one at a time in sequence; with 4, up to 4
-    files run concurrently, cutting wall-clock time roughly proportionally.
-
-    Returns (success: bool, log: str).
-    """
-    os.makedirs(fastqc_dir, exist_ok=True)
-    cmd = ["fastqc", "-o", fastqc_dir, "-t", str(threads)] + fastq_paths
-    try:
-        result = subprocess.run(
-            # Timeout increased from the original 30 minutes: that limit
-            # was set while only testing against small bacterial (E.
-            # coli) FASTQ files. Real-world datasets with many
-            # samples/large human-genome-scale reads (e.g. 16 paired-end
-            # airway samples = 32 files) can legitimately need well
-            # beyond 30 minutes even with threading, so this is bumped
-            # to 2 hours as a safer ceiling that still catches genuinely
-            # stuck/hung processes rather than merely slow ones.
-            cmd, capture_output=True, text=True, check=True, timeout=7200
-        )
-        return True, result.stdout + result.stderr
-    except subprocess.CalledProcessError as e:
-        return False, (e.stdout or "") + (e.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, "FastQC timed out after 2 hours."
-
-
-def _run_multiqc(fastqc_dir, multiqc_dir):
-    """
-    Run MultiQC on the FastQC output directory, combining every individual
-    FastQC report into a single unified HTML report in the project's
-    multiqc_dir.
-
-    Returns (success: bool, log: str).
-    """
-    os.makedirs(multiqc_dir, exist_ok=True)
-    cmd = ["multiqc", fastqc_dir, "-o", multiqc_dir, "-f"]
-    try:
-        result = subprocess.run(
-            # Increased alongside FastQC's timeout above, for the same
-            # reason: MultiQC scanning/combining many more (and larger)
-            # FastQC reports than our original small-scale E. coli
-            # testing can legitimately take longer than 30 minutes,
-            # though MultiQC itself is generally much faster than FastQC
-            # since it's just aggregating already-computed reports.
-            cmd, capture_output=True, text=True, check=True, timeout=3600
-        )
-        return True, result.stdout + result.stderr
-    except subprocess.CalledProcessError as e:
-        return False, (e.stdout or "") + (e.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, "MultiQC timed out after 1 hour."
-
-
-def _parse_fastqc_summaries(fastqc_dir):
-    """
-    Read the summary.txt file bundled inside each *_fastqc.zip output by
-    FastQC. Each line is tab-separated: STATUS<TAB>MODULE_NAME<TAB>FILENAME
-    where STATUS is one of PASS / WARN / FAIL.
-
-    Returns a long-format DataFrame: filename, module, status.
-    """
-    rows = []
-    if not os.path.isdir(fastqc_dir):
-        return pd.DataFrame(columns=["filename", "module", "status"])
-
-    for entry in os.listdir(fastqc_dir):
-        if entry.endswith("_fastqc.zip"):
-            zip_path = os.path.join(fastqc_dir, entry)
-            try:
-                with zipfile.ZipFile(zip_path) as zf:
-                    summary_name = [n for n in zf.namelist() if n.endswith("summary.txt")]
-                    if not summary_name:
-                        continue
-                    with zf.open(summary_name[0]) as f:
-                        for line in f.read().decode("utf-8").splitlines():
-                            parts = line.strip().split("\t")
-                            if len(parts) == 3:
-                                status, module, filename = parts
-                                rows.append({
-                                    "filename": filename,
-                                    "module": module,
-                                    "status": status,
-                                })
-            except zipfile.BadZipFile:
-                continue
-
-    return pd.DataFrame(rows)
-
-
-def _build_quality_flags(summary_df):
-    """
-    Convert the raw per-module PASS/WARN/FAIL table into a beginner-
-    friendly per-sample overview: an overall status badge, plus plain-
-    language explanations for anything that wasn't a clean PASS.
-    """
-    if summary_df.empty:
-        return pd.DataFrame(columns=["File", "Overall Quality", "Details"]), {}
-
-    overview_rows = []
-    details_by_file = {}
-
-    for filename, group in summary_df.groupby("filename"):
-        has_fail = (group["status"] == "FAIL").any()
-        has_warn = (group["status"] == "WARN").any()
-
-        if has_fail:
-            overall = "🔴 Needs attention"
-        elif has_warn:
-            overall = "🟡 Minor issues"
-        else:
-            overall = "🟢 Good quality"
-
-        flagged = group[group["status"] != "PASS"]
-        explanations = []
-        for _, row in flagged.iterrows():
-            icon = "🔴" if row["status"] == "FAIL" else "🟡"
-            guidance = FASTQC_MODULE_GUIDANCE.get(
-                row["module"],
-                "No additional guidance available for this check."
-            )
-            explanations.append(f"{icon} **{row['module']}**: {guidance}")
-
-        overview_rows.append({
-            "File": filename,
-            "Overall Quality": overall,
-            "Details": f"{len(flagged)} item(s) flagged" if flagged.shape[0] > 0 else "All checks passed",
-        })
-        details_by_file[filename] = explanations
-
-    return pd.DataFrame(overview_rows), details_by_file
-
-
 def _render_server_directory_fastq_section(fastq_dir):
     """
     Render the "point to a directory of FASTQ files already on this
@@ -700,7 +160,7 @@ def _render_server_directory_fastq_section(fastq_dir):
     directory full of raw FASTQ files sitting on its own disk.
 
     Files are SYMLINKED (never copied) into fastq_dir -- see
-    _symlink_fastq_files_from_directory's docstring for why this
+    ingestion_manager.symlink_fastq_files_from_directory's docstring for why this
     matters for potentially very large, numerous raw FASTQ files.
     """
     with st.expander("📂 Or point to a directory of FASTQ files already on this server"):
@@ -718,12 +178,12 @@ def _render_server_directory_fastq_section(fastq_dir):
 
         selected_dir = fb.render_server_directory_browser(
             key_prefix="fastq_dir_browse",
-            preview_extensions=FASTQ_BROWSE_EXTENSIONS,
+            preview_extensions=ingest.FASTQ_BROWSE_EXTENSIONS,
             label="Browse for the directory containing your FASTQ files:",
         )
 
         if selected_dir:
-            all_entries, fastq_filenames = _find_fastq_filenames_in_directory(selected_dir)
+            all_entries, fastq_filenames = ingest.find_fastq_filenames_in_directory(selected_dir)
 
             if not fastq_filenames:
                 st.warning(
@@ -744,7 +204,7 @@ def _render_server_directory_fastq_section(fastq_dir):
                 )
 
                 if st.button("🔗 Link These Files Into This Project", key="fastq_dir_browse_link_btn"):
-                    n_linked, n_skipped, skipped_names = _symlink_fastq_files_from_directory(
+                    n_linked, n_skipped, skipped_names = ingest.symlink_fastq_files_from_directory(
                         selected_dir, fastq_dir
                     )
                     if n_linked:
@@ -1170,7 +630,7 @@ def _render_metadata_sync_section(raw_meta_df, sample_col, sample_pairs, metadat
         names (may not literally be called "sample" -- this is whatever
         column the user picked in the "Which column contains your
         sample names?" dropdown above).
-    sample_pairs: the dict returned by _validate_sample_pairs, i.e. the
+    sample_pairs: the dict returned by ingest.validate_sample_pairs, i.e. the
         FASTQ samples currently detected in this project.
     metadata_saved_path: where to persist the updated metadata CSV.
 
@@ -1254,136 +714,13 @@ def _render_metadata_sync_section(raw_meta_df, sample_col, sample_pairs, metadat
                 st.caption("✅ Every metadata row has a matching FASTQ sample.")
 
 
-def _detect_blank_metadata_samples(raw_meta_df, sample_col):
-    """
-    Return the sample name(s) whose metadata row has NOTHING filled in
-    besides the sample name itself (every other column is blank/NaN) --
-    used to pre-select sensible defaults in
-    _render_metadata_ncbi_refetch_section below, since these are exactly
-    the rows a user would want to re-fetch (e.g. rows just added via
-    _render_metadata_sync_section's "Add a blank row for" button, or any
-    other row that's never had its details filled in).
-
-    A "blank" cell is either a true NaN or a string that's empty/only
-    whitespace after stripping -- covers both a truly missing pandas
-    value and a manually-added blank string cell (e.g. from the sync
-    section above, which fills new rows with "").
-    """
-    other_cols = [c for c in raw_meta_df.columns if c != sample_col]
-    if not other_cols:
-        # No other columns exist at all -- every sample is trivially
-        # "blank" in this case, though there'd be nothing meaningful
-        # for a re-fetch to fill in either.
-        return raw_meta_df[sample_col].astype(str).tolist()
-
-    def _is_blank_row(row):
-        return all(pd.isna(row[c]) or str(row[c]).strip() == "" for c in other_cols)
-
-    blank_mask = raw_meta_df.apply(_is_blank_row, axis=1)
-    return raw_meta_df.loc[blank_mask, sample_col].astype(str).tolist()
-
-
-def _merge_ncbi_metadata_rows(raw_meta_df, sample_col, metadata_rows, overwrite_existing=False):
-    """
-    Merge NCBI-derived attribute data (from sra.build_metadata_dataframe,
-    which returns a list of dicts each keyed by "sample" -- the Run
-    accession) into raw_meta_df's EXISTING rows for matching samples,
-    rather than adding new rows or replacing the whole table.
-
-    This is the core mechanism behind
-    _render_metadata_ncbi_refetch_section: unlike
-    _render_sra_metadata_autofill_section (which BUILDS an entirely new
-    metadata table from scratch, intended for first-time setup), this
-    function targets specific, already-existing row(s) and fills in
-    just their missing/blank fields -- exactly what's needed when a
-    sample was already added to the metadata sheet (e.g. via the sync
-    feature above) with blank values, and the user wants to go back and
-    populate those blanks from NCBI without disturbing any other
-    already-filled-in samples or columns.
-
-    Matching is done by comparing metadata_rows' "sample" value against
-    raw_meta_df[sample_col] -- this works correctly because, for any
-    sample originally downloaded via this app's SRA feature, the sample
-    name IS the Run accession (fasterq-dump's own output naming
-    convention, which this app's FASTQ-matching logic already relies on
-    elsewhere), so a lookup keyed by Run accession lines up directly
-    with the project's existing sample names with no extra translation
-    needed.
-
-    overwrite_existing: if False (the default, and the expected common
-        case), only currently-BLANK cells are filled in -- any column
-        that already has a real value for that sample is left
-        completely untouched, even if NCBI's data for it happens to
-        differ. If True, every matched column is overwritten with
-        NCBI's value regardless of what was there before -- offered as
-        an explicit opt-in for a genuine "start over from NCBI" case,
-        never the default (since silently overwriting a user's own
-        manually-entered/edited values would be a bad, low-trust
-        surprise).
-
-    A brand new column present in NCBI's data but not yet in
-    raw_meta_df (e.g. "strain", "treatment") is automatically added
-    (defaulting to blank for every OTHER, non-matched sample), so
-    running this repeatedly for different samples over time correctly
-    accumulates whatever attribute columns each individual NCBI lookup
-    happens to provide.
-
-    Returns (updated_df, filled_sample_names: list[str]) -- the merged
-    DataFrame, and the list of sample names that actually received at
-    least one filled-in value (for a clear success message -- a sample
-    present in metadata_rows but with, say, every value already
-    non-blank and overwrite_existing=False would correctly NOT appear
-    in this list, since nothing was actually changed for it).
-    """
-    updated_df = raw_meta_df.copy()
-    filled_samples = []
-
-    for entry in metadata_rows:
-        sample_name = entry.get("sample")
-        mask = updated_df[sample_col].astype(str) == str(sample_name)
-        if not mask.any():
-            continue
-        idx = updated_df.index[mask][0]
-
-        any_filled = False
-        for col, val in entry.items():
-            if col == "sample":
-                continue
-            if col not in updated_df.columns:
-                updated_df[col] = pd.Series([pd.NA] * len(updated_df), dtype=object)
-            elif not pd.api.types.is_object_dtype(updated_df[col]):
-                # A column that's entirely blank for every sample so far
-                # (e.g. never filled in yet) gets read back from the CSV
-                # as a NUMERIC dtype (float64) by pandas, since an
-                # all-empty column has nothing to infer a string type
-                # from. Newer/stricter pandas correctly REFUSES to
-                # silently upcast that column when a real string value
-                # (e.g. "27") is written into it -- raising
-                # "TypeError: Invalid value '27' for dtype 'float64'" --
-                # rather than the old, looser behavior of quietly
-                # converting the whole column on the fly. This explicit
-                # conversion must happen BEFORE the assignment below.
-                updated_df[col] = updated_df[col].astype(object)
-
-            current_val = updated_df.at[idx, col]
-            is_blank = pd.isna(current_val) or str(current_val).strip() == ""
-            if overwrite_existing or is_blank:
-                updated_df.at[idx, col] = val
-                any_filled = True
-
-        if any_filled:
-            filled_samples.append(sample_name)
-
-    return updated_df, filled_samples
-
-
 def _render_metadata_ncbi_refetch_section(project, raw_meta_df, sample_col, metadata_saved_path):
     """
     Render a "Re-fetch metadata from NCBI for existing sample(s)"
     section: lets the user select one or more samples ALREADY present
     in the metadata table (defaulting to whichever ones currently have
     nothing filled in besides their sample name -- see
-    _detect_blank_metadata_samples) and re-run an SRA/NCBI lookup for
+    ingest.detect_blank_metadata_samples) and re-run an SRA/NCBI lookup for
     exactly those samples, filling in their blank fields directly.
 
     Added specifically in response to a real gap: a user downloaded new
@@ -1425,7 +762,7 @@ def _render_metadata_ncbi_refetch_section(project, raw_meta_df, sample_col, meta
         )
 
         all_samples = raw_meta_df[sample_col].astype(str).tolist()
-        blank_samples = _detect_blank_metadata_samples(raw_meta_df, sample_col)
+        blank_samples = ingest.detect_blank_metadata_samples(raw_meta_df, sample_col)
 
         selected_samples = st.multiselect(
             "Which sample(s) should be re-fetched from NCBI?",
@@ -1450,7 +787,7 @@ def _render_metadata_ncbi_refetch_section(project, raw_meta_df, sample_col, meta
                 st.error(f"⚠️ {message}")
             else:
                 metadata_rows = sra.build_metadata_dataframe(lookup_rows, selected_runs=selected_samples)
-                updated_df, filled_samples = _merge_ncbi_metadata_rows(
+                updated_df, filled_samples = ingest.merge_ncbi_metadata_rows(
                     raw_meta_df, sample_col, metadata_rows, overwrite_existing=overwrite_existing,
                 )
 
@@ -1545,7 +882,7 @@ def render():
     # Show anything already uploaded to this project in a previous session,
     # so reopening a project doesn't look empty even though the files are
     # sitting on disk.
-    existing_fastq_names = _list_existing_fastq(fastq_dir)
+    existing_fastq_names = ingest.list_existing_fastq(fastq_dir)
     if existing_fastq_names:
         st.markdown(f"**{len(existing_fastq_names)} file(s) already in this project:**")
         st.dataframe(
@@ -1561,7 +898,7 @@ def render():
     )
 
     if uploaded_fastq:
-        saved_paths = _save_uploaded_files(uploaded_fastq, fastq_dir)
+        saved_paths = ingest.save_uploaded_files(uploaded_fastq, fastq_dir)
         st.success(f"✅ {len(saved_paths)} new file(s) uploaded successfully.")
 
     # --- Point to a directory of FASTQ files already on this server ---
@@ -1579,11 +916,11 @@ def render():
     # server-side directory) rather than only from this session's upload
     # widget. This is what makes reopening a project actually reflect
     # prior progress.
-    all_fastq_names = _list_existing_fastq(fastq_dir)
+    all_fastq_names = ingest.list_existing_fastq(fastq_dir)
 
     sample_pairs = {}
     if all_fastq_names:
-        sample_pairs = _validate_sample_pairs(all_fastq_names)
+        sample_pairs = ingest.validate_sample_pairs(all_fastq_names)
 
         st.markdown("**What we detected from your file names:**")
         detected_rows = []
@@ -1676,7 +1013,7 @@ def render():
     # elsewhere in the app -- see _render_metadata_file_input's
     # docstring). uploaded_meta may be either a Streamlit UploadedFile
     # (upload path) or a plain path string (browse path); both are
-    # handled transparently by _read_metadata_file below.
+    # handled transparently by ingest.read_metadata_file below.
     uploaded_meta = _render_metadata_file_input()
 
     raw_meta_df = None
@@ -1685,7 +1022,7 @@ def render():
     if uploaded_meta:
         # A fresh upload/browse-selection this session always takes
         # priority.
-        raw_meta_df, read_error = _read_metadata_file(uploaded_meta)
+        raw_meta_df, read_error = ingest.read_metadata_file(uploaded_meta)
     elif os.path.exists(metadata_saved_path):
         # No new upload this session, but this project already has a
         # metadata file saved from a previous session (either a manual
@@ -1815,7 +1152,7 @@ def render():
         )
         return
 
-    match_table = _build_match_table(sample_pairs, meta_df)
+    match_table = ingest.build_match_table(sample_pairs, meta_df)
     st.dataframe(match_table, use_container_width=True, hide_index=True)
 
     n_matched = (match_table["Status"] == "✅ Matched").sum()
@@ -1835,7 +1172,7 @@ def render():
             st.dataframe(pd.read_csv(samplesheet_path), use_container_width=True, hide_index=True)
 
         if st.button(save_label):
-            samplesheet_df = _write_matched_samplesheet(sample_pairs, meta_df, fastq_dir, samplesheet_path)
+            samplesheet_df = ingest.write_matched_samplesheet(sample_pairs, meta_df, fastq_dir, samplesheet_path)
             st.session_state["bulk_rnaseq_matched"] = True
             pm.mark_step_complete(project, "samples_matched")
             st.success(f"Saved to `{samplesheet_path}`.")
@@ -1864,7 +1201,7 @@ def render():
                     "means and whether you need to do anything about it."
                 )
 
-            fastqc_ok, multiqc_ok = _tools_available()
+            fastqc_ok, multiqc_ok = fastqc.tools_available()
             multiqc_html_path = os.path.join(multiqc_dir, "multiqc_report.html")
             qc_already_done = os.path.exists(multiqc_html_path)
 
@@ -1939,7 +1276,7 @@ def render():
                                 fastq_paths.append(os.path.join(fastq_dir, reads[key]))
 
                     with st.spinner(f"Running FastQC on {len(fastq_paths)} file(s) ({fastqc_threads} at a time)..."):
-                        fastqc_success, fastqc_log = _run_fastqc(fastq_paths, fastqc_dir, threads=fastqc_threads)
+                        fastqc_success, fastqc_log = fastqc.run_fastqc(fastq_paths, fastqc_dir, threads=fastqc_threads)
 
                     if not fastqc_success:
                         st.error("FastQC failed to run. Details below:")
@@ -1955,7 +1292,7 @@ def render():
                     else:
                         st.success("✅ FastQC completed.")
                         with st.spinner("Combining reports with MultiQC..."):
-                            multiqc_success, multiqc_log = _run_multiqc(fastqc_dir, multiqc_dir)
+                            multiqc_success, multiqc_log = fastqc.run_multiqc(fastqc_dir, multiqc_dir)
 
                         if not multiqc_success:
                             st.error("MultiQC failed to run. Details below:")
@@ -1971,8 +1308,8 @@ def render():
                 # disk — this is what makes reopening a project actually
                 # display prior QC results instead of requiring a re-run.
                 if qc_already_done:
-                    summary_df = _parse_fastqc_summaries(fastqc_dir)
-                    overview_df, details_by_file = _build_quality_flags(summary_df)
+                    summary_df = fastqc.parse_fastqc_summaries(fastqc_dir)
+                    overview_df, details_by_file = fastqc.build_quality_flags(summary_df)
 
                     if not overview_df.empty:
                         st.subheader("📋 Quality Overview")
