@@ -3,8 +3,8 @@ advanced_mode_workspace.py
 
 Streamlit wizard UI for "Auto" -- one of possibly several workspaces
 living in the top-level "Advanced Modes" sidebar drawer (see app.py's
-PIPELINE_GROUPS; Monitor Mode is intended to join this same drawer once
-its own workspace UI is built). Auto's own FIRST screen is a pipeline
+PIPELINE_GROUPS; Monitor Mode joins this same drawer via its own
+monitor_mode_workspace.py). Auto's own FIRST screen is a pipeline
 picker (see PIPELINE_AUTO_HANDLERS / render() below) -- today that
 picker only offers Bulk RNA-Seq, but the dispatch structure exists so
 that Single-cell RNA-seq / Spatial RNA-seq can register their own Auto
@@ -32,7 +32,6 @@ accession is caught immediately, and the resulting SAMPLE_ATTRIBUTES
 can auto-populate the metadata table for the user to review -- exactly
 the same NCBI record data the interactive workspace's SRA lookup
 feature surfaces today, just consolidated into this one upfront screen.
-
 The actual FASTQ DOWNLOAD (prefetch + fasterq-dump), by contrast, is
 genuinely long-running (minutes to multiple hours per run depending on
 file size and NCBI server load) -- that work is deferred entirely to
@@ -40,8 +39,24 @@ the background pipeline process (advanced_mode_orchestrator._run_ingest,
 stage 1 of the run), which is why a prominent time-expectation warning
 is shown right before the launch button whenever the FASTQ source is
 NCBI/SRA -- see _ncbi_download_warning() below.
-"""
 
+--- Post-completion behavior (2026-08-16) ---
+Previously, once a project's background run finished, this workspace
+kept rendering the full Steps 1-4 configuration wizard right below the
+"Pipeline complete" status panel -- as if inviting the user to
+reconfigure/relaunch a project that was already done, with no
+indication that anything had actually finished. Now, once
+orch.get_status(project)["pipeline_status"] == "complete", the wizard
+is replaced with a completed-project actions panel (via
+project_actions.py, the same shared actions Monitor Mode's
+launched-projects list uses): a "Prepare/Download Project Package"
+button (QC/MultiQC/alignment scores/counts table -- no raw or aligned
+reads, see project_actions.py) and a "Begin DE Analysis" button that
+hands off straight to the Differential Expression workspace with this
+project selected. Steps 1-4 are still reachable on demand via a
+"Reconfigure & Re-launch This Project" expander, for the (presumably
+rarer) case of wanting to re-run a project that's already complete.
+"""
 import os
 
 import pandas as pd
@@ -53,6 +68,7 @@ import reference_manager as ref
 import file_browser as fb
 import ingestion_manager as ingest
 import advanced_mode_orchestrator as orch
+import project_actions as pa
 
 STAGE_LABELS = {
     "ingest": "1. FASTQ ingestion + sample matching",
@@ -65,7 +81,6 @@ STAGE_LABELS = {
 STAGE_ICONS = {
     "pending": "⏳", "running": "🔄", "complete": "✅", "skipped": "⏭️", "error": "❌",
 }
-
 # quantification_manager.run_tximport_gene_collapse() collapses Salmon's
 # transcript-level quant.sf output to gene-level counts (via tximport's
 # countsFromAbundance="lengthScaledTPM"), which matters for any organism
@@ -103,21 +118,17 @@ def _ncbi_download_warning(n_runs):
 # ---------------------------------------------------------------------------
 # Step 1: FASTQ source
 # ---------------------------------------------------------------------------
-
 def _render_fastq_source_step(project):
     st.subheader("Step 1: FASTQ Source")
     fastq_dir = pm.fastq_dir(project)
-
     existing = ingest.list_existing_fastq(fastq_dir)
     if existing:
         st.success(f"✅ {len(existing)} FASTQ file(s) already present in this project.")
-
     source = st.radio(
         "How will you provide FASTQ files for this project?",
         ["📤 Upload from my computer", "📂 Browse a directory on this server", "🔎 Fetch from NCBI/SRA"],
         key="adv_fastq_source_radio", horizontal=True,
     )
-
     if source.startswith("📤"):
         uploaded_files = st.file_uploader(
             "Upload your raw FASTQ file(s):", type=["fastq", "gz", "fq"],
@@ -133,7 +144,6 @@ def _render_fastq_source_step(project):
         # safely no-ops (skips) any file that's already there, so this
         # is just a harmless confirmation pass, not a real copy/link.
         return {"fastq_source": "directory", "fastq_source_dir": fastq_dir}
-
     elif source.startswith("📂"):
         selected_dir = fb.render_server_directory_browser(
             key_prefix="adv_fastq_dir_browse",
@@ -147,7 +157,6 @@ def _render_fastq_source_step(project):
                 return {"fastq_source": "directory", "fastq_source_dir": selected_dir}
             st.warning("⚠️ No FASTQ files found directly inside this directory.")
         return None
-
     else:
         return _render_ncbi_source(project)
 
@@ -163,12 +172,10 @@ def _render_ncbi_source(project):
         "`PRJNA123456`), and/or paste **individual run accessions** "
         "(e.g. `SRR1234567`, separated by commas/spaces/newlines)."
     )
-
     prefetch_ok, fasterq_ok = sra.tools_available()
     if not (prefetch_ok and fasterq_ok):
         st.error("⚠️ The SRA Toolkit (`prefetch`/`fasterq-dump`) isn't available on this system yet.")
         return None
-
     single_term_input = st.text_input(
         "Study or BioProject accession:", placeholder="e.g. SRP123456 or PRJNA123456",
         key="adv_sra_single_term_input",
@@ -182,7 +189,6 @@ def _render_ncbi_source(project):
         "Or upload a file listing accessions (.txt, .csv, or .xlsx):",
         type=["txt", "csv", "xlsx", "xls"], key="adv_sra_accession_file_upload",
     )
-
     if st.button("🔍 Validate Accession(s) on NCBI", key="adv_sra_validate_btn"):
         combined_accessions = list(sra._split_accession_list_text(accession_list_text))
         file_read_error = None
@@ -191,7 +197,6 @@ def _render_ncbi_source(project):
             combined_accessions.extend(file_accessions)
         seen = set()
         combined_accessions = [a for a in combined_accessions if not (a in seen or seen.add(a))]
-
         if file_read_error:
             st.error(f"⚠️ {file_read_error}")
         elif combined_accessions:
@@ -216,11 +221,9 @@ def _render_ncbi_source(project):
                 st.success(f"✅ {message} — valid, ready to download.")
         else:
             st.warning("⚠️ Please enter an accession, paste a list, or upload a file to validate.")
-
     lookup_rows = st.session_state.get("adv_sra_lookup_rows")
     if not lookup_rows:
         return None
-
     display_rows = [{
         "Run": row.get("Run", "—"),
         "Organism": row.get("ScientificName", "—"),
@@ -229,11 +232,9 @@ def _render_ncbi_source(project):
         "Size (MB)": row.get("size_MB", "—"),
     } for row in lookup_rows]
     st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
-
     non_rna_count = sum(1 for r in lookup_rows if not sra.is_rna_seq(r))
     if non_rna_count:
         st.warning(f"⚠️ {non_rna_count} of {len(lookup_rows)} run(s) are not annotated as RNA-Seq.")
-
     run_options = [row["Run"] for row in lookup_rows]
     selected_runs = st.multiselect(
         "Select which validated run(s) to download:", options=run_options,
@@ -241,7 +242,6 @@ def _render_ncbi_source(project):
     )
     if not selected_runs:
         return None
-
     # Same "parallel downloads" control the interactive workspace's own
     # SRA lookup section offers (bulk_rnaseq_workspace.py's
     # _render_sra_lookup_section) -- since downloading is mostly spent
@@ -264,7 +264,6 @@ def _render_ncbi_source(project):
             "decrease it if downloads start failing."
         ),
     )
-
     st.info(_ncbi_download_warning(len(selected_runs)))
     return {"fastq_source": "sra", "sra_accessions": selected_runs, "sra_max_workers": max_workers}
 
@@ -272,13 +271,10 @@ def _render_ncbi_source(project):
 # ---------------------------------------------------------------------------
 # Step 2: Metadata
 # ---------------------------------------------------------------------------
-
 def _render_metadata_step(project, fastq_config):
     st.subheader("Step 2: Sample Metadata")
-
     lookup_rows = st.session_state.get("adv_sra_lookup_rows")
     selected_runs = fastq_config.get("sra_accessions") if fastq_config else None
-
     if fastq_config and fastq_config.get("fastq_source") == "sra" and lookup_rows and selected_runs:
         st.markdown(
             "Auto-built from each validated sample's own NCBI record -- "
@@ -311,26 +307,21 @@ def _render_metadata_step(project, fastq_config):
                 st.error(error)
             else:
                 default_df = parsed_df
-
     if default_df is None:
         st.info("Provide a metadata source above to continue.")
         return None
     if "sample" not in default_df.columns:
         st.error("⚠️ Your metadata must have a column named exactly `sample` matching FASTQ-derived sample names.")
-
     return st.data_editor(default_df, num_rows="dynamic", use_container_width=True, key="adv_metadata_editor")
 
 
 # ---------------------------------------------------------------------------
 # Step 3: Genome & pipeline options
 # ---------------------------------------------------------------------------
-
 def _render_genome_and_options_step(project):
     st.subheader("Step 3: Reference Genome & Pipeline Options")
-
     is_custom = st.checkbox("Use a custom (non-preset) reference genome", key="adv_ref_is_custom")
     reference_cfg = {"is_custom": is_custom}
-
     if not is_custom:
         species_options = list(ref.REFERENCE_CATALOG.keys())
         species_labels = {k: v["label"] for k, v in ref.REFERENCE_CATALOG.items()}
@@ -353,13 +344,11 @@ def _render_genome_and_options_step(project):
             "species_key": None, "custom_genome_fasta": genome_fasta,
             "custom_gtf": gtf_path, "custom_transcript_fasta": None,
         })
-
     alignment_method = st.radio(
         "Alignment/quantification method:", ["salmon", "star"],
         format_func=lambda m: "Salmon (pseudo-alignment, faster)" if m == "salmon" else "STAR (splice-aware alignment)",
         key="adv_alignment_method", horizontal=True,
     )
-
     # Same three options + same help text as alignment_workspace.py's
     # "⚙️ Advanced STAR options (optional)" expander -- previously
     # missing from this wizard entirely, so a STAR run launched via
@@ -406,14 +395,12 @@ def _render_genome_and_options_step(project):
                     "produces, so most users can safely leave this unchecked."
                 ),
             )
-
     detected_cores, recommended_threads = pm.get_recommended_thread_count()
     threads = st.slider(
         "Threads for each tool (FastQC/fastp/Salmon/STAR):",
         min_value=1, max_value=detected_cores, value=recommended_threads, key="adv_pipeline_threads",
     )
     thread_cfg = {k: threads for k in ("fastqc", "fastp", "salmon_index", "salmon_quant", "star_index", "star_align")}
-
     # Placed right next to the thread-count picker since both affect
     # HOW the trimming (fastp) stage runs, rather than WHAT data goes
     # in -- controls whether the background pipeline's trimming stage
@@ -451,7 +438,6 @@ def _render_genome_and_options_step(project):
             "produce them, with no automatic detection or fix. Only turn "
             "this off if you have a specific reason to preserve these tails."
         )
-
     return {
         "reference": reference_cfg,
         "alignment_method": alignment_method,
@@ -466,12 +452,10 @@ def _render_genome_and_options_step(project):
 # ---------------------------------------------------------------------------
 # Status panel
 # ---------------------------------------------------------------------------
-
 def _render_status_panel(project):
     status = orch.get_status(project)
     if status.get("pipeline_status") == "not_started":
         return
-
     st.subheader("📡 Background Run Status")
     overall = status["pipeline_status"]
     if overall == "queued":
@@ -488,16 +472,13 @@ def _render_status_panel(project):
         st.success("✅ Pipeline complete — gene counts matrix is ready.")
     elif overall == "error":
         st.error("❌ Pipeline stopped with an error — see details below.")
-
     for stage_key, _ in orch.PIPELINE_STAGES:
         entry = status["stages"][stage_key]
         icon = STAGE_ICONS.get(entry["status"], "•")
         st.markdown(f"{icon} **{STAGE_LABELS[stage_key]}** — {entry.get('message') or entry['status']}")
-
     if status.get("error"):
         with st.expander("Technical error details"):
             st.code(status["error"].get("traceback", ""))
-
     if orch.is_run_in_progress(project):
         if st.button("🔄 Refresh Status", key="adv_status_refresh_btn"):
             st.rerun()
@@ -506,9 +487,91 @@ def _render_status_panel(project):
 
 
 # ---------------------------------------------------------------------------
+# Completed-project actions (shown in place of Steps 1-4 once done)
+# ---------------------------------------------------------------------------
+def _render_completed_project_actions(project):
+    """
+    Replaces the Steps 1-4 configuration wizard once this project's
+    background run has actually finished (pipeline_status == "complete"),
+    using the same shared project_actions.py actions Monitor Mode's
+    launched-projects list offers: a packaged QC/MultiQC/alignment-
+    scores/counts-table download (no raw or aligned reads -- see
+    project_actions.py's module docstring), and a "Begin DE Analysis"
+    hand-off straight to the Differential Expression workspace.
+
+    Previously, the full Steps 1-4 wizard kept rendering unconditionally
+    below the status panel even after "Pipeline complete" -- as if
+    inviting reconfiguration/relaunch of an already-finished project,
+    with no obvious "what do I do now that it's done" action. Steps 1-4
+    are still reachable on demand via the "Reconfigure & Re-launch"
+    expander below, for the less common case of wanting to re-run a
+    completed project (e.g. with different options).
+    """
+    st.success(f"🎉 **{project}** is ready for downstream analysis.")
+    if pa.project_package_available(project):
+        col1, col2 = st.columns(2)
+        with col1:
+            zip_key = f"adv_pkg_zip_{project}"
+            if st.button("📦 Prepare Download Package", key=f"{zip_key}_prep_btn"):
+                st.session_state[zip_key] = pa.build_project_package_zip(project)
+            if st.session_state.get(zip_key):
+                st.download_button(
+                    "⬇️ Download Project Package (.zip)",
+                    data=st.session_state[zip_key],
+                    file_name=f"{project}_package.zip",
+                    mime="application/zip",
+                    key=f"{zip_key}_dl_btn",
+                    help="FastQC/MultiQC reports, alignment scores/info, and the gene counts matrix -- no raw or aligned read files.",
+                )
+        with col2:
+            if st.button("🌋 Begin DE Analysis", key=f"adv_begin_de_{project}", type="primary"):
+                pa.request_navigation_to_deseq2(project)
+                st.rerun()
+    else:
+        st.caption("⏳ Gene counts matrix not found yet -- packaging/DE hand-off will appear once it's ready.")
+    st.markdown("---")
+    with st.expander("🔁 Reconfigure & Re-launch This Project"):
+        st.caption(
+            "This project already completed a run. Reconfiguring below "
+            "and launching again will re-run the pipeline from Step 1 "
+            "-- already-completed stages are resumed/skipped where "
+            "possible (see advanced_mode_orchestrator's resumability), "
+            "not blindly redone from scratch."
+        )
+        _render_configuration_wizard(project)
+
+
+def _render_configuration_wizard(project):
+    "Steps 1-4: FASTQ source -> metadata -> genome/options -> launch."
+    fastq_config = _render_fastq_source_step(project)
+    st.markdown("---")
+    edited_metadata_df = _render_metadata_step(project, fastq_config or {})
+    st.markdown("---")
+    genome_and_options = _render_genome_and_options_step(project)
+    st.markdown("---")
+    st.subheader("Step 4: Launch")
+    ready = fastq_config is not None and edited_metadata_df is not None and "sample" in edited_metadata_df.columns
+    if not ready:
+        st.info("Complete Steps 1–2 above (a valid FASTQ source and metadata with a `sample` column) to launch.")
+        return
+    if fastq_config.get("fastq_source") == "sra":
+        st.warning(_ncbi_download_warning(len(fastq_config.get("sra_accessions", []))))
+    if st.button("🚀 Save Configuration & Launch Background Run", key="adv_launch_btn", type="primary"):
+        metadata_path = pm.metadata_path(project)
+        edited_metadata_df.to_csv(metadata_path, index=False)
+        config = {**fastq_config, "metadata_path": metadata_path, **genome_and_options}
+        pid = orch.launch_background_run(project, config)
+        st.success(
+            f"✅ Background run launched (process ID {pid}). You can close "
+            "this tab or navigate away — progress will be shown in the "
+            "status panel above whenever you return to this page."
+        )
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Bulk RNA-Seq's Auto pipeline (FASTQ -> ... -> gene counts matrix)
 # ---------------------------------------------------------------------------
-
 def _render_bulk_rnaseq_auto():
     """
     Everything that used to be this module's top-level render() before
@@ -517,6 +580,11 @@ def _render_bulk_rnaseq_auto():
     in behavior -- only pulled into its own function so render() below
     can dispatch to it (or, in the future, to a Single-cell/Spatial
     equivalent) based on the pipeline dropdown.
+
+    Once the project's run is complete, Steps 1-4 are replaced by
+    _render_completed_project_actions() (download package + Begin DE
+    Analysis) rather than continuing to show the configuration wizard
+    -- see this module's docstring under "Post-completion behavior".
     """
     st.markdown(
         "Define your project's FASTQ source, metadata, reference genome, "
@@ -526,13 +594,10 @@ def _render_bulk_rnaseq_auto():
         "remain separate, interactive steps you run afterward, same as "
         "the step-by-step workflow."
     )
-
     _init_state()
-
     project = pm.render_project_selector(workspace_key="advanced_mode")
     if not project:
         return
-
     st.markdown("---")
     _render_status_panel(project)
     run_in_progress = orch.is_run_in_progress(project)
@@ -540,36 +605,12 @@ def _render_bulk_rnaseq_auto():
         st.markdown("---")
         st.info("A background run is currently in progress for this project. The configuration below is disabled until it finishes.")
         return
-
+    status = orch.get_status(project)
     st.markdown("---")
-    fastq_config = _render_fastq_source_step(project)
-    st.markdown("---")
-    edited_metadata_df = _render_metadata_step(project, fastq_config or {})
-    st.markdown("---")
-    genome_and_options = _render_genome_and_options_step(project)
-    st.markdown("---")
-
-    st.subheader("Step 4: Launch")
-    ready = fastq_config is not None and edited_metadata_df is not None and "sample" in edited_metadata_df.columns
-    if not ready:
-        st.info("Complete Steps 1–2 above (a valid FASTQ source and metadata with a `sample` column) to launch.")
+    if status.get("pipeline_status") == "complete":
+        _render_completed_project_actions(project)
         return
-
-    if fastq_config.get("fastq_source") == "sra":
-        st.warning(_ncbi_download_warning(len(fastq_config.get("sra_accessions", []))))
-
-    if st.button("🚀 Save Configuration & Launch Background Run", key="adv_launch_btn", type="primary"):
-        metadata_path = pm.metadata_path(project)
-        edited_metadata_df.to_csv(metadata_path, index=False)
-
-        config = {**fastq_config, "metadata_path": metadata_path, **genome_and_options}
-        pid = orch.launch_background_run(project, config)
-        st.success(
-            f"✅ Background run launched (process ID {pid}). You can close "
-            "this tab or navigate away — progress will be shown in the "
-            "status panel above whenever you return to this page."
-        )
-        st.rerun()
+    _render_configuration_wizard(project)
 
 
 # ---------------------------------------------------------------------------
@@ -600,16 +641,13 @@ def render():
         "FASTQ source, metadata, reference genome, and options up front "
         "on one guided screen."
     )
-
     pipeline_choice = st.selectbox(
         "Which pipeline would you like to run in Auto mode?",
         options=list(PIPELINE_AUTO_HANDLERS.keys()),
         key="adv_pipeline_choice",
     )
-
     handler = PIPELINE_AUTO_HANDLERS.get(pipeline_choice)
     st.markdown("---")
-
     if handler is None:
         st.info(
             f"⏳ An Auto workflow for **{pipeline_choice}** isn't built yet -- "
@@ -618,5 +656,4 @@ def render():
             "step-by-step workspace in the sidebar in the meantime."
         )
         return
-
     handler()

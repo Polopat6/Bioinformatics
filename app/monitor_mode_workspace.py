@@ -22,7 +22,34 @@ followed by a form to configure and start a brand-new one.
 Every project a monitor launches is a completely normal project
 afterward -- browsable in Trimming/Alignment/DESeq2/Ontology like any
 other -- since Monitor Mode launches through the exact same
-advanced_mode_orchestrator engine Auto uses.
+advanced_mode_orchestrator engine Auto uses. Once a launched project's
+gene counts matrix is ready, project_actions.py's shared "completed
+project" actions (download package zip, "Begin DE Analysis" hand-off to
+the DESeq2 workspace) are surfaced right in that project's row -- see
+_render_monitor_launched_projects() below.
+
+--- Bug fix (2026-08-16) ---
+Previously, render() unconditionally called _render_new_monitor_form()
+on every rerun, with no session_state-based view swap between "show the
+setup form" and "a monitor is already running". This meant that
+clicking "Save & Start Monitor" would launch the monitor and st.rerun(),
+but on that very next run the newly-started monitor now appeared in the
+"Configured Monitors" list ABOVE the exact same setup form, which was
+still rendered right below it -- fully populated with the just-submitted
+name/settings (now showing a confusing "already exists" error, since
+that monitor_id was no longer available). There was also no else branch
+to hide the form once a monitor existed, and the confirmation
+st.success() was called immediately before st.rerun(), so it was wiped
+out by the rerun before the user ever saw it.
+
+Fix: a `show_new_monitor_form` session_state flag now gates the form
+(defaulting to shown only when no monitors exist yet), a "+ Configure
+Another Monitor" button reveals it on demand, the flag is explicitly
+cleared (view swapped back to the monitor list) right after a
+successful save, all "new_mon"-prefixed widget state is reset so the
+form opens blank next time, and the success confirmation is stashed in
+session_state so it actually survives the rerun and is shown once, at
+the top of the page.
 """
 import streamlit as st
 
@@ -32,6 +59,7 @@ import file_browser as fb
 import monitor_manager as mm
 import notification_manager as notif
 import advanced_mode_orchestrator as orch
+import project_actions as pa
 
 STATUS_ICONS = {"watching": "👀", "rejected": "⚠️", "launched": "🔄", "complete": "✅", "pipeline_error": "❌"}
 ACTIVITY_ICONS = {
@@ -39,13 +67,14 @@ ACTIVITY_ICONS = {
     "launched": "🚀", "pipeline_complete": "✅", "pipeline_failed": "❌",
 }
 
-
 # ---------------------------------------------------------------------------
 # Shared sub-forms (parameterized by key_prefix so the SAME widgets can be
 # rendered independently for multiple monitors without session_state key
 # collisions -- see app.py's own note on why grouped-widget state needs
 # distinct keys across otherwise-identical screens)
 # ---------------------------------------------------------------------------
+
+
 def _render_preset_options_step(key_prefix, existing=None):
     """
     The reference genome + alignment/quantification options for a
@@ -54,6 +83,7 @@ def _render_preset_options_step(key_prefix, existing=None):
     folders don't get their own genome/options screen, since there's
     no user present to fill one out when a folder is dropped
     automatically).
+
     Returns a dict matching the shape advanced_mode_orchestrator.py's
     config expects for "reference"/"alignment_method"/"threads"/
     "star_options", plus fixed "salmon_count_type"/"use_tximport"
@@ -155,6 +185,7 @@ def _render_notification_settings(key_prefix, existing=None):
     phone/carrier inputs, three "notify me when..." toggles, and a
     "send test notification" button so delivery can be confirmed
     before relying on it for an unattended run.
+
     Returns a dict matching monitor_manager.py's "notifications" config
     shape.
     """
@@ -189,10 +220,10 @@ def _render_notification_settings(key_prefix, existing=None):
             index=carrier_options.index(existing_carrier) if existing_carrier in carrier_options else 0,
             key=f"{key_prefix}_notif_carrier",
         )
-        result["sms_phone_number"] = phone
-        result["sms_carrier"] = carrier
-        if phone and not carrier:
-            st.caption("⚠️ Select a carrier to enable text alerts -- a phone number alone can't be routed to a text.")
+    result["sms_phone_number"] = phone
+    result["sms_carrier"] = carrier
+    if phone and not carrier:
+        st.caption("⚠️ Select a carrier to enable text alerts -- a phone number alone can't be routed to a text.")
     st.caption(
         "ℹ️ Text alerts are sent via your carrier's free email-to-SMS "
         "gateway -- convenient and zero-cost, but not as reliable/"
@@ -231,6 +262,8 @@ def _render_notification_settings(key_prefix, existing=None):
 # ---------------------------------------------------------------------------
 # Per-monitor panel (existing monitor)
 # ---------------------------------------------------------------------------
+
+
 def _render_monitor_activity_feed(monitor_id):
     st.markdown("**📋 Activity Feed**")
     entries = mm.read_activity_log(monitor_id, n_most_recent=50)
@@ -239,10 +272,22 @@ def _render_monitor_activity_feed(monitor_id):
         return
     for entry in entries:
         icon = ACTIVITY_ICONS.get(entry.get("event"), "•")
-        st.markdown(f"{icon} **{entry.get('timestamp', '—')}** — `{entry.get('folder', '—')}`: {entry.get('event', '—')} — {entry.get('detail', '')}")
+        st.markdown(f"{icon} **{entry.get('timestamp', '—')}** — {entry.get('folder', '—')}: {entry.get('event', '—')} — {entry.get('detail', '')}")
 
 
 def _render_monitor_launched_projects(monitor_id):
+    """
+    List every project this monitor has launched, each with its
+    completed-step count and -- once the project's gene counts matrix
+    is actually ready (project_actions.project_package_available) --
+    the two shared "completed project" actions from project_actions.py:
+    a download button for the full packaged zip (QC/MultiQC/alignment
+    scores/counts, no raw reads), and a "Begin DE Analysis" button that
+    hands off straight to the DESeq2 workspace with this project
+    pre-selected. These were previously only defined in
+    project_actions.py but never actually called from here -- this
+    project's row was plain text with no actions at all.
+    """
     st.markdown("**🚀 Launched Projects**")
     registry = mm.read_registry_summary(monitor_id)
     launched = {k: v for k, v in registry.items() if v.get("status") in ("launched", "complete", "pipeline_error")}
@@ -256,51 +301,77 @@ def _render_monitor_launched_projects(monitor_id):
         icon = STATUS_ICONS.get(info.get("status"), "•")
         warning_note = f" ⚠️ {info['warning']}" if info.get("warning") else ""
         st.markdown(
-            f"{icon} **{folder_name}** → project `{project_name}` "
+            f"{icon} → project **{project_name}** "
             f"(launched {info.get('launched_at', '—')}) — "
             f"{len(completed_steps)} step(s) completed.{warning_note}"
         )
+        if pa.project_package_available(project_name):
+            action_col1, action_col2 = st.columns(2)
+            with action_col1:
+                zip_key = f"monitor_pkg_zip_{monitor_id}_{folder_name}"
+                if st.button("📦 Prepare Download Package", key=f"{zip_key}_prep_btn"):
+                    st.session_state[zip_key] = pa.build_project_package_zip(project_name)
+                if st.session_state.get(zip_key):
+                    st.download_button(
+                        "⬇️ Download Project Package (.zip)",
+                        data=st.session_state[zip_key],
+                        file_name=f"{project_name}_package.zip",
+                        mime="application/zip",
+                        key=f"{zip_key}_dl_btn",
+                    )
+            with action_col2:
+                if st.button("🌋 Begin DE Analysis", key=f"monitor_begin_de_{monitor_id}_{folder_name}"):
+                    pa.request_navigation_to_deseq2(project_name)
+                    st.rerun()
+        elif info.get("status") == "launched":
+            st.caption("⏳ Pipeline still running -- packaging/DE hand-off will appear once the gene counts matrix is ready.")
 
 
 def _render_existing_monitor(monitor_id):
     config = mm.load_monitor_config(monitor_id)
     running = mm.is_monitor_running(monitor_id)
     status_label = "🟢 Running" if running else "⚪ Stopped"
-    with st.expander(f"**{monitor_id}** — {status_label} — watching `{config['watch_dir']}`", expanded=False):
+    with st.expander(f"{status_label} **{monitor_id}** — watching {config['watch_dir']}", expanded=False):
         col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
             st.caption(
-                f"Sample-ID column: `{config.get('sample_id_column', mm.DEFAULT_SAMPLE_ID_COLUMN)}` · "
+                f"Sample-ID column: {config.get('sample_id_column', mm.DEFAULT_SAMPLE_ID_COLUMN)} · "
                 f"Poll every {config.get('poll_interval_seconds', 30)}s"
             )
         with col2:
             if running:
                 if st.button("⏹️ Stop", key=f"stop_{monitor_id}"):
                     mm.stop_monitor(monitor_id)
-                    st.success(f"Stopped monitor '{monitor_id}'. Any pipeline run(s) it already launched keep running independently.")
+                    st.session_state["_monitor_action_message"] = (
+                        "success",
+                        f"Stopped monitor '{monitor_id}'. Any pipeline run(s) it already launched keep running independently.",
+                    )
                     st.rerun()
             else:
                 if st.button("▶️ Start", key=f"start_{monitor_id}"):
                     pid = mm.launch_monitor_daemon(monitor_id)
-                    st.success(f"Started monitor '{monitor_id}' (process ID {pid}).")
+                    st.session_state["_monitor_action_message"] = (
+                        "success",
+                        f"Started monitor '{monitor_id}' (process ID {pid}).",
+                    )
                     st.rerun()
         with col3:
             if not running:
                 if st.button("🗑️ Delete", key=f"delete_{monitor_id}"):
                     st.session_state[f"_confirm_delete_{monitor_id}"] = True
-        if st.session_state.get(f"_confirm_delete_{monitor_id}"):
-            st.warning(f"⚠️ Permanently delete monitor '{monitor_id}'? This does NOT delete any project(s) it already launched.")
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                if st.button("Yes, delete this monitor", key=f"confirm_delete_{monitor_id}"):
-                    mm.delete_monitor(monitor_id)
-                    st.session_state.pop(f"_confirm_delete_{monitor_id}", None)
-                    st.success(f"Monitor '{monitor_id}' deleted.")
-                    st.rerun()
-            with cc2:
-                if st.button("Cancel", key=f"cancel_delete_{monitor_id}"):
-                    st.session_state.pop(f"_confirm_delete_{monitor_id}", None)
-                    st.rerun()
+                if st.session_state.get(f"_confirm_delete_{monitor_id}"):
+                    st.warning(f"⚠️ Permanently delete monitor '{monitor_id}'? This does NOT delete any project(s) it already launched.")
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        if st.button("Yes, delete this monitor", key=f"confirm_delete_{monitor_id}"):
+                            mm.delete_monitor(monitor_id)
+                            st.session_state.pop(f"_confirm_delete_{monitor_id}", None)
+                            st.session_state["_monitor_action_message"] = ("success", f"Monitor '{monitor_id}' deleted.")
+                            st.rerun()
+                    with cc2:
+                        if st.button("Cancel", key=f"cancel_delete_{monitor_id}"):
+                            st.session_state.pop(f"_confirm_delete_{monitor_id}", None)
+                            st.rerun()
         st.markdown("---")
         _render_monitor_activity_feed(monitor_id)
         st.markdown("---")
@@ -310,6 +381,25 @@ def _render_existing_monitor(monitor_id):
 # ---------------------------------------------------------------------------
 # New monitor setup form
 # ---------------------------------------------------------------------------
+
+
+def _clear_new_monitor_form_state():
+    """
+    Reset every widget belonging to the "new monitor" setup form -- ALL of
+    which are keyed with the "new_mon" prefix (see this module's docstring
+    on key_prefix, and every st.*(..., key=f"{key_prefix}_...") call above
+    with key_prefix="new_mon") -- back to Streamlit's defaults.
+
+    Called right after a monitor is successfully saved & started so that
+    the NEXT time this form is reopened (e.g. to configure a second,
+    independent monitor) it starts blank instead of showing the
+    just-submitted monitor's stale name/settings.
+    """
+    for key in list(st.session_state.keys()):
+        if key.startswith("new_mon"):
+            del st.session_state[key]
+
+
 def _render_new_monitor_form():
     st.subheader("➕ Configure a New Monitor")
     st.caption(
@@ -377,7 +467,16 @@ def _render_new_monitor_form():
         }
         mm.create_monitor(monitor_id, config)
         pid = mm.launch_monitor_daemon(monitor_id)
-        st.success(f"✅ Monitor '{monitor_id}' started (process ID {pid}), watching `{watch_dir}`. You can close this tab -- it keeps running in the background.")
+        # --- Bug fix: view-swap back to the monitor list instead of leaving
+        # this same (now stale) form rendered underneath the newly-running
+        # monitor. The confirmation message is stashed in session_state
+        # (rather than st.success()'d here) so it actually survives the
+        # st.rerun() below and is shown once, at the top of render().
+        st.session_state["_just_started_monitor"] = {
+            "monitor_id": monitor_id, "pid": pid, "watch_dir": watch_dir,
+        }
+        st.session_state["show_new_monitor_form"] = False
+        _clear_new_monitor_form_state()
         st.rerun()
 
 
@@ -394,6 +493,25 @@ def render():
         "run afterward for each resulting project, same as Auto."
     )
     st.markdown("---")
+
+    # One-time confirmation banners, sourced from session_state so they
+    # survive the st.rerun() that follows the action which set them (a plain
+    # st.success() called immediately before st.rerun() is wiped out before
+    # Streamlit ever paints it -- this was true of the "new monitor" save
+    # button as well as the per-monitor Start/Stop/Delete buttons below).
+    just_started = st.session_state.pop("_just_started_monitor", None)
+    if just_started:
+        st.success(
+            f"✅ Monitor '{just_started['monitor_id']}' started (process ID "
+            f"{just_started['pid']}), watching {just_started['watch_dir']}. "
+            "You can close this tab -- it keeps running in the background. "
+            "See it listed below."
+        )
+    action_message = st.session_state.pop("_monitor_action_message", None)
+    if action_message:
+        level, message = action_message
+        getattr(st, level, st.info)(message)
+
     existing_monitors = mm.list_monitors()
     if existing_monitors:
         st.subheader(f"Configured Monitors ({len(existing_monitors)})")
@@ -402,4 +520,21 @@ def render():
         st.markdown("---")
     else:
         st.caption("No monitors configured yet -- set one up below.")
-    _render_new_monitor_form()
+
+    # --- Bug fix: view swap between the monitor list and the "new monitor"
+    # setup form. Previously this form was rendered unconditionally every
+    # time render() ran, so right after clicking "Save & Start Monitor" the
+    # newly-running monitor appeared above while the exact same setup
+    # inputs -- still populated with the just-submitted name/settings --
+    # remained fully visible below it (and, since that monitor_id now
+    # existed, showed a confusing "already exists" error on top of it).
+    # The form now defaults to shown only when no monitors exist yet
+    # (first-time setup), is explicitly hidden right after a successful
+    # save, and can be re-revealed on demand via the button below.
+    show_form = st.session_state.get("show_new_monitor_form", not existing_monitors)
+    if show_form:
+        _render_new_monitor_form()
+    else:
+        if st.button("➕ Configure Another Monitor", key="show_new_mon_form_btn"):
+            st.session_state["show_new_monitor_form"] = True
+            st.rerun()

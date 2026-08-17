@@ -1,108 +1,103 @@
-# Use a stable Ubuntu base image with R pre-installed
-FROM rocker/r-ver:4.3.2
+# Dockerfile
+#
+# Builds the Multi-Omics Bioinformatics Portal image entirely from
+# environment.yml (this repo's single source of truth for Python, R/
+# Bioconductor, and CLI tool dependencies) via micromamba -- so this image
+# can never drift out of sync with what a local or HPC conda/mamba install
+# would produce from the same environment.yml.
+#
+# --- Replaces the OLD, hand-maintained Dockerfile (2026-08-17) ---
+# The old Dockerfile (rocker/r-ver base, manual apt/curl/conda/R/pip install
+# steps scattered across the file) is being retired in favor of this one.
+# Reviewing it surfaced several things this file's environment.yml now
+# restores that were previously missing here: nextflow + its Java
+# dependency, gffread, bioconductor-limma (REQUIRED for DESeq2's batch-
+# adjusted PCA -- not optional), and r-duckdb/r-dbi/r-tidyr for the Spatial
+# Transcriptomics pipeline (Nextflow -> R spatial core -> DuckDB, see
+# spatial_workspace.py / main.nf / bin/process_spatial.R). See
+# environment.yml's own header comment for the full list and reasoning.
+#
+# --- kaleido + Chrome (2026-08-17) ---
+# python-kaleido v1+ (see environment.yml -- the old 0.2.* pin was a
+# deprecated version) never bundles Chrome, regardless of whether it's
+# installed via conda or pip -- a separate one-time `kaleido.get_chrome_sync()`
+# call is required to fetch a compatible Chrome/Chromium build. The old
+# Dockerfile had already correctly identified this and ran the equivalent
+# pip-based prefetch at BUILD time (network access available then) rather
+# than leaving it to happen at first real use at RUNTIME (where the
+# container may have no outbound network access, silently breaking PDF
+# export on its first real use). That same build-time prefetch is
+# reproduced below, now against the conda-installed python-kaleido.
+#
+# --- Repo layout (CONFIRMED, 2026-08-17) ---
+# repo root contains environment.yml/Dockerfile/bin/(process_spatial.R)/
+# main.nf/nextflow.config, with the Streamlit app itself in an app/
+# subfolder (repo/app/app.py, repo/app/.streamlit/config.toml, etc.) --
+# matching the OLD Dockerfile's own COPY/chmod paths (COPY . /app; chmod +x
+# /app/bin/process_spatial.R), now confirmed against the real checkout.
+#
+# One deliberate deviation from the old Dockerfile: its CMD launched
+# Streamlit as `streamlit run app/app.py` from the REPO ROOT (no `cd` into
+# app/ first). This project's own confirmed, HPC-tested fix for a real
+# Streamlit upload-limit bug established that `.streamlit/config.toml` is
+# ONLY ever read relative to the directory `streamlit run` is invoked
+# FROM, and that the working invocation is `cd repo/app && streamlit run
+# app.py` (see DEPLOYMENT.md). The old CMD predates that fix and likely
+# carried the identical latent bug -- any config.toml at
+# repo/app/.streamlit/ would have been silently ignored under a
+# "run from repo root" invocation, quite possibly unnoticed simply because
+# no single upload through that container ever happened to exceed
+# Streamlit's default 200MB limit. This Dockerfile intentionally uses the
+# CONFIRMED-working "cd into app/" convention below instead.
+#
+# BUILD:
+#   docker build -t bioportal:latest .
+#
+# RUN (mounts a persistent projects/reference-cache volume so projects and
+# shared reference genomes/indices survive container restarts -- see
+# project_manager.py's PROJECTS_ROOT / SHARED_REFERENCES_ROOT):
+#   docker run -p 8501:8501 -v "$(pwd)/data:/workspace/repo/app/data" bioportal:latest
 
-# 1. Install system dependencies for spatial genomics, databases, and
-#    bulk RNA-seq tooling (Nextflow requires Java; unzip is needed by the
-#    Nextflow installer).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip \
-    python3-dev \
-    libcurl4-openssl-dev \
-    libssl-dev \
-    libxml2-dev \
-    procps \
-    curl \
-    default-jre-headless \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
+FROM mambaorg/micromamba:1.5.8 AS base
 
-# 2. Install Nextflow itself (required to run main.nf inside this
-#    container rather than relying on the host machine).
-RUN curl -s https://get.nextflow.io | bash \
-    && mv nextflow /usr/local/bin/ \
-    && chmod +x /usr/local/bin/nextflow
+# Build the conda/mamba environment from the single-source-of-truth spec.
+# Copying ONLY environment.yml first (before the rest of the source) means
+# Docker's layer cache is reused for this expensive step on every rebuild
+# that doesn't change dependencies -- only touches app code afterward.
+COPY --chown=$MAMBA_USER:$MAMBA_USER environment.yml /tmp/environment.yml
+RUN micromamba install -y -n base -f /tmp/environment.yml && \
+    micromamba clean --all --yes
+ARG MAMBA_DOCKERFILE_ACTIVATE=1
 
-# 3. Install fastp (adapter/quality trimming tool used by the Trimming &
-#    Post-Trim QC workspace). Downloaded as a precompiled static binary
-#    directly from the official fastp release site, since fastp is a
-#    single compiled executable rather than a pip/conda/R package.
-RUN curl -L -o /usr/local/bin/fastp http://opengene.org/fastp/fastp.0.23.4 \
-    && chmod +x /usr/local/bin/fastp
+# One-time Chrome pre-fetch for kaleido v1+ (see this file's header comment)
+# -- done here, at BUILD time while network access is available, rather
+# than deferred to the container's first real PDF-export use at runtime.
+RUN python -c "import kaleido; kaleido.get_chrome_sync()"
 
-# 4. Install Miniforge (conda) to get Salmon, FastQC, and MultiQC with
-#    pinned, reproducible versions rather than fighting apt package
-#    availability.
-RUN curl -L -o /tmp/miniforge.sh \
-    https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
-    && bash /tmp/miniforge.sh -b -p /opt/conda \
-    && rm /tmp/miniforge.sh
-ENV PATH="/opt/conda/bin:${PATH}"
+# --- Application code ---
+# See this file's "Repo layout (CONFIRMED)" comment above.
+WORKDIR /workspace
+COPY --chown=$MAMBA_USER:$MAMBA_USER repo/ /workspace/repo/
 
-RUN conda install -y -c bioconda -c conda-forge \
-    salmon=1.10.* \
-    fastqc=0.12.* \
-    multiqc=1.19.* \
-    star=2.7.* \
-    gffread=0.12.* \
-    sra-tools=3.1.* \
-    && conda clean -afy
+# The Spatial Transcriptomics pipeline's R script (invoked by main.nf) must
+# be executable and reachable on PATH, exactly as the old Dockerfile
+# ensured -- restored here since it's an application asset the old file
+# handled that had no equivalent step in this file's earlier draft.
+RUN chmod +x /workspace/repo/bin/process_spatial.R
+ENV PATH="/workspace/repo/bin:${PATH}"
 
-# 5. Install R packages inside the container
-#    - DBI/duckdb/tidyr: existing spatial pipeline dependencies (tidyr
-#      kept installed just in case any script still references it, even
-#      though it was found to be unused in the cleaned-up version)
-#    - jsonlite: reads the job-spec JSON file passed into the DESeq2
-#      Rscript (deseq2_manager.py's _DESEQ2_R_SCRIPT) -- required
-#      explicitly since it is NOT a guaranteed transitive dependency of
-#      DESeq2/tximport and the script hard-fails without it.
-#    - tximport: imports Salmon quant.sf output into R
-#    - DESeq2: differential expression analysis (Bioconductor)
-#    - limma: provides removeBatchEffect(), used by the DESeq2 R script
-#      to build the batch-adjusted PCA view (visualization only) shown
-#      side-by-side with the raw PCA in the Differential Expression
-#      workspace whenever a batch column is selected -- previously
-#      missing here, which would hard-fail at runtime
-#      ("there is no package called 'limma'") for any project using a
-#      batch column, since the script does `library(limma)` directly.
-RUN R -e "install.packages(c('DBI', 'duckdb', 'tidyr', 'jsonlite', 'BiocManager'), repos='https://cran.r-project.org')" \
-    && R -e "BiocManager::install(c('tximport', 'DESeq2', 'limma'), update = FALSE, ask = FALSE)"
+# Streamlit reads .streamlit/config.toml relative to the directory `streamlit
+# run` is invoked FROM -- WORKDIR must match that exact directory (repo/app),
+# not just contain it, per this project's own confirmed HPC testing (see
+# this file's header comment on the repo layout assumption).
+WORKDIR /workspace/repo/app
 
-# 6. Copy application dependency records
-WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-
-# 7. Install Python packages inside the container
-#    (streamlit, duckdb, plotly, pandas, openpyxl, kaleido — see
-#    requirements.txt). `kaleido` is pinned/verified explicitly here
-#    (in addition to whatever requirements.txt specifies) since it
-#    backs the "Save as PDF" plot export feature in the Differential
-#    Expression workspace, and its behavior differs meaningfully by
-#    version:
-#      - kaleido >= 1.0 no longer bundles Chromium; it downloads a
-#        Chrome binary on first use via `kaleido.get_chrome_sync()`.
-#        That download requires network access, so it's done here at
-#        BUILD time (when the image build has internet access) rather
-#        than left to happen at runtime, where the container may be
-#        deployed without outbound network access and PDF export would
-#        silently fail on its first real use.
-#      - kaleido 0.2.1 (the old pin some deployments still use because
-#        it bundles Chromium directly, avoiding the download above) is
-#        already past Plotly's own deprecation cutoff (Sept 2025) --
-#        intentionally NOT used here in favor of a current kaleido
-#        release with the Chrome binary pre-fetched at build time.
-RUN pip3 install --no-cache-dir -r requirements.txt \
-    && pip3 install --no-cache-dir "kaleido>=1.0.0" \
-    && python3 -c "import kaleido; kaleido.get_chrome_sync()"
-
-# 8. Copy the rest of the project files into the container
-COPY . /app
-
-# Ensure our custom R script remains executable inside Linux environments
-RUN chmod +x /app/bin/process_spatial.R
-ENV PATH="/app/bin:${PATH}"
-
-# Set the default port exposure window for our user interface server
 EXPOSE 8501
 
-# Default command launches the UI if the container is run stand-alone
-CMD ["streamlit", "run", "app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# --server.maxUploadSize is passed explicitly here too (belt-and-suspenders
+# alongside .streamlit/config.toml) since it's cheap insurance against the
+# exact config-discovery failure mode described above.
+ENTRYPOINT ["streamlit", "run", "app.py", \
+            "--server.address=0.0.0.0", \
+            "--server.port=8501", \
+            "--server.maxUploadSize=2048"]

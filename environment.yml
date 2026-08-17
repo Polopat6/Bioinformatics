@@ -1,0 +1,224 @@
+# environment.yml
+#
+# SINGLE SOURCE OF TRUTH for every dependency the Multi-Omics Bioinformatics
+# Portal needs -- Python packages, R/Bioconductor packages, AND external CLI
+# bioinformatics tools -- so Docker, HPC (conda/mamba), and local installs
+# all build from exactly this one file instead of drifting out of sync.
+# Lives at the REPO ROOT, alongside Dockerfile/DEPLOYMENT.md -- NOT inside
+# app/, since it describes the whole runtime stack, not just the Streamlit
+# app's own Python imports.
+#
+# --- Merged in from the OLD, hand-maintained Dockerfile ---
+# This project has two pipelines sharing one dependency stack: Bulk RNA-Seq
+# (Streamlit-native) and Spatial Transcriptomics (Nextflow -> R spatial core
+# -> DuckDB -> Streamlit). Reviewing the OLD Dockerfile surfaced nextflow,
+# gffread, r-duckdb/r-dbi/r-tidyr, and bioconductor-limma (REQUIRED, not
+# optional -- powers DESeq2's removeBatchEffect() batch-adjusted PCA view).
+#
+# --- kaleido version correction ---
+# python-kaleido is left UNPINNED (not "=0.2.*", which is a deprecated,
+# unsupported version per Plotly's own Sept-2025 cutoff). Regardless of
+# install method, kaleido v1+ never bundles Chrome -- run
+# `python -c "import kaleido; kaleido.get_chrome_sync()"` once after
+# installing (automated at Docker build time; see Dockerfile/DEPLOYMENT.md
+# for the local/HPC one-time step).
+#
+# --- Single-cell RNA-Seq pipeline additions (2026-08-17) ---
+# Added for the new Single-cell RNA-Seq pipeline (app/single_cell/) --
+# Phase 1 (ingestion through STARsolo alignment/cell-calling) plus the
+# CONFIRMED, real packages Phase 2/3 will need (cell-level QC, clustering,
+# annotation), added now so environment.yml stays the single point where
+# every dependency this app will ever need is tracked, rather than being
+# updated piecemeal phase-by-phase:
+#   - alevin-fry: the optional faster alternate to STARsolo (Phase 1)
+#   - scanpy + anndata + python-igraph + leidenalg: the Python-native
+#     interactive analysis layer (normalization, clustering, UMAP -- Phase 3)
+#   - harmonypy: Harmony batch-correction algorithm, recommended default
+#     (Phase 3)
+#   - celltypist: optional automated first-pass cell type annotation
+#     (Phase 3) -- its own bioconda recipe already depends on
+#     scanpy/anndata/leidenalg, so no separate pins are needed for those
+#   - bioconductor-scdblfinder: doublet detection (Phase 2)
+#   - r-soupx: ambient RNA correction, DEFAULT choice (Phase 2) -- confirmed
+#     on CRAN, with a bioconda-built "r-soupx" conda package also confirmed
+#     available (r-universe listing: "Conda: r-soupx-1.6.2")
+#   - bioconductor-decontx: ambient RNA correction, ALTERNATIVE choice
+#     (Phase 2) -- confirmed as its own standalone Bioconductor package
+#     (not just bundled inside the larger `celda` package)
+# NOT included: scvi-tools (a heavier, GPU-oriented alternative to Harmony
+# for batch correction) -- Harmony is the recommended default and covers
+# the common case; scvi-tools can be added when/if that specific optional
+# path is actually implemented, to avoid pulling in its substantial
+# PyTorch dependency chain before it's actually used by any code.
+#
+# USAGE
+# -----
+# Local machine:
+#   mamba env create -f environment.yml
+#   mamba activate bioportal
+#   python -c "import kaleido; kaleido.get_chrome_sync()"   # one-time
+#   cd repo/app && streamlit run app.py
+#
+# HPC:
+#   mamba env create -f environment.yml -p $SCRATCH/envs/bioportal
+#   mamba activate $SCRATCH/envs/bioportal
+#   python -c "import kaleido; kaleido.get_chrome_sync()"   # one-time
+#   cd repo/app && streamlit run app.py --server.maxUploadSize=2048
+#
+# Docker: see Dockerfile, which installs from this exact file via micromamba
+# and runs the kaleido Chrome pre-fetch automatically at build time.
+#
+# REPRODUCIBILITY NOTE
+# ---------------------
+# Bioconductor packages (and Bioconductor-adjacent CRAN packages like
+# SoupX) are left UNPINNED deliberately -- Bioconductor's twice-yearly
+# release cadence does not bump every package's version every cycle, and
+# this project previously hit a real install failure from guessed,
+# never-actually-published version pins. Each package's own recipe already
+# declares its compatible r-base bound, so the solver picks a real,
+# compatible version automatically. CLI tools and core language runtimes
+# (which follow ordinary, densely-published semver) remain pinned.
+#
+# For full bit-for-bit reproducibility once this file has stabilized,
+# generate and commit a conda-lock.yml alongside it:
+#   pip install conda-lock
+#   conda-lock lock -f environment.yml -p linux-64 --lockfile conda-lock.yml
+#   conda-lock install --name bioportal conda-lock.yml
+name: bioportal
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # -------------------------------------------------------------------
+  # Core language runtimes
+  # -------------------------------------------------------------------
+  - python=3.11
+  - r-base=4.3
+
+  # -------------------------------------------------------------------
+  # External CLI bioinformatics tools
+  # -------------------------------------------------------------------
+  - fastqc=0.12.*
+  - multiqc=1.21.*
+  - fastp=0.23.*
+  - salmon=1.10.*
+  - star=2.7.11b
+  - sra-tools=3.1.*           # NCBI/SRA download (prefetch + fasterq-dump)
+  - gffread                  # GFF/GTF format conversion/filtering utility
+                              # (spatial pipeline reference prep)
+  - nextflow                 # workflow engine for the Spatial Transcriptomics
+                              # pipeline's main.nf -- its own bioconda recipe
+                              # depends on openjdk, pulled in automatically
+  - alevin-fry               # Single-cell RNA-Seq: optional faster alternate
+                              # to STARsolo (see single_cell/starsolo_manager.py)
+
+  # -------------------------------------------------------------------
+  # Python packages
+  # -------------------------------------------------------------------
+  - streamlit=1.37.*
+  - pandas=2.2.*
+  - plotly=5.22.*
+  - python-kaleido            # UNPINNED -- see "kaleido version correction" above
+  - duckdb=1.0.*              # Python DuckDB (reads the spatial pipeline's
+                              # R-written DuckDB file; separate from r-duckdb)
+  - openpyxl=3.1.*
+  - scipy=1.13.*
+  - paramiko=3.4.*            # SSH client for hpc_manager.py's HPC connection
+                              # test/setup page (see setup_workspace.py)
+  - requests=2.32.*           # NCBI esearch/efetch HTTP calls (sra_manager.py)
+
+  # --- Single-cell RNA-Seq: Python analysis layer (Phase 3) ---
+  - scanpy                    # interactive normalization/clustering/UMAP layer
+  - anndata                   # scanpy's underlying data structure -- also the
+                              # planned future multi-omics warehouse's storage
+                              # format (see project roadmap notes)
+  - python-igraph             # required by leidenalg for graph-based clustering
+  - leidenalg                 # Leiden clustering algorithm (current best
+                              # practice, supersedes Louvain)
+  - harmonypy                 # Harmony batch-correction algorithm (recommended
+                              # default for multi-sample integration)
+  - celltypist                # optional automated first-pass cell type
+                              # annotation ("helpful starting guess to review
+                              # and correct, not ground truth" -- see
+                              # single-cell pipeline plan)
+
+  # -------------------------------------------------------------------
+  # R / Bioconductor packages
+  # -------------------------------------------------------------------
+  # Left UNPINNED -- see "REPRODUCIBILITY NOTE" above.
+  - bioconductor-deseq2
+  - r-jsonlite                # DESeq2 R script's job-spec I/O
+  - bioconductor-tximport      # Salmon transcript->gene count collapsing
+  - bioconductor-clusterprofiler  # bitr() ID mapping; GO/KEGG enrichment
+  - bioconductor-reactompa        # Reactome pathway enrichment
+  - bioconductor-gosemsim          # clusterProfiler::simplify() GO term dedup
+  - bioconductor-limma         # removeBatchEffect() for DESeq2's
+                              # batch-adjusted PCA view -- REQUIRED, not
+                              # optional; see this file's header comment
+  - r-duckdb                  # spatial pipeline's R -> DuckDB write path
+  - r-dbi                     # DBI generic used directly and as r-duckdb's
+                              # own dependency -- kept explicit for clarity
+  - r-tidyr                   # legacy spatial-pipeline dependency, kept per
+                              # the old Dockerfile's own note
+
+  # --- Single-cell RNA-Seq: R-based cell-level QC (Phase 2) ---
+  # Reserved for the specific jobs with no good Python equivalent -- see
+  # single_cell/ module docstrings for the full rationale (scanpy handles
+  # everything else in the pipeline natively, in-process).
+  - bioconductor-scdblfinder   # doublet detection
+  - r-soupx                    # ambient RNA correction -- DEFAULT choice
+                              # (2026 benchmarking credits it with minimal
+                              # count distortion; confirmed real bioconda
+                              # package, not just CRAN-only)
+  - bioconductor-decontx       # ambient RNA correction -- ALTERNATIVE choice
+                              # (per-cell contamination estimate; works from
+                              # the filtered matrix alone, no raw/unfiltered
+                              # matrix required)
+
+  # -------------------------------------------------------------------
+  # Organism annotation packages (org.*.db), one per PRESET species in
+  # reference_manager.py's REFERENCE_CATALOG. Add a new organism's
+  # org.*.db package here the same day it's added to REFERENCE_CATALOG.
+  # -------------------------------------------------------------------
+  - bioconductor-org.hs.eg.db     # human (Homo sapiens)
+  - bioconductor-org.mm.eg.db     # mouse (Mus musculus)
+  - bioconductor-org.dm.eg.db     # fly (Drosophila melanogaster)
+  - bioconductor-org.sc.sgd.db    # yeast (Saccharomyces cerevisiae) --
+                                  # NOTE: keyed by SGD ORF identifiers, not
+                                  # Entrez Gene IDs like the others
+  - bioconductor-org.ce.eg.db     # roundworm (Caenorhabditis elegans)
+  - bioconductor-org.dr.eg.db     # zebrafish (Danio rerio)
+  - bioconductor-org.eck12.eg.db  # E. coli strain K-12
+
+  # -------------------------------------------------------------------
+  # pip-only packages
+  # -------------------------------------------------------------------
+  - pip
+  - pip:
+      - watchdog>=4.0,<5   # reserved for a possible future event-driven
+                           # Monitor Mode watcher; not currently required
+                           # by its poll_interval_seconds-based design
+
+# -------------------------------------------------------------------
+# NOT included here (intentionally, per current project roadmap):
+# -------------------------------------------------------------------
+# - eggNOG-mapper / its ~50GB local database -- on hold; planned as an
+#   admin-only one-time shared-resource setup when actively built.
+# - scvi-tools -- optional, heavier alternative to Harmony for batch
+#   correction; add only once that specific path is actually implemented
+#   in code (see "Single-cell RNA-Seq pipeline additions" note above).
+# - 10x Genomics' `bamtofastq` (NOT the same as sra-tools' own tooling,
+#   and NOT available on conda-forge/bioconda as of this writing --
+#   confirmed 10x distributes it only as standalone prebuilt binaries
+#   from their own GitHub releases, github.com/10XGenomics/bamtofastq).
+#   Needed only for the (currently unhandled) case where a single-cell
+#   NCBI/SRA accession was originally deposited as a 10x-specific BAM
+#   file rather than plain FASTQ -- see single_cell/sc_sra_manager.py's
+#   module docstring, point 2, for the full detection/warning behavior
+#   this pipeline currently has WITHOUT this tool (an honest warning
+#   pointing the user to the accession's own SRA page, rather than a
+#   silent failure or an incorrect FASTQ reconstruction). Add this via
+#   a Dockerfile RUN step downloading the prebuilt binary directly (the
+#   same pattern the OLD Dockerfile used for fastp) if/when automating
+#   this specific case becomes worth the added maintenance surface.

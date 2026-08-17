@@ -2,53 +2,92 @@
 app.py
 
 Thin router / entry point for the Multi-Omics Bioinformatics Portal.
-
 This file should rarely need to change. All workspace-specific logic lives
 in its own module:
-    - spatial_workspace.py       -> 10x Genomics Visium Viewer
-    - bulk_rnaseq_workspace.py   -> Bulk RNA-Seq Pipeline (upload, matching, QC)
-    - trimming_workspace.py      -> Adapter Trimming & Post-Trim QC
-    - alignment_workspace.py     -> RNA Alignment & Counts (Salmon quantification)
-    - differential_expression_workspace.py -> Differential Expression (DESeq2)
-    - ontology_workspace.py      -> Ontology Analysis (GO/pathway enrichment)
+  - spatial_workspace.py       -> 10x Genomics Visium Viewer
+  - bulk_rnaseq_workspace.py   -> Bulk RNA-Seq Pipeline (upload, matching, QC)
+  - trimming_workspace.py      -> Adapter Trimming & Post-Trim QC
+  - alignment_workspace.py     -> RNA Alignment & Counts (Salmon quantification)
+  - differential_expression_workspace.py -> Differential Expression (DESeq2)
+  - ontology_workspace.py      -> Ontology Analysis (GO/pathway enrichment)
+  - setup_workspace.py         -> Setup & Deployment (environment check, HPC SSH connections)
+  - single_cell/singlecell_workspace.py -> Single-cell RNA-Seq (Phase 1: ingestion
+    through STARsolo alignment/cell-calling, plus a Phase 2 Cell-level QC
+    placeholder page; see that module's own docstring for scope --
+    droplet-based UMI methods only)
 
 Keeping workspaces in separate files means work on one pipeline (e.g. Bulk
 RNA-Seq) can never accidentally break another (e.g. Spatial Transcriptomics).
 
-Sidebar structure
-------------------
+### Sidebar structure
+
 Rather than one long flat list of radio buttons, workspace steps are grouped
 into collapsible sidebar drawers ("expanders") -- one per pipeline -- via
-render_pipeline_section() below. "Portal Home" sits outside any pipeline
-group as a standalone button, since it isn't a pipeline step.
+render_pipeline_section() below. "Portal Home" and "Setup & Deployment" both
+sit outside any pipeline group as standalone buttons, since neither is a
+pipeline step -- Setup & Deployment is a cross-cutting utility page (see
+setup_workspace.py's own module docstring), exactly like Portal Home.
 
-Because a workspace's step now lives inside a *per-pipeline* radio widget
+Because a workspace's step now lives inside a _per-pipeline_ radio widget
 instead of one single radio, routing can no longer be driven directly by a
 single widget's session_state value. Instead, a plain (non-widget) key,
 st.session_state["active_workspace"], is the single source of truth used
 for routing below. It is updated in one of two ways:
-    1. A grouped radio's on_change callback, fired the moment the user
-       picks a step inside an expanded pipeline drawer.
-    2. The pending-nav-request block below, used when another workspace
-       module (e.g. the "Proceed to Trimming" button at the end of
-       bulk_rnaseq_workspace.py) requests navigation by setting
-       st.session_state["nav_request"] and calling st.rerun().
+  1. A grouped radio's on_change callback, fired the moment the user
+     picks a step inside an expanded pipeline drawer.
+  2. The pending-nav-request block below, used when another workspace
+     module (e.g. the "Proceed to Trimming" button at the end of
+     bulk_rnaseq_workspace.py, singlecell_workspace.py's own "Proceed to
+     Phase 2: Cell-level QC" button, or project_actions.py's "Begin DE
+     Analysis" hand-off from Auto/Monitor Mode) requests navigation by
+     setting st.session_state["nav_request"] and calling st.rerun().
 
 Note on cross-page navigation and expander state: Streamlit's st.expander
-has no `key` parameter (even as of Streamlit 1.52), so it cannot track its
+has no key parameter (even as of Streamlit 1.52), so it cannot track its
 own open/closed state in session_state, and manually toggling one via the
 UI is not visible to the script until some other rerun occurs -- at which
-point whatever `expanded=` value the code passes will win. To make this
-work *with* that constraint rather than fight it, each pipeline's drawer is
+point whatever expanded= value the code passes will win. To make this
+work _with_ that constraint rather than fight it, each pipeline's drawer is
 simply expanded whenever it contains the currently active_workspace, and
 collapsed otherwise. In practice this means the drawer for whichever
 pipeline you're currently working in stays open (revealing its steps),
 while other pipelines stay tucked away until you navigate into them.
-"""
 
+--- single_cell/ subfolder import note (2026-08-17) ---
+singlecell_workspace.py and its supporting modules (sc_project_manager.py,
+chemistry_manager.py, singlecell_ingestion_manager.py,
+singlecell_trim_manager.py, starsolo_manager.py) live in a single_cell/
+subfolder rather than directly alongside this file, for cleaner file
+organization as this pipeline grows. Since Streamlit is always launched
+via `cd repo/app && streamlit run app.py` (see DEPLOYMENT.md), app.py's own
+working directory is repo/app/ -- sys.path.insert below adds single_cell/
+onto the import path so `import singlecell_workspace` resolves normally,
+the same as any other top-level module in this app, without needing
+package-relative imports or an __init__.py-based package structure.
+
+--- Single-cell Phase 2 placeholder route added (2026-08-17) ---
+Added "🔬 SC Cell-level QC" as a fourth option in the "single_cell"
+pipeline group below, plus a matching elif branch calling
+singlecell_workspace.render_cell_qc(). This was added specifically so
+Step 6's (STARsolo alignment) new "➡️ Proceed to Phase 2: Cell-level QC"
+button has a real, working navigation target -- without a matching
+PIPELINE_GROUPS entry AND elif branch, that button's nav_request would
+set active_workspace to a value matching no branch below, silently
+rendering a blank page. render_cell_qc() itself is currently a
+placeholder (Phase 2's actual scDblFinder/SoupX/DecontX implementation
+hasn't been built yet) -- only the navigation plumbing is real so far.
+"""
+import os
+import sys
 from functools import partial
 
 import streamlit as st
+
+# Make single_cell/'s modules importable as plain top-level modules (see
+# this file's own docstring note above) -- inserted once, at import time,
+# before singlecell_workspace itself (or anything it depends on) is
+# imported below.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "single_cell"))
 
 import spatial_workspace
 import bulk_rnaseq_workspace
@@ -58,24 +97,28 @@ import trimming_workspace
 import alignment_workspace
 import differential_expression_workspace
 import ontology_workspace
+import setup_workspace
+import singlecell_workspace
 
 # 1. Global Setup Layout
+
 st.set_page_config(layout="wide", page_title="Multi-Omics Bioinformatics Portal")
-
 HOME_OPTION = "📊 Portal Home"
+SETUP_OPTION = "⚙️ Setup & Deployment"
 
-# Pipeline groups: each becomes one collapsible sidebar drawer titled `title`,
+# Pipeline groups: each becomes one collapsible sidebar drawer titled title,
 # containing a radio button list of that pipeline's sequential workspace
-# steps (`options`, in pipeline order). Adding a future pipeline (e.g.
-# Single-cell RNA-seq) is just one more entry here -- no other code below
-# needs to change.
+# steps (options, in pipeline order). Adding a future pipeline is just one
+# more entry here -- no other code below needs to change.
+
+# --- Drawer order (2026-08-17) ---
+# Reordered to: Portal Home (standalone button, unaffected by this dict's
+# order) -> Bulk RNA-Seq -> Single-cell RNA-Seq -> Spatial Transcriptomics
+# -> Advanced Modes -> Setup & Deployment (standalone button). Python
+# dicts preserve insertion order, and render_pipeline_section() below
+# iterates PIPELINE_GROUPS.items() in that same order, so this dict's
+# literal key order below IS the sidebar's actual top-to-bottom order.
 PIPELINE_GROUPS = {
-    "spatial": {
-        "title": "🧠 Spatial Transcriptomics",
-        "options": [
-            "🧠 10x Genomics Visium Viewer",
-        ],
-    },
     "bulk_rnaseq": {
         "title": "🧬 Bulk RNA-Seq",
         "options": [
@@ -86,18 +129,57 @@ PIPELINE_GROUPS = {
             "🧬 Ontology Analysis",
         ],
     },
+    # Single-cell RNA-Seq: its own top-level drawer, separate from
+    # "bulk_rnaseq" above, since single-cell projects live in their own
+    # namespace (sc_project_manager.SC_PROJECTS_ROOT) and follow a
+    # meaningfully different step sequence (chemistry detection, R1/R2-
+    # aware trimming, STARsolo cell-calling).
+    #
+    # --- Multi-option fix (2026-08-17) ---
+    # This drawer previously had only ONE option ("🧫 Single-cell
+    # RNA-Seq" covering the whole pipeline as a single page), which was a
+    # real navigation bug, not just a stylistic difference from Bulk
+    # RNA-Seq: Streamlit only fires a radio widget's on_change callback
+    # when its value actually CHANGES. With only one possible option,
+    # that radio's value could never change, so on_change could never
+    # fire, so clicking it could never navigate there at all. Splitting
+    # into genuinely distinct step options -- mirroring Bulk RNA-Seq's
+    # own Pipeline/Ingestion -> Trimming & Post-Trim QC -> Alignment &
+    # Counts grouping exactly -- fixes that bug as a direct consequence
+    # of giving this drawer the same step-by-step radio flow Bulk
+    # RNA-Seq already has, not as a separate patch on top of it.
+    #
+    # --- Phase 2 placeholder route added (2026-08-17) ---
+    # "🔬 SC Cell-level QC" appended as a fourth option -- gives Step 6's
+    # "Proceed to Phase 2" button (singlecell_workspace.py) a real
+    # navigation target; see this file's own module docstring section
+    # "Single-cell Phase 2 placeholder route added" above for why both
+    # this entry AND the matching elif branch below are required
+    # together. Later phases (clustering/annotation, pseudobulk DE) are
+    # planned as additional options appended to this same list.
+    "single_cell": {
+        "title": "🧫 Single-cell RNA-Seq",
+        "options": [
+            "🧫 Single-cell RNA-Seq",
+            "🧪 SC Trimming & Post-Trim QC",
+            "🧬 SC Alignment & Cell-Calling",
+            "🔬 SC Cell-level QC",
+        ],
+    },
+    "spatial": {
+        "title": "🧠 Spatial Transcriptomics",
+        "options": [
+            "🧠 10x Genomics Visium Viewer",
+        ],
+    },
     # "Advanced Modes" is its own top-level drawer, separate from any
     # single pipeline's own step-by-step drawer (e.g. "bulk_rnaseq"
     # above) -- since the "Auto" workspace lets a user pick WHICH
     # pipeline to run non-interactively via a dropdown on its own first
     # screen (see advanced_mode_workspace.py's render()), rather than
     # being one more step nested inside any one pipeline's own drawer.
-    # Monitor Mode (background folder-watcher automation) is intended
-    # to live in this same drawer once its workspace UI is built -- see
-    # advanced_mode/README.md's "What's still needed" section -- so
-    # this group is deliberately structured to hold more than one
-    # option going forward, even though "Auto" is the only one wired
-    # up today.
+    # Monitor Mode (background folder-watcher automation) lives in this
+    # same drawer alongside Auto.
     "advanced_modes": {
         "title": "🚀 Advanced Modes",
         "options": [
@@ -110,62 +192,33 @@ PIPELINE_GROUPS = {
 
 def _activate(radio_key: str):
     """
-    on_change callback for a grouped radio widget.
-
-    Promotes the radio's newly clicked value to `active_workspace`, the
-    single non-widget session_state key that drives routing below. Fired
-    by Streamlit before the script reruns, so by the time the routing
-    block executes, active_workspace already reflects this click.
+    on_change callback for a grouped radio widget: copies that widget's
+    current value into the single active_workspace routing key used by
+    the elif-chain below, so picking a step inside ANY pipeline's drawer
+    updates routing the same way regardless of which drawer it came from.
     """
     st.session_state["active_workspace"] = st.session_state[radio_key]
 
 
 def render_pipeline_section(name: str, options: list[str], key: str, icon: str = ""):
     """
-    Render one collapsible sidebar drawer (expander) titled `name`,
-    containing a radio button list `options` for that pipeline's steps.
-
-    Parameters
-    ----------
-    name : str
-        Display name of the pipeline, e.g. "Bulk RNA-Seq".
-    options : list[str]
-        Ordered list of workspace step labels for this pipeline, exactly
-        matching the strings used in the routing if/elif block below.
-    key : str
-        Unique key prefix for this pipeline's radio widget
-        (e.g. "bulk_rnaseq"). Must be unique across all pipeline groups.
-    icon : str, optional
-        Optional emoji/icon prefix for the drawer title.
-
-    Notes
-    -----
-    The drawer auto-expands whenever `active_workspace` is one of its own
-    `options` (i.e. whenever the user is currently working in this
-    pipeline), and stays collapsed otherwise. See the module docstring for
-    why this -- rather than trying to persist a manual user toggle -- is
-    the appropriate approach given st.expander's lack of a `key` argument.
+    Render one collapsible sidebar drawer (expander) titled name,
+    containing a radio button list options for that pipeline's steps.
+    The drawer is expanded whenever it contains the currently active
+    workspace (so the pipeline you're actively working in stays open),
+    and collapsed otherwise -- see this module's docstring for why this
+    "derive expanded= from current state" approach is used instead of
+    trying to track the expander's own open/closed state directly.
     """
-    radio_key = f"{key}_workspace_radio"
-    is_active_group = st.session_state.get("active_workspace") in options
-
-    with st.sidebar.expander(f"{icon} {name}".strip(), expanded=is_active_group):
+    radio_key = f"_workspace_radio_{key}"
+    active = st.session_state.get("active_workspace")
+    is_active_group = active in options
+    with st.sidebar.expander(name, expanded=is_active_group):
         st.radio(
-            "Select step:",
-            options,
-            # index=None means no option is pre-checked until the user (or a
-            # nav_request, via session_state) picks one. This matters even
-            # for groups with a single step (e.g. Spatial currently has
-            # only one): with a pre-selected default, Streamlit's on_change
-            # only fires when the value actually *changes*, so clicking an
-            # already-selected (and, for single-step groups, *always*
-            # already-selected) option would silently do nothing. Starting
-            # unselected guarantees every click is a real change and fires
-            # _activate.
-            index=None,
-            key=radio_key,
-            on_change=partial(_activate, radio_key),
-            label_visibility="collapsed",
+            "Go to:", options,
+            index=options.index(active) if active in options else 0,
+            key=radio_key, label_visibility="collapsed",
+            on_change=_activate, args=(radio_key,),
         )
 
 
@@ -178,18 +231,20 @@ def render_pipeline_section(name: str, options: list[str], key: str, icon: str =
 # must happen first, exactly as it did with the single flat
 # assay_choice_radio previously.
 # ------------------------------------------------------------------
+
 if "nav_request" in st.session_state:
     target = st.session_state.pop("nav_request")
     st.session_state["active_workspace"] = target
     for group_key, group in PIPELINE_GROUPS.items():
         if target in group["options"]:
-            st.session_state[f"{group_key}_workspace_radio"] = target
+            st.session_state[f"_workspace_radio_{group_key}"] = target
             break
 
 if "active_workspace" not in st.session_state:
     st.session_state["active_workspace"] = HOME_OPTION
 
 # 2. Main Portal Routing Menu
+
 st.sidebar.title("🧬 Multi-Omics Portal")
 st.sidebar.markdown("---")
 
@@ -201,11 +256,21 @@ for group_key, group in PIPELINE_GROUPS.items():
 
 st.sidebar.markdown("---")
 
+# Standalone button, same pattern as HOME_OPTION above -- Setup &
+# Deployment is a cross-cutting utility page (environment/dependency
+# checker, HPC SSH connection management), not a pipeline step, so it
+# does not belong inside any PIPELINE_GROUPS drawer.
+if st.sidebar.button(SETUP_OPTION, key="setup_button", use_container_width=True):
+    st.session_state["active_workspace"] = SETUP_OPTION
+
+st.sidebar.markdown("---")
+
 assay_choice = st.session_state["active_workspace"]
 
 # ==========================================
 # 🏠 WORKSPACE 1: PORTAL HOME
 # ==========================================
+
 if assay_choice == "📊 Portal Home":
     st.title("🎛️ Clinical Multi-Omics Orchestration Hub")
     st.markdown(
@@ -214,56 +279,84 @@ if assay_choice == "📊 Portal Home":
         "structural data metrics or view interactive expression atlases."
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.info("### 🧠 Spatial Transcriptomics\nProcess micro-array slides, format H&E histology matrices, and map localized cluster counts using DuckDB + Plotly overlays.")
-    with col2:
-        st.info("### 🧬 Bulk RNA-Seq\nUpload raw sequencing runs, evaluate sample quality structures, and execute differential gene expression layouts.")
-
 # ==========================================
 # 🧠 WORKSPACE 2: SPATIAL TRANSCRIPTOMICS
 # ==========================================
+
 elif assay_choice == "🧠 10x Genomics Visium Viewer":
     spatial_workspace.render()
 
 # ==========================================
 # 🧬 WORKSPACE 3: BULK RNA-SEQ WORKFLOW
 # ==========================================
+
 elif assay_choice == "🧬 Bulk RNA-Seq Pipeline":
     bulk_rnaseq_workspace.render()
 
 # ==========================================
 # 🤖 ADVANCED MODES: AUTO
 # ==========================================
+
 elif assay_choice == "🤖 Auto":
     advanced_mode_workspace.render()
 
 # ==========================================
 # 📁 ADVANCED MODES: MONITOR MODE
 # ==========================================
+
 elif assay_choice == "📁 Monitor Mode":
     monitor_mode_workspace.render()
 
 # ==========================================
 # 🧪 WORKSPACE 4: TRIMMING & POST-TRIM QC
 # ==========================================
+
 elif assay_choice == "🧪 Trimming & Post-Trim QC":
     trimming_workspace.render()
 
 # ==========================================
 # 🧮 WORKSPACE 5: RNA ALIGNMENT & COUNTS
 # ==========================================
+
 elif assay_choice == "🧮 RNA Alignment & Counts":
     alignment_workspace.render()
 
 # =========================================
 # 🌋 WORKSPACE 6: DIFFERENTIAL EXPRESSION
 # =========================================
+
 elif assay_choice == "🌋 Differential Expression":
     differential_expression_workspace.render()
 
 # =========================================
 # 🧬 WORKSPACE 7: ONTOLOGY ANALYSIS
 # =========================================
+
 elif assay_choice == "🧬 Ontology Analysis":
     ontology_workspace.render()
+
+# =========================================
+# ⚙️ WORKSPACE 8: SETUP & DEPLOYMENT
+# =========================================
+
+elif assay_choice == SETUP_OPTION:
+    setup_workspace.render()
+
+# =========================================
+# 🧫 WORKSPACE 9: SINGLE-CELL RNA-SEQ
+# =========================================
+
+elif assay_choice == "🧫 Single-cell RNA-Seq":
+    singlecell_workspace.render_ingestion()
+
+elif assay_choice == "🧪 SC Trimming & Post-Trim QC":
+    singlecell_workspace.render_trimming()
+
+elif assay_choice == "🧬 SC Alignment & Cell-Calling":
+    singlecell_workspace.render_alignment()
+
+# Phase 2 placeholder route (2026-08-17) -- see this file's own module
+# docstring section "Single-cell Phase 2 placeholder route added" and
+# singlecell_workspace.render_cell_qc()'s own docstring for context.
+elif assay_choice == "🔬 SC Cell-level QC":
+    singlecell_workspace.render_cell_qc()

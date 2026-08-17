@@ -53,7 +53,7 @@ try:
     import certifi
     _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 except ImportError:
-    # certifi isn't installed — fall back to the default context. This
+    # certifi isn't installed -- fall back to the default context. This
     # will hit the same CERTIFICATE_VERIFY_FAILED error on affected
     # systems, but we don't want a missing optional dependency to be a
     # hard crash at import time.
@@ -108,7 +108,7 @@ REFERENCE_CATALOG = {
         # unchanged. The exact "toplevel" vs. "primary_assembly" naming
         # below is inferred from Drosophila's compact, well-finished
         # genome structure (similar to yeast) rather than independently
-        # confirmed against a live directory listing — if this doesn't
+        # confirmed against a live directory listing -- if this doesn't
         # match on first real use, _resolve_ensembl_filename() will
         # return a clear "could not find a matching file" error rather
         # than silently downloading the wrong thing, so this is safe to
@@ -124,7 +124,7 @@ REFERENCE_CATALOG = {
         "species_name": "Caenorhabditis_elegans",
         "assembly": "WBcel235",
         # Same note as Drosophila above re: pattern verification on
-        # first real use — also confirmed on Ensembl's main FTP site,
+        # first real use -- also confirmed on Ensembl's main FTP site,
         # same current_fasta/current_gtf symlink pattern applies.
         "genome_fasta_pattern": r"Caenorhabditis_elegans\.WBcel235\.dna\.toplevel\.fa\.gz",
         "cdna_fasta_pattern": r"Caenorhabditis_elegans\.WBcel235\.cdna\.all\.fa\.gz",
@@ -146,7 +146,7 @@ REFERENCE_CATALOG = {
     "ecoli": {
         "label": "E. coli (K-12 MG1655)",
         "source": "ncbi",
-        # NCBI RefSeq assembly GCF_000005845.2 (ASM584v2) — a fixed,
+        # NCBI RefSeq assembly GCF_000005845.2 (ASM584v2) -- a fixed,
         # permanent path that does not change over time.
         "ncbi_base_url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2",
         "genome_fasta_filename": "GCF_000005845.2_ASM584v2_genomic.fna.gz",
@@ -399,7 +399,7 @@ def _resolve_ensembl_filename(directory_url, filename_pattern):
     if not matches:
         return None
     # Directory listings may reference the same filename multiple times
-    # (e.g. in both an href and display text) — dedupe while preserving
+    # (e.g. in both an href and display text) -- dedupe while preserving
     # order, then take the first (they should all be identical anyway).
     return matches[0]
 
@@ -464,7 +464,7 @@ def download_cdna_fasta(species_key, dest_dir, progress_callback=None):
         if not filename:
             return False, None, (
                 f"Could not find a matching cDNA FASTA file at {directory_url}. "
-                "Ensembl may have changed their file naming — please check "
+                "Ensembl may have changed their file naming -- please check "
                 "manually or use the custom upload option instead."
             )
         url = directory_url + filename
@@ -504,7 +504,7 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
     species without one (e.g. E. coli via NCBI, which does not publish a
     standalone transcriptome FASTA for this assembly), this automatically
     falls back to downloading the genome + GTF and extracting transcript
-    sequences — so the UI never has to expose that distinction to the
+    sequences -- so the UI never has to expose that distinction to the
     user or hand them a dead-end error message telling them to do
     something manually that the interface doesn't otherwise support for
     preset organisms.
@@ -524,7 +524,7 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
         return download_cdna_fasta(species_key, dest_dir, progress_callback)
 
     # Fallback path: no standalone transcriptome FASTA published for this
-    # species/assembly — download genome + GTF and extract transcripts.
+    # species/assembly -- download genome + GTF and extract transcripts.
     success, paths, message = download_genome_and_gtf(species_key, dest_dir, progress_callback)
     if not success:
         return False, None, f"Reference download failed: {message}"
@@ -558,66 +558,223 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
     )
 
 
+# ---------------------------------------------------------------------------
+# Ensembl GTF -> GFF3 fallback (2026-08-17)
+# ---------------------------------------------------------------------------
+#
+# CONFIRMED: Ensembl is in the middle of retiring its classic species-
+# name-based FTP layout (this exact module's ENSEMBL_BASE_URL structure)
+# in favor of a new assembly-accession-based structure at
+# ftp.ebi.ac.uk/pub/ensemblorganisms/GCA/... -- see Ensembl's own blog
+# post "Updates to FTP site of the new Ensembl website" (26 June 2026),
+# which states the old species-name-based structure "will be retired"
+# and that "this change will affect workflows and pipelines pointing to
+# this site." A real, reproducible symptom of this transition was hit in
+# production: this module's "current_gtf/{species}/" directory 404'd for
+# human, while "current_fasta/{species}/dna/" (genome) and
+# "current_gff3/{species}/" (the GFF3 equivalent of the same annotation)
+# were BOTH independently confirmed still reachable at the same moment --
+# i.e. this is a partial, in-progress migration state, not a single fixed
+# bug with one correct permanent replacement URL.
+#
+# Because this is an ACTIVE, ongoing migration (today's failure mode may
+# not be tomorrow's), _download_ensembl_annotation() below does NOT
+# simply replace "current_gtf" with "current_gff3" outright -- it tries
+# GTF FIRST (in case Ensembl restores it, or it simply works for a
+# different species than the one that failed), and only falls back to
+# downloading GFF3 + converting to GTF via gffread (already a dependency
+# elsewhere in this module, and already part of this project's
+# environment.yml) if the GTF attempt specifically 404s. This keeps every
+# downstream consumer (extract_tx2gene_from_gtf, STARsolo, gffread-based
+# transcript extraction) working against a real .gtf file regardless of
+# which path was actually taken, with zero changes needed anywhere else.
+#
+# KNOWN FUTURE RISK, not yet acted on: Ensembl's blog post also states the
+# ENTIRE old species-name-based structure (including current_fasta, which
+# is still working today) is slated for eventual full retirement in favor
+# of the new GCA-accession-based site. If/when current_fasta itself starts
+# 404ing, this module will need a similarly real fallback to the new GCA
+# structure -- deliberately NOT implemented speculatively here, since that
+# is a materially different URL scheme (different domain, accession-number
+# based paths requiring a species -> GCA accession lookup) that hasn't yet
+# actually failed and would need its own real verification first, exactly
+# like this GTF->GFF3 fallback did.
+
+def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
+    """
+    Resolve and download this species' gene annotation from Ensembl,
+    preferring GTF but automatically falling back to GFF3 (+ conversion
+    to GTF via gffread) if the "current_gtf" directory 404s -- see the
+    module-level comment above for why. Always returns a real .gtf file
+    at dest_dir/annotation.gtf regardless of which path was taken, so
+    callers never need to know or care which format Ensembl actually
+    served.
+
+    Returns (success: bool, gtf_path_or_None, message: str).
+    """
+    gtf_dir_url = f"{ENSEMBL_BASE_URL}/current_gtf/{entry['species_dir']}/"
+    gtf_filename = None
+    try:
+        gtf_filename = _resolve_ensembl_filename(gtf_dir_url, entry["gtf_pattern"])
+    except RuntimeError:
+        # current_gtf itself unreachable (e.g. a 404 on the directory,
+        # not just no matching file within it) -- fall through to the
+        # GFF3 attempt below rather than failing immediately.
+        gtf_filename = None
+
+    if gtf_filename:
+        gtf_url = gtf_dir_url + gtf_filename
+        gtf_gz = os.path.join(dest_dir, "annotation.gtf.gz")
+        gtf_path = os.path.join(dest_dir, "annotation.gtf")
+        success, error = _download_file(gtf_url, gtf_gz, progress_callback)
+        if not success:
+            return False, None, f"GTF download failed: {error}"
+        success, error = _decompress_gz(gtf_gz, gtf_path)
+        if not success:
+            return False, None, f"GTF decompression failed: {error}"
+        os.remove(gtf_gz)
+        return True, gtf_path, f"Downloaded annotation (GTF) from {gtf_url}"
+
+    # --- GFF3 fallback ---
+    gff3_dir_url = f"{ENSEMBL_BASE_URL}/current_gff3/{entry['species_dir']}/"
+    # Ensembl's GFF3 filenames follow the identical naming convention as
+    # their GTF filenames, just with "gff3" in place of "gtf" (confirmed
+    # against Ensembl's real directory structure) -- so the existing
+    # gtf_pattern can be reused directly via a simple substitution rather
+    # than maintaining a second, parallel pattern per species.
+    gff3_pattern = entry["gtf_pattern"].replace("gtf", "gff3")
+    try:
+        gff3_filename = _resolve_ensembl_filename(gff3_dir_url, gff3_pattern)
+    except RuntimeError as e:
+        return False, None, (
+            f"Could not find a GTF annotation at {gtf_dir_url} (Ensembl "
+            f"is in the middle of restructuring their FTP site as of "
+            f"2026), and the GFF3 fallback also failed: {e}"
+        )
+    if not gff3_filename:
+        return False, None, (
+            f"Could not find a matching GTF OR GFF3 annotation file for "
+            f"this species (checked {gtf_dir_url} and {gff3_dir_url}). "
+            "Ensembl may have changed their file naming further -- please "
+            "check manually or use the custom upload option instead."
+        )
+
+    if shutil.which("gffread") is None:
+        return False, None, (
+            f"Found a GFF3 annotation at {gff3_dir_url}{gff3_filename}, but "
+            "no GTF was available at Ensembl's usual location, and gffread "
+            "(needed to convert GFF3 -> GTF) is not installed on this "
+            "system. gffread is part of this project's environment.yml."
+        )
+
+    gff3_url = gff3_dir_url + gff3_filename
+    gff3_gz = os.path.join(dest_dir, "annotation.gff3.gz")
+    gff3_path = os.path.join(dest_dir, "annotation.gff3")
+    gtf_path = os.path.join(dest_dir, "annotation.gtf")
+
+    success, error = _download_file(gff3_url, gff3_gz, progress_callback)
+    if not success:
+        return False, None, f"GFF3 download failed: {error}"
+    success, error = _decompress_gz(gff3_gz, gff3_path)
+    if not success:
+        return False, None, f"GFF3 decompression failed: {error}"
+    os.remove(gff3_gz)
+
+    # gffread's -T flag outputs GTF format (its default output without -T
+    # is GFF3) -- the same conversion this project's own single-cell
+    # Step 5 UI already recommends to users manually for custom GFF3
+    # uploads, applied here automatically for preset species instead.
+    try:
+        subprocess.run(
+            ["gffread", gff3_path, "-T", "-o", gtf_path],
+            capture_output=True, text=True, check=True, timeout=1800,
+        )
+    except subprocess.CalledProcessError as e:
+        return False, None, f"gffread GFF3->GTF conversion failed: {(e.stdout or '') + (e.stderr or '')}"
+    except subprocess.TimeoutExpired:
+        return False, None, "gffread GFF3->GTF conversion timed out after 30 minutes."
+
+    return True, gtf_path, (
+        f"Ensembl's 'current_gtf' directory was unavailable for this "
+        f"species (Ensembl is in the middle of restructuring their FTP "
+        f"site as of 2026) -- downloaded GFF3 from {gff3_url} instead and "
+        f"converted it to GTF using gffread."
+    )
+
+
 def download_genome_and_gtf(species_key, dest_dir, progress_callback=None):
     """
     Download the genome FASTA + GTF annotation for the given species key,
     for use with STAR (or for extracting transcripts via gffread if used
     as a Salmon fallback).
 
+    For Ensembl-sourced species, the annotation download automatically
+    falls back from GTF to GFF3 (+ gffread conversion) if Ensembl's
+    "current_gtf" directory is unreachable -- see
+    _download_ensembl_annotation()'s own docstring for why this exists
+    and is NOT just a one-time hardcoded URL swap.
+
     Returns (success: bool, (genome_fasta_path, gtf_path) or None, message: str).
     """
     entry = REFERENCE_CATALOG[species_key]
 
+    genome_gz = os.path.join(dest_dir, f"{species_key}.genome.fa.gz")
+    genome_fa = os.path.join(dest_dir, f"{species_key}.genome.fa")
+    gtf_path_final = os.path.join(dest_dir, f"{species_key}.annotation.gtf")
+
     if entry["source"] == "ensembl":
         genome_dir_url = f"{ENSEMBL_BASE_URL}/current_fasta/{entry['species_dir']}/dna/"
-        gtf_dir_url = f"{ENSEMBL_BASE_URL}/current_gtf/{entry['species_dir']}/"
-
         genome_filename = _resolve_ensembl_filename(genome_dir_url, entry["genome_fasta_pattern"])
         if not genome_filename:
             return False, None, (
                 f"Could not find a matching genome FASTA file at {genome_dir_url}. "
-                "Ensembl may have changed their file naming — please check "
+                "Ensembl may have changed their file naming -- please check "
                 "manually or use the custom upload option instead."
             )
-        gtf_filename = _resolve_ensembl_filename(gtf_dir_url, entry["gtf_pattern"])
-        if not gtf_filename:
-            return False, None, (
-                f"Could not find a matching GTF file at {gtf_dir_url}. "
-                "Ensembl may have changed their file naming — please check "
-                "manually or use the custom upload option instead."
-            )
-
         genome_url = genome_dir_url + genome_filename
-        gtf_url = gtf_dir_url + gtf_filename
+
+        success, error = _download_file(genome_url, genome_gz, progress_callback)
+        if not success:
+            return False, None, f"Genome download failed: {error}"
+        success, error = _decompress_gz(genome_gz, genome_fa)
+        if not success:
+            return False, None, f"Genome decompression failed: {error}"
+        os.remove(genome_gz)
+
+        annotation_success, annotation_gtf_path, annotation_message = _download_ensembl_annotation(entry, dest_dir, progress_callback)
+        if not annotation_success:
+            return False, None, annotation_message
+        if annotation_gtf_path != gtf_path_final:
+            shutil.move(annotation_gtf_path, gtf_path_final)
+
+        return True, (genome_fa, gtf_path_final), f"Downloaded genome from {genome_url}. {annotation_message}"
 
     elif entry["source"] == "ncbi":
         genome_url = f"{entry['ncbi_base_url']}/{entry['genome_fasta_filename']}"
         gtf_url = f"{entry['ncbi_base_url']}/{entry['gtf_filename']}"
+
+        gtf_gz = os.path.join(dest_dir, f"{species_key}.annotation.gtf.gz")
+
+        success, error = _download_file(genome_url, genome_gz, progress_callback)
+        if not success:
+            return False, None, f"Genome download failed: {error}"
+        success, error = _decompress_gz(genome_gz, genome_fa)
+        if not success:
+            return False, None, f"Genome decompression failed: {error}"
+        os.remove(genome_gz)
+
+        success, error = _download_file(gtf_url, gtf_gz, progress_callback)
+        if not success:
+            return False, None, f"GTF download failed: {error}"
+        success, error = _decompress_gz(gtf_gz, gtf_path_final)
+        if not success:
+            return False, None, f"GTF decompression failed: {error}"
+        os.remove(gtf_gz)
+
+        return True, (genome_fa, gtf_path_final), f"Downloaded genome from {genome_url} and annotation from {gtf_url}"
+
     else:
         return False, None, f"Unknown reference source '{entry['source']}'."
-
-    genome_gz = os.path.join(dest_dir, f"{species_key}.genome.fa.gz")
-    genome_fa = os.path.join(dest_dir, f"{species_key}.genome.fa")
-    gtf_gz = os.path.join(dest_dir, f"{species_key}.annotation.gtf.gz")
-    gtf_path = os.path.join(dest_dir, f"{species_key}.annotation.gtf")
-
-    success, error = _download_file(genome_url, genome_gz, progress_callback)
-    if not success:
-        return False, None, f"Genome download failed: {error}"
-    success, error = _decompress_gz(genome_gz, genome_fa)
-    if not success:
-        return False, None, f"Genome decompression failed: {error}"
-    os.remove(genome_gz)
-
-    success, error = _download_file(gtf_url, gtf_gz, progress_callback)
-    if not success:
-        return False, None, f"GTF download failed: {error}"
-    success, error = _decompress_gz(gtf_gz, gtf_path)
-    if not success:
-        return False, None, f"GTF decompression failed: {error}"
-    os.remove(gtf_gz)
-
-    return True, (genome_fa, gtf_path), f"Downloaded genome from {genome_url} and annotation from {gtf_url}"
 
 
 def extract_transcripts_with_gffread(genome_fasta_path, gtf_path, dest_fasta_path):
@@ -696,7 +853,7 @@ def extract_gene_level_transcripts(genome_fasta_path, gtf_path, dest_fasta_path)
     gene-level coordinates from a GTF file, bypassing gffread entirely.
 
     This is the appropriate approach for organisms with no introns
-    (bacteria, archaea) where "gene" and "transcript" are equivalent —
+    (bacteria, archaea) where "gene" and "transcript" are equivalent --
     it sidesteps gffread's eukaryotic gene->transcript->exon parent-
     child ID matching, which fails on NCBI's bacterial GTF format
     (features are "gene"/"CDS" only, with no separate transcript/mRNA
@@ -735,7 +892,7 @@ def extract_gene_level_transcripts(genome_fasta_path, gtf_path, dest_fasta_path)
                     continue
 
                 # GTF coordinates are 1-based, inclusive; Python slicing
-                # is 0-based, exclusive on the end — convert accordingly.
+                # is 0-based, exclusive on the end -- convert accordingly.
                 start_idx, end_idx = int(start) - 1, int(end)
                 gene_seq = genome_seqs[seqid][start_idx:end_idx]
 
@@ -753,7 +910,7 @@ def extract_gene_level_transcripts(genome_fasta_path, gtf_path, dest_fasta_path)
 
     if n_extracted == 0:
         return False, (
-            "No gene sequences could be extracted — check that the GTF "
+            "No gene sequences could be extracted -- check that the GTF "
             "file's chromosome/contig names match the genome FASTA's "
             "sequence IDs."
         )
@@ -818,17 +975,17 @@ def count_transcripts_in_fasta(filepath):
 #
 #   - Ensembl-downloaded cDNA (human/mouse/yeast/Drosophila/C. elegans
 #     presets): the gene ID is embedded directly in each FASTA header,
-#     so no separate GTF parsing is needed — see
+#     so no separate GTF parsing is needed -- see
 #     extract_tx2gene_from_ensembl_fasta.
 #
 #   - No-intron organisms (e.g. E. coli): our own gene-level extraction
 #     (extract_gene_level_transcripts, above) already writes one
 #     sequence per gene using the gene ID as the header, so transcript
-#     ID == gene ID by construction — see build_identity_tx2gene.
+#     ID == gene ID by construction -- see build_identity_tx2gene.
 #
 #   - Custom eukaryote uploads processed via gffread: gffread's output
 #     FASTA headers don't reliably carry gene information, but the
-#     original GTF's 'transcript' feature lines always do — see
+#     original GTF's 'transcript' feature lines always do -- see
 #     extract_tx2gene_from_gtf.
 
 def extract_tx2gene_from_ensembl_fasta(fasta_path):
@@ -842,12 +999,12 @@ def extract_tx2gene_from_ensembl_fasta(fasta_path):
 
     This means no separate GTF download is needed just to build a
     tx2gene mapping for Ensembl-sourced references (human/mouse/yeast/
-    Drosophila/C. elegans presets) — the mapping is already present in
+    Drosophila/C. elegans presets) -- the mapping is already present in
     the FASTA we already downloaded for Salmon.
 
     Returns a dict {transcript_id: gene_id}. Returns an empty dict if no
     headers matched the expected pattern (e.g. a non-Ensembl FASTA was
-    passed in) — callers should treat an empty result as "mapping not
+    passed in) -- callers should treat an empty result as "mapping not
     available" rather than assuming success.
     """
     tx2gene = {}
@@ -979,7 +1136,7 @@ def extract_tx2gene_from_gtf(gtf_path):
     Parse a transcript-to-gene mapping from a GTF file's 'transcript'
     feature lines (columns: transcript_id, gene_id attributes). This is
     the appropriate source for custom eukaryotic references where
-    transcripts were extracted from a genome + GTF via gffread — gffread's
+    transcripts were extracted from a genome + GTF via gffread -- gffread's
     output FASTA header doesn't reliably carry gene information, but the
     original GTF always does.
 
@@ -1008,7 +1165,7 @@ def build_identity_tx2gene(fasta_path):
     FASTA's header lines. Appropriate for no-intron organisms (bacteria,
     archaea) where our own gene-level extraction (see
     extract_gene_level_transcripts) already writes one sequence per gene
-    using the gene ID as the FASTA header — so "collapsing" is a no-op
+    using the gene ID as the FASTA header -- so "collapsing" is a no-op
     by construction, but we still return an explicit mapping for
     consistency with the other tx2gene sources.
     """
@@ -1023,7 +1180,7 @@ def build_identity_tx2gene(fasta_path):
 
 def save_tx2gene_csv(tx2gene, dest_path):
     """
-    Write a tx2gene mapping dict to a CSV with columns TXNAME, GENEID —
+    Write a tx2gene mapping dict to a CSV with columns TXNAME, GENEID --
     the column names tximport's tx2gene argument expects by convention.
     """
     import csv
