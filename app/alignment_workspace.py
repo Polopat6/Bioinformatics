@@ -449,6 +449,60 @@ def _render_reference_file_input(purpose_label, key_prefix, file_extensions, des
         # perfectly usable.
         return selected_path
 
+def _render_readonly_contig_browser(gtf_path):
+    """
+    Read-only contig inventory browser, shared by BOTH the preset-
+    species mito verification banner (_render_bulk_mito_verification,
+    extended below) and the new custom-reference mito check
+    (_render_custom_star_mito_check) -- purely informational, no
+    select/resolve/save action, since Bulk RNA-Seq has nothing
+    downstream that consumes a resolved mitochondrial gene list the
+    way Single-cell's Cell-level QC does (see this patch's own
+    docstring for the full rationale, confirmed by tracing gene_id
+    handling through deseq2_manager.py and ontology_manager.py).
+
+    Reuses sc_cellqc_manager.py's get_gtf_contig_summary() and
+    suggest_mito_contigs_by_keyword() -- the exact same GTF-parsing
+    functions built for the Single-cell pipeline's contig PICKER --
+    but stops short of offering any contig selection/resolution here,
+    since there's nothing to resolve INTO for this pipeline.
+
+    Imported LOCALLY (not at this module's top level) for the same
+    reason reference_manager.py's own verify_preset_reference_mito_content()
+    already does a local import of sc_cellqc_manager: this module
+    (alignment_workspace.py, Bulk RNA-Seq) has no other reason to
+    depend on single_cell/sc_cellqc_manager.py, so this avoids an
+    unconditional cross-pipeline import for every other caller of this
+    file that never reaches this specific contig-browsing expander.
+    """
+    try:
+        import sc_cellqc_manager as cellqc
+    except ImportError:
+        st.caption("ℹ️ Contig browser unavailable on this system (sc_cellqc_manager could not be imported).")
+        return
+
+    contig_summary = cellqc.get_gtf_contig_summary(gtf_path)
+    if not contig_summary:
+        st.caption("No contigs could be read from this GTF -- the file may be empty or malformed.")
+        return
+
+    suggestions = cellqc.suggest_mito_contigs_by_keyword(gtf_path)
+    suggested_names = {s["contig"] for s in suggestions}
+    if suggested_names:
+        st.info(
+            "⭐ Based on well-known mitochondrial gene names/descriptions found in this GTF "
+            f"(e.g. `cox1`, `nd1`, `atp6`, `cytb`, \"mitochondrially encoded\" ...), the following "
+            f"contig(s) look like strong candidates: **{', '.join(sorted(suggested_names))}**."
+        )
+
+    n_shown = min(25, len(contig_summary))
+    display_df = pd.DataFrame(contig_summary[:n_shown])
+    if suggested_names:
+        display_df.insert(0, "⭐", display_df["contig"].apply(lambda c: "⭐" if c in suggested_names else ""))
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    if len(contig_summary) > n_shown:
+        st.caption(f"Showing top {n_shown} of {len(contig_summary):,} contig(s) by gene count.")
+
 
 def _render_bulk_mito_verification(species_key, species_labels, genome_fasta_expected, gtf_expected):
     """
@@ -532,6 +586,109 @@ def _render_bulk_mito_verification(species_key, species_labels, genome_fasta_exp
             st.rerun()
         else:
             st.error(f"❌ Re-download failed: {message}")
+
+    # FIXED: de-indented to 4 spaces -- this is now a SIBLING of the
+    # `if st.button(...):` block above, not nested inside it, so it
+    # renders unconditionally every time this function is called
+    # (i.e. whenever mito verification fails), regardless of whether
+    # the re-download button was clicked this run.
+    with st.expander("🔬 Browse this reference's contigs (if re-downloading doesn't help)"):
+        st.caption(
+            "If you've already tried re-downloading (or you're confident this ISN'T "
+            "a corrupted/partial download), the mitochondrial contig may simply have "
+            "a name this app's built-in alias list doesn't recognize. This lists "
+            "every contig in this reference's GTF -- purely to help you spot a likely "
+            "mitochondrial contig by eye. Read-only: nothing here needs to be "
+            "selected or saved."
+        )
+        _render_readonly_contig_browser(gtf_expected)
+
+def _render_custom_star_mito_check(genome_fasta_path, gtf_path):
+    """
+    Best-effort, INFORMATIONAL-ONLY mitochondrial genome check for a
+    CUSTOM (uploaded) reference on the STAR path.
+
+    Unlike _render_bulk_mito_verification() above (which applies to
+    PRESET species and is skipped entirely for bacterial/organelle-free
+    presets via REFERENCE_CATALOG's "source" field), a custom reference
+    has no equivalent "is this species eukaryotic with mitochondria"
+    metadata to consult -- so an explicit opt-out checkbox is offered
+    here instead, mirroring the existing "This organism has no introns"
+    checkbox already used in the Salmon custom-reference branch just
+    above in this same file.
+
+    IMPORTANT -- confirmed by tracing gene_id handling through both
+    deseq2_manager.py and ontology_manager.py: this check being unable
+    to verify mitochondrial content (or a user opting out via the
+    checkbox below) has NO EFFECT WHATSOEVER on gene counts matrix
+    building, DESeq2, or downstream GO/KEGG/Reactome ontology analysis.
+    Mitochondrial-contig recognition is used ONLY for Single-cell's
+    per-cell %mito QC filtering elsewhere in this app -- genes on an
+    unrecognized custom mitochondrial contig still flow through the
+    counts matrix and into ontology analysis exactly like any other
+    gene, gated only by whether clusterProfiler::bitr() can map their
+    gene_id to the chosen OrgDb, which is entirely independent of
+    mitochondrial status. This check exists purely so a user isn't left
+    wondering, after the fact, whether their alignment silently missed
+    real mitochondrial-origin reads because their reference's mito
+    contig used a naming convention this app's built-in alias list
+    doesn't recognize.
+
+    Session-state only -- nothing here is persisted into the project's
+    saved reference_choice (via pm.save_reference_choice), since Bulk
+    RNA-Seq has no later consumer of a resolved mito gene list the way
+    Single-cell's Cell-level QC does.
+    """
+    st.markdown("**🧬 Mitochondrial Genome Check** (informational only)")
+
+    no_mito_organism = st.checkbox(
+        "This organism has no mitochondrial genome (e.g. some symbionts, certain "
+        "protists, or you're intentionally excluding it)",
+        value=False,
+        key="custom_star_no_mito_checkbox",
+        help=(
+            "Check this to skip the mitochondrial-content check below entirely -- "
+            "most eukaryotic organisms DO have a mitochondrial genome, so leave "
+            "this unchecked unless you specifically know otherwise for your organism."
+        ),
+    )
+    if no_mito_organism:
+        st.caption("ℹ️ Mitochondrial genome check skipped for this reference.")
+        return
+
+    # rm (reference_manager) is already imported at this module's top
+    # level -- no local import needed here, unlike the sc_cellqc_manager
+    # import inside _render_readonly_contig_browser() above (which IS a
+    # genuine cross-pipeline dependency this module doesn't otherwise have).
+    verification = rm.verify_preset_reference_mito_content(genome_fasta_path, gtf_path)
+
+    if verification["verified"]:
+        st.success(
+            f"✅ Mitochondrial genome verified in this reference: the genome FASTA "
+            f"includes a mitochondrial contig, and {verification['gtf_mito_gene_count']} "
+            f"mitochondrial gene(s) were found in the annotation."
+        )
+        return
+
+    st.warning(
+        "🟡 **Could not verify mitochondrial genome content in this reference.** "
+        f"Genome FASTA mitochondrial contig found: {'✅ Yes' if verification['fasta_has_mito_contig'] else '❌ No'}. "
+        f"Mitochondrial genes found in annotation: {verification['gtf_mito_gene_count']}.\n\n"
+        "**This is informational only -- it does NOT block alignment, gene counting, or "
+        "downstream analysis.** If your organism does have a mitochondrial genome and "
+        "you believe it's actually present in this reference, its contig may simply use "
+        "a naming convention this app doesn't automatically recognize -- browse this "
+        "reference's actual contigs below to check by eye."
+    )
+
+    with st.expander("🔬 Browse this reference's contigs"):
+        st.caption(
+            "This lists every contig/chromosome found in your GTF, along with its gene "
+            "count -- purely to help you spot a likely mitochondrial contig by name (e.g. "
+            "a short contig with a handful of genes, or one whose genes look "
+            "mitochondrial). Read-only: nothing here needs to be selected or saved."
+        )
+        _render_readonly_contig_browser(gtf_path)
 
 
 def render():
@@ -1062,7 +1219,10 @@ def render():
         # path via a plain upload).
         resolved_custom_fasta = st.session_state.get("_custom_fasta_actual_path", custom_fasta_dest)
         resolved_custom_gtf = st.session_state.get("_custom_gtf_actual_path", custom_gtf_dest)
-
+        if (method == "star" and st.session_state.get("_custom_ref_saved")
+                 and os.path.exists(resolved_custom_fasta) and os.path.exists(resolved_custom_gtf)):
+             st.markdown("---")
+             _render_custom_star_mito_check(resolved_custom_fasta, resolved_custom_gtf)
         # If this looks like a genome FASTA (not already a transcriptome)
         # and we're using Salmon, offer to extract transcripts.
         if method == "salmon" and st.session_state.get("_custom_ref_saved") and os.path.exists(resolved_custom_gtf):

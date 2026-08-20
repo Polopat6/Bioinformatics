@@ -177,25 +177,31 @@ ENSEMBL_BASE_URL = "https://ftp.ensembl.org/pub"
 # lightweight, FASTA-header-only cross-check) -- both independently
 # maintained since they check different file types, but should be kept
 # in sync if either is ever extended with new naming conventions.
-_MITO_SEQNAME_ALIASES = {"mt", "chrm", "chrmt", "m", "mitochondrion", "mtdna"}
+_MITO_SEQNAME_ALIASES = {
+    "mt", "chrm", "chrmt", "m", "mitochondrion", "mtdna",
+    "mito", "chrmito", "mt-genome", "mitochondrial",
+    "mitochondrial_genome", "mitogenome",
+}
 
-
-def genome_fasta_contains_mito_contig(fasta_path, max_headers_to_scan=5000):
+ 
+def genome_fasta_contains_mito_contig(fasta_path, max_headers_to_scan=5000,
+                                       additional_contig_names=None):
     """
     Check whether a genome FASTA file's own sequence headers include a
     recognized mitochondrial contig name (e.g. ">MT dna:chromosome...",
-    ">chrM ...") -- WITHOUT reading or scanning any actual sequence data,
-    so this stays fast even for a multi-gigabyte primary-assembly FASTA.
+    ">chrM ...") -- WITHOUT reading or scanning any actual sequence
+    data, so this stays fast even for a multi-gigabyte primary-assembly
+    FASTA.
 
-    This exists specifically to let the UI answer "does this ALREADY-
-    DOWNLOADED reference actually include the mitochondrial genome?"
-    directly and quickly, rather than the previous behavior of only
-    checking "does this directory have files in it at all?" -- which
-    says nothing about their actual content, and left a real, reported
-    gap where a user had no way to distinguish a genuinely mito-free
-    reference (which would silently produce misleading "0% mitochondrial"
-    single-cell QC results) from a healthy one, without re-downloading
-    or manually inspecting the file.
+    additional_contig_names: optional iterable of extra contig/seqname
+        strings (exact, case-insensitive match) to ALSO recognize as
+        mitochondrial, on top of the built-in _MITO_SEQNAME_ALIASES
+        set -- intended for a contig name a user has explicitly
+        confirmed via the Cell-level QC contig-picker UI (see
+        sc_cellqc_manager.get_mito_gene_ids_from_gtf_by_contigs()), so
+        this module's independent FASTA-level check can agree with
+        that confirmed answer instead of only ever checking against
+        the fixed built-in alias list.
 
     fasta_path: path to a genome FASTA file (may be a large primary-
         assembly/toplevel file -- this function is header-scan-only and
@@ -213,7 +219,9 @@ def genome_fasta_contains_mito_contig(fasta_path, max_headers_to_scan=5000):
     """
     if not fasta_path or not os.path.isfile(fasta_path):
         return False
-
+    recognized = set(_MITO_SEQNAME_ALIASES)
+    if additional_contig_names:
+        recognized |= {c.strip().lower() for c in additional_contig_names if c}
     headers_scanned = 0
     try:
         with open(fasta_path, "r", errors="replace") as f:
@@ -227,33 +235,44 @@ def genome_fasta_contains_mito_contig(fasta_path, max_headers_to_scan=5000):
                 # delimited token after ">" (e.g. ">MT dna:chromosome
                 # MT:GRCh38:MT:1:16569:1 REF" -> "MT").
                 seq_id = line[1:].split()[0].strip().lower()
-                if seq_id in _MITO_SEQNAME_ALIASES:
+                if seq_id in recognized:
                     return True
     except OSError:
         return False
-
     return False
 
 
-def verify_preset_reference_mito_content(genome_fasta_path, gtf_path):
+
+def verify_preset_reference_mito_content(genome_fasta_path, gtf_path,
+                                          user_confirmed_contigs=None):
     """
-    Combined mitochondrial-content verification for a PRESET (auto-
-    downloaded) reference's already-on-disk genome FASTA + GTF -- used
-    by singlecell_workspace.py's Step 5 to answer "can this already-
-    downloaded reference's mitochondrial content actually be confirmed?"
-    immediately, without needing to re-download or run a full Cell-level
-    QC pass first.
+    Combined mitochondrial-content verification for a reference's
+    already-on-disk genome FASTA + GTF -- used by singlecell_workspace.py's
+    Step 5 to answer "can this already-downloaded reference's
+    mitochondrial content actually be confirmed?" immediately, without
+    needing to re-download or run a full Cell-level QC pass first.
 
     Uses TWO independent checks (mirroring the same two-method approach
     already used for single-cell QC's own mito-gene detection):
       1. genome_fasta_contains_mito_contig() above -- does the genome
          FASTA's own sequence headers include a mitochondrial contig?
       2. A local import of sc_cellqc_manager.get_mito_gene_ids_from_gtf()
-         -- does the GTF contain any gene-level features on a
-         mitochondrial contig? (Imported locally, not at module level,
-         to avoid a circular/unnecessary import for every other
-         reference_manager.py caller that has nothing to do with
-         single-cell QC.)
+         (or get_mito_gene_ids_from_gtf_by_contigs() when
+         user_confirmed_contigs is provided) -- does the GTF contain any
+         gene-level features on a mitochondrial contig? (Imported
+         locally, not at module level, to avoid a circular/unnecessary
+         import for every other reference_manager.py caller that has
+         nothing to do with single-cell QC.)
+
+    user_confirmed_contigs: optional list of contig/seqname strings a
+        user has already explicitly confirmed as mitochondrial via the
+        Cell-level QC contig-picker UI (see sc_cellqc_manager.py's
+        get_gtf_contig_summary() / get_mito_gene_ids_from_gtf_by_contigs()).
+        When provided, both underlying checks also recognize these
+        contigs, in addition to the built-in alias list -- so a
+        reference verified this way is correctly reported as
+        "verified", instead of contradicting a choice the user already
+        confirmed elsewhere in the same project.
 
     Returns a dict:
         {
@@ -262,22 +281,21 @@ def verify_preset_reference_mito_content(genome_fasta_path, gtf_path):
             "verified": bool,  # True only if BOTH checks succeed
         }
     """
-    fasta_ok = genome_fasta_contains_mito_contig(genome_fasta_path)
-
+    fasta_ok = genome_fasta_contains_mito_contig(
+        genome_fasta_path, additional_contig_names=user_confirmed_contigs
+    )
     gtf_gene_count = 0
     if gtf_path and os.path.isfile(gtf_path):
         try:
-            # Local import: this module (reference_manager.py) is used
-            # by the Bulk RNA-Seq pipeline too, which has no reason to
-            # depend on single_cell/sc_cellqc_manager.py -- importing
-            # only here, only when this specific verification function
-            # is actually called, avoids adding an unconditional
-            # cross-pipeline import at module load time.
             import sc_cellqc_manager as _cellqc
-            gtf_gene_count = len(_cellqc.get_mito_gene_ids_from_gtf(gtf_path))
+            if user_confirmed_contigs:
+                gtf_gene_count = len(
+                    _cellqc.get_mito_gene_ids_from_gtf_by_contigs(gtf_path, user_confirmed_contigs)
+                )
+            else:
+                gtf_gene_count = len(_cellqc.get_mito_gene_ids_from_gtf(gtf_path))
         except ImportError:
             gtf_gene_count = 0
-
     return {
         "fasta_has_mito_contig": fasta_ok,
         "gtf_mito_gene_count": gtf_gene_count,
@@ -751,12 +769,106 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
 # ---------------------------------------------------------------------------
 # Ensembl GTF -> GFF3 fallback (2026-08-17)
 # ---------------------------------------------------------------------------
+def backfill_gene_names_from_gff3(gff3_path, gtf_path):
+    """
+    Parse gene_name (Name=) values directly from a GFF3's own
+    gene-level records, and inject them as gene_name "..." attributes
+    into a gffread-converted GTF file that's missing them entirely.
+
+    gffread's default `-T` conversion mode drops gene-level lines (and
+    their Name= attribute) unless explicitly told to preserve them, and
+    Ensembl's GFF3 only ever places a gene's Name= on that gene-level
+    record, never repeated onto its child exon/CDS lines -- so a plain
+    `gffread -T` conversion permanently discards every gene's name
+    during this fallback path, for the ENTIRE genome.
+
+    This is intentionally tool-independent -- it reads the ORIGINAL
+    GFF3 source directly for gene_id -> gene_name pairs, rather than
+    depending on gffread's own (inconsistently supported, and
+    explicitly low-priority per gffread's own maintainer) gene-line/
+    full-attribute-preservation flags (--keep-genes / -F).
+
+    gff3_path: the original downloaded GFF3 file (still on disk at
+        this point in _download_ensembl_annotation()'s flow -- the
+        decompressed .gff3 is kept; only the .gff3.gz is removed).
+    gtf_path: the GTF file gffread already produced (via `-T`) --
+        REWRITTEN IN PLACE by this function to add gene_name
+        attributes wherever a matching gene_id is found. Idempotent:
+        any line that already has a gene_name is left untouched, so
+        this is always safe to call even if gffread's output happened
+        to already have some gene_names present.
+
+    Returns the number of GTF lines that had a gene_name attribute
+    successfully backfilled (0 if the GFF3 had no gene-level Name=
+    data at all -- callers should treat 0 as "nothing to backfill",
+    not as an error; the GTF conversion itself already succeeded).
+    """
+    gene_id_to_name = {}
+    id_pattern = re.compile(r'ID=([^;]+)')
+    name_pattern = re.compile(r'Name=([^;]+)')
+    with open(gff3_path, "r", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9 or fields[2] != "gene":
+                continue
+            id_match = id_pattern.search(fields[8])
+            name_match = name_pattern.search(fields[8])
+            if id_match and name_match:
+                gene_id_to_name[id_match.group(1)] = name_match.group(1)
+
+    if not gene_id_to_name:
+        return 0
+
+    gtf_gene_id_pattern = re.compile(r'gene_id "([^"]+)"')
+    backfilled_count = 0
+    output_lines = []
+    with open(gtf_path, "r", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                output_lines.append(line)
+                continue
+            if 'gene_name "' in line:
+                output_lines.append(line)
+                continue
+            match = gtf_gene_id_pattern.search(line)
+            if match and match.group(1) in gene_id_to_name:
+                gene_name = gene_id_to_name[match.group(1)]
+                stripped = line.rstrip("\n")
+                if not stripped.endswith(";"):
+                    stripped += ";"
+                stripped += f' gene_name "{gene_name}";'
+                output_lines.append(stripped + "\n")
+                backfilled_count += 1
+            else:
+                output_lines.append(line)
+
+    with open(gtf_path, "w") as f:
+        f.writelines(output_lines)
+
+    return backfilled_count
+
 
 def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
     """
     Resolve and download this species' gene annotation from Ensembl,
     preferring GTF but automatically falling back to GFF3 (+ conversion
     to GTF via gffread) if the "current_gtf" directory 404s.
+
+    --- gene_name backfill (2026-08-20) ---
+    gffread's default `-T` conversion mode discards gene-level records
+    (and their Name= attribute) entirely -- so, immediately after a
+    successful GFF3->GTF conversion, backfill_gene_names_from_gff3()
+    is now called to inject each gene's real name back in directly
+    from the original GFF3's own gene-level records, since Ensembl's
+    GFF3 only ever places gene_name there, never on child exon/CDS
+    lines. Without this step, every gene in a reference that hits this
+    fallback path would have no gene_name at all -- discovered via a
+    real debugging session where this silently caused mitochondrial
+    gene-SYMBOL detection ("^MT-" prefix matching) to always find zero
+    matches, even though the mitochondrial genes themselves were
+    present and correctly indexed/aligned the whole time.
 
     Returns (success: bool, gtf_path_or_None, message: str).
     """
@@ -778,6 +890,10 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
         if not success:
             return False, None, f"GTF decompression failed: {error}"
         os.remove(gtf_gz)
+        # Direct GTF downloads come straight from Ensembl's own GTF
+        # release -- these already include gene_name natively (GTF's
+        # own attribute convention repeats gene_name onto every child
+        # line), so no backfill step is needed on this path at all.
         return True, gtf_path, f"Downloaded annotation (GTF) from {gtf_url}"
 
     # --- GFF3 fallback ---
@@ -830,11 +946,27 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
     except subprocess.TimeoutExpired:
         return False, None, "gffread GFF3->GTF conversion timed out after 30 minutes."
 
+    # --- NEW STEP: backfill gene_name, since gffread -T dropped it ---
+    n_backfilled = backfill_gene_names_from_gff3(gff3_path, gtf_path)
+    if n_backfilled > 0:
+        gene_name_note = (
+            f" Backfilled {n_backfilled:,} gene_name attribute(s) from the "
+            "GFF3's own gene-level records (gffread's GTF conversion mode "
+            "does not preserve these by default)."
+        )
+    else:
+        gene_name_note = (
+            " Note: no gene_name attributes could be backfilled from this "
+            "GFF3 -- gene symbols may be unavailable for this reference "
+            "(raw gene IDs will be used instead wherever a symbol is "
+            "expected)."
+        )
+
     return True, gtf_path, (
         f"Ensembl's 'current_gtf' directory was unavailable for this "
         f"species (Ensembl is in the middle of restructuring their FTP "
         f"site as of 2026) -- downloaded GFF3 from {gff3_url} instead and "
-        f"converted it to GTF using gffread."
+        f"converted it to GTF using gffread.{gene_name_note}"
     )
 
 

@@ -119,7 +119,13 @@ def cellqc_tools_available():
 # Mitochondrial gene detection -- GTF-derived (2026-08-17)
 # ---------------------------------------------------------------------------
 
-_MITO_SEQNAME_ALIASES = {"mt", "chrm", "chrmt", "m", "mitochondrion", "mtdna"}
+_MITO_SEQNAME_ALIASES = {
+    "mt", "chrm", "chrmt", "m", "mitochondrion", "mtdna",
+    # Added: additional real-world naming conventions seen across
+    # NCBI/Ensembl/manually-assembled non-model-organism references.
+    "mito", "chrmito", "mt-genome", "mitochondrial",
+    "mitochondrial_genome", "mitogenome",
+}
 
 
 def get_mito_gene_ids_from_gtf(gtf_path, max_lines=None):
@@ -278,44 +284,272 @@ def find_gene_ids_matching_terms(gtf_path, terms):
 
     return sorted(matched)
 
+def get_gtf_contig_summary(gtf_path, max_contigs=None):
+    """
+    Scan a GTF/GFF3 file and return every distinct contig (seqname,
+    column 1) it references, along with how many DISTINCT gene_id
+    values are found on each -- powers the mitochondrial-contig PICKER
+    fallback in singlecell_workspace.py's Step 5, shown when automatic
+    mito detection (alias matching) finds zero mitochondrial genes.
+
+    Counts gene_id occurrences from ANY feature-type line (gene,
+    transcript, exon, CDS, etc.), not just explicit "gene" rows --
+    manually curated/hand-added annotations (e.g. a custom
+    mitochondrial contig with only transcript/exon lines and no
+    separately generated "gene" line) are common for non-model-organism
+    references and must not be silently invisible to this function.
+
+    This only ever counts genes per CONTIG -- it never searches by
+    gene name/identity, so it stays entirely separate from any
+    DEG/volcano-plot gene-search utility elsewhere in this codebase.
+
+    max_contigs: optional cap on how many contigs to return (already
+        sorted by gene_count descending, so this keeps the highest-
+        gene-count -- i.e. most "chromosome-like" -- contigs first).
+        Leave unset to return the full inventory; the UI can layer its
+        own "show top N, expand for all" behavior on top of the full
+        list if desired.
+
+    Returns a list of dicts, sorted by gene_count descending:
+        [{"contig": "chr1", "gene_count": 4213}, ...]
+    Returns an empty list if the file doesn't exist or has no
+    recognizable feature lines at all.
+    """
+    if not gtf_path or not os.path.isfile(gtf_path):
+        return []
+    contig_gene_ids = {}
+    gene_id_pattern = re.compile(r'gene_id[\s=]+"?([^";]+)"?')
+    with open(gtf_path, "r", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 9:
+                continue
+            seqname = fields[0].strip()
+            if not seqname:
+                continue
+            bucket = contig_gene_ids.setdefault(seqname, set())
+            match = gene_id_pattern.search(fields[8])
+            if match:
+                bucket.add(match.group(1).strip())
+    summary = [{"contig": contig, "gene_count": len(ids)} for contig, ids in contig_gene_ids.items()]
+    summary.sort(key=lambda d: d["gene_count"], reverse=True)
+    if max_contigs:
+        summary = summary[:max_contigs]
+    return summary
+
+
+
+# Keyword/gene-name hints used ONLY to pre-highlight likely mitochondrial
+# contigs in the picker UI -- never used to silently auto-select a contig
+# without the user confirming. These are well-known, highly-conserved
+# mitochondrial gene names/abbreviations that show up across essentially
+# all animal (and most eukaryotic) mitochondrial genomes regardless of the
+# organism or annotation pipeline used.
+_MITO_KEYWORD_SUBSTRING = re.compile(r"mitochond", re.IGNORECASE)
+_MITO_ID_SUBSTRING = re.compile(r"mito", re.IGNORECASE)
+_MITO_GENE_NAME_HINTS = {
+    "cox1", "cox2", "cox3", "co1", "co2", "co3", "cytb", "cob",
+    "nd1", "nd2", "nd3", "nd4", "nd4l", "nd5", "nd6",
+    "atp6", "atp8", "rrns", "rrnl", "12s", "16s", "trnf", "trnv",
+}
+
+
+def suggest_mito_contigs_by_keyword(gtf_path, min_hits=2):
+    """
+    Best-effort SUGGESTION (never a confident auto-detection) of which
+    contig(s) are likely mitochondrial, by scanning every feature
+    line's full attribute string (any feature type -- gene, transcript,
+    exon, CDS, etc.) for:
+      - the substring "mitochond" anywhere in the attribute string
+        (catches gene_biotype/description/product annotations like
+        "mitochondrially encoded ..." even when gene_name itself
+        doesn't say so), OR
+      - a gene_name OR gene_id matching a well-known, highly-conserved
+        mitochondrial gene abbreviation (cox1, nd1, atp6, cytb, 12S/16S
+        rRNA, etc.) -- checking gene_id in addition to gene_name
+        matters for manually curated references that may have no
+        gene_name attribute at all, only gene_id values like "COX1", OR
+      - the substring "mito" (a shorter, narrower check than
+        "mitochond" above) appearing specifically WITHIN a gene_id or
+        transcript_id value -- catches manually curated/custom
+        references where a curator has deliberately embedded "mito"
+        into gene/transcript identifiers themselves (e.g. "genemito3",
+        "rnamito4"), a common real-world convention for hand-annotated
+        non-model-organism mitochondrial contigs. Deliberately checked
+        ONLY against gene_id/transcript_id (not the full attribute
+        string or free-text descriptions), since the short "mito"
+        substring has real false-positive risk in free text -- e.g.
+        "mitogen-activated protein kinase", "mitosis", "mitotic" all
+        start with "mito" and are unrelated nuclear genes/processes,
+        but this is far less likely to occur incidentally within a
+        short structured identifier field.
+    then tallying which CONTIG those hits fall on.
+
+    This exists purely to pre-highlight candidates in the contig-picker
+    UI (e.g. a "⭐ likely mitochondrial" badge next to a suggested
+    contig) -- the user always makes the final selection themselves;
+    this function's output is never used to auto-apply a mito contig
+    choice on its own.
+
+    min_hits: minimum number of keyword/gene-name hits required on a
+        contig before it's included as a suggestion, to guard against
+        one coincidental substring match on an unrelated contig (e.g.
+        a nuclear pseudogene with "mitochondrial" in its description).
+
+    Returns a list of dicts, sorted by hit_count descending:
+        [{"contig": "NC_012920.1", "hit_count": 37}, ...]
+    Returns an empty list if the file doesn't exist or nothing matched.
+    """
+    if not gtf_path or not os.path.isfile(gtf_path):
+        return []
+    hit_counts = {}
+    gene_name_pattern = re.compile(r'gene_name[\s=]+"?([^";]+)"?')
+    gene_id_pattern = re.compile(r'gene_id[\s=]+"?([^";]+)"?')
+    transcript_id_pattern = re.compile(r'transcript_id[\s=]+"?([^";]+)"?')
+    with open(gtf_path, "r", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 9:
+                continue
+            seqname = fields[0].strip()
+            attributes = fields[8]
+            hit = bool(_MITO_KEYWORD_SUBSTRING.search(attributes))
+            if not hit:
+                name_match = gene_name_pattern.search(attributes)
+                if name_match and name_match.group(1).strip().lower() in _MITO_GENE_NAME_HINTS:
+                    hit = True
+            if not hit:
+                id_match = gene_id_pattern.search(attributes)
+                if id_match:
+                    gid = id_match.group(1).strip()
+                    if gid.lower() in _MITO_GENE_NAME_HINTS or _MITO_ID_SUBSTRING.search(gid):
+                        hit = True
+            if not hit:
+                tx_match = transcript_id_pattern.search(attributes)
+                if tx_match and _MITO_ID_SUBSTRING.search(tx_match.group(1).strip()):
+                    hit = True
+            if hit:
+                hit_counts[seqname] = hit_counts.get(seqname, 0) + 1
+    suggestions = [
+        {"contig": contig, "hit_count": n}
+        for contig, n in hit_counts.items()
+        if n >= min_hits
+    ]
+    suggestions.sort(key=lambda d: d["hit_count"], reverse=True)
+    return suggestions
+
+
+def get_mito_gene_ids_from_gtf_by_contigs(gtf_path, contigs):
+    """
+    Like get_mito_gene_ids_from_gtf(), but restricted to an EXPLICIT set
+    of user-CONFIRMED contig names from the contig-picker UI, rather
+    than the built-in _MITO_SEQNAME_ALIASES set.
+
+    Matches gene_id on ANY feature-type line (gene, transcript, exon,
+    CDS, etc.), not just explicit "gene" rows -- so this correctly
+    resolves genes for manually curated references whose mitochondrial
+    annotation has no separately generated "gene" line, only
+    transcript/exon/CDS lines.
+
+    Used once a user has selected one or more contigs from
+    get_gtf_contig_summary()'s full inventory (optionally pre-
+    highlighted via suggest_mito_contigs_by_keyword()) as the real
+    mitochondrial contig(s) for a reference whose naming convention
+    wasn't recognized by automatic alias-based detection.
+
+    contigs: list of exact contig/seqname strings as they appear in the
+        GTF's column 1. These should come directly from
+        get_gtf_contig_summary()'s own output (i.e. selected from a
+        rendered list, not free-typed), so no case-normalization is
+        applied here -- exact match only.
+
+    Returns a sorted list of gene_id strings (possibly empty, if the
+    selected contig(s) have no recognizable gene_id values at all).
+    """
+    if not gtf_path or not os.path.isfile(gtf_path) or not contigs:
+        return []
+    contig_set = set(contigs)
+    gene_ids = set()
+    gene_id_pattern = re.compile(r'gene_id[\s=]+"?([^";]+)"?')
+    with open(gtf_path, "r", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 9:
+                continue
+            if fields[0].strip() not in contig_set:
+                continue
+            match = gene_id_pattern.search(fields[8])
+            if match:
+                gene_ids.add(match.group(1).strip())
+    return sorted(gene_ids)
 
 # ---------------------------------------------------------------------------
 # Stale STAR index diagnostic (2026-08-17) -- see module docstring
 # ---------------------------------------------------------------------------
 
-def diagnose_starsolo_matrix_for_mito(filtered_matrix_dir):
+def diagnose_starsolo_matrix_for_mito(filtered_matrix_dir, mito_gene_ids=None):
     """
     Fast, R-independent check of whether STARsolo's own features.tsv (the
     actual gene set baked into THIS sample's count matrix at alignment
-    time) includes any mitochondrial genes at all -- checked via gene-name
-    '^MT-' prefix matching on features.tsv's standard column 2, completely
-    independent of what the reference GTF/genome FASTA currently say.
+    time) includes any mitochondrial genes at all -- checked via BOTH:
+      1. gene-SYMBOL '^MT-' prefix matching on features.tsv's column 2
+         (works for references with real gene symbols, e.g. most
+         preset model organisms downloaded via Ensembl's direct GTF), and
+      2. direct gene-ID membership against mito_gene_ids (the SAME
+         resolved mito gene ID list -- see resolve_mito_gene_ids() above
+         -- used everywhere else in this pipeline) on features.tsv's
+         column 1 (works for references with NO gene symbols at all,
+         e.g. any reference that went through the GFF3/gffread fallback
+         download path, which strips gene_name genome-wide -- see
+         reference_manager.py's backfill_gene_names_from_gff3() for the
+         full story on why that happens).
 
-    This exists specifically to distinguish TWO genuinely different root
-    causes for a "0% mitochondrial" Cell-level QC result that otherwise
-    look identical to the user:
-      1. The REFERENCE (genome FASTA/GTF) itself lacks mitochondrial
-         content -- checked separately via
-         reference_manager.verify_preset_reference_mito_content().
-      2. The reference is fine today, but THIS SAMPLE's STAR index/
-         alignment was built from an OLDER version of the reference --
-         re-running Cell-level QC does NOT fix this, since it only
-         re-reads the existing STARsolo output already on disk; it does
-         not re-align. This requires rebuilding the STAR index AND
-         re-running Step 6 alignment for this specific sample.
+    Checking BOTH independently, then unioning the results, mirrors the
+    exact same "two independent detection methods, unioned" pattern
+    already used successfully by the main R script's own mito detection
+    (symbol_mito_set + gtf_mito_set) -- see this module's docstring.
 
-    filtered_matrix_dir: path to STARsolo's Solo.out/Gene/filtered/
-        directory for one sample.
+    Without checking by ID as well as by symbol, this function would
+    ALWAYS report zero mitochondrial genes (a false "stale index"
+    signature) for any reference with no gene symbols at all --
+    completely independent of whether that sample's index/alignment is
+    actually stale or perfectly fresh -- which is exactly the bug this
+    fix resolves.
+
+    mito_gene_ids: the reference's resolved mitochondrial gene ID list
+        (e.g. from resolve_mito_gene_ids()) -- pass None/empty if this
+        isn't known/available yet (the check then falls back to
+        symbol-only detection, same as this function's original
+        behavior).
 
     Returns a dict:
         {
             "total_genes": int,
-            "mito_genes_in_matrix": int,
+            "mito_genes_in_matrix": int,        # union of both methods
+            "symbol_match_count": int,
+            "id_match_count": int,
+            "checked_via_id": bool,              # was an ID list available to check?
             "sample_mito_gene_names": [str, ...],  # up to 5, for display
-            "likely_stale_index": bool,  # True if the matrix has genes
-                overall but zero of them are mitochondrial
+            "likely_stale_index": bool,
         }
     Returns None if no features file could be found/read.
+
+    likely_stale_index is ONLY set True when we actually HAD a positive
+    expectation of mitochondrial genes for this reference (i.e.
+    mito_gene_ids resolved at least one real gene ID from the CURRENT
+    reference's GTF) but found NONE of them -- by symbol OR by ID -- as
+    rows in this sample's own matrix. If no mito_gene_ids are known at
+    all, an all-zero result is treated as "we don't have enough
+    information to tell," NOT as evidence of staleness -- that
+    genuinely different situation (no mito genes resolvable for this
+    reference at all) is already separately surfaced by the main
+    pipeline's own "no_mito_genes_found" diagnostic.
     """
     candidate_names = ("features.tsv.gz", "features.tsv", "genes.tsv.gz", "genes.tsv")
     found_path = None
@@ -327,9 +561,12 @@ def diagnose_starsolo_matrix_for_mito(filtered_matrix_dir):
     if found_path is None:
         return None
 
+    mito_gene_id_set = set(mito_gene_ids) if mito_gene_ids else set()
+
     opener = gzip.open if found_path.endswith(".gz") else open
     total = 0
-    mito_names = []
+    symbol_hits = []
+    id_hits = []
     try:
         with opener(found_path, "rt", errors="replace") as f:
             for line in f:
@@ -337,18 +574,28 @@ def diagnose_starsolo_matrix_for_mito(filtered_matrix_dir):
                 if len(fields) < 2:
                     continue
                 total += 1
+                gene_id = fields[0]
                 gene_name = fields[1]
                 if gene_name.lower().startswith("mt-"):
-                    mito_names.append(gene_name)
+                    symbol_hits.append(gene_name)
+                if gene_id in mito_gene_id_set:
+                    id_hits.append(gene_id)
     except OSError:
         return None
 
+    union_count = len(set(symbol_hits) | set(id_hits))
+    likely_stale = bool(mito_gene_id_set) and total > 0 and union_count == 0
+
     return {
         "total_genes": total,
-        "mito_genes_in_matrix": len(mito_names),
-        "sample_mito_gene_names": mito_names[:5],
-        "likely_stale_index": total > 0 and len(mito_names) == 0,
+        "mito_genes_in_matrix": union_count,
+        "symbol_match_count": len(symbol_hits),
+        "id_match_count": len(id_hits),
+        "checked_via_id": bool(mito_gene_id_set),
+        "sample_mito_gene_names": (symbol_hits[:5] if symbol_hits else id_hits[:5]),
+        "likely_stale_index": likely_stale,
     }
+
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +676,7 @@ AMBIENT_METHOD_OPTIONS = {
 DEFAULT_AMBIENT_METHOD = "decontx"
 
 DEFAULT_MAD_NMADS = 3
+MITO_SOURCE_USER_SELECTED_CONTIGS = "user_selected_contigs"
 QC_METRIC_LABELS = {
     "sum": "Total UMI counts per cell",
     "detected": "Genes detected per cell",
@@ -546,41 +794,128 @@ if (job$doublet_method == "scDblFinder") {
   optimal_pK <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
   cat(paste("DoubletFinder pK sweep complete -- selected pK =", optimal_pK), "\n")
 
+  # --- NEW HARDENING #1: is the selected pK sitting at the edge of the
+  # tested sweep range? This can indicate the sweep didn't actually
+  # bracket a real optimum (the true best pK may lie outside what was
+  # tested), rather than genuinely landing on the best value.
+  all_pK_values <- as.numeric(as.character(bcmvn$pK))
+  pk_range_min <- min(all_pK_values)
+  pk_range_max <- max(all_pK_values)
+  pk_at_edge <- isTRUE(all.equal(optimal_pK, pk_range_min)) || isTRUE(all.equal(optimal_pK, pk_range_max))
+  if (pk_at_edge) {
+    cat(paste0(
+      "\u26a0\ufe0f WARNING: Selected pK (", optimal_pK, ") sits at the ",
+      if (isTRUE(all.equal(optimal_pK, pk_range_min))) "MINIMUM" else "MAXIMUM",
+      " edge of the tested sweep range [", pk_range_min, ", ", pk_range_max, "] -- ",
+      "this can mean the true optimal pK lies outside what was tested, rather than ",
+      "genuinely being the best value found."
+    ), "\n")
+  }
+
   annotations <- seu@meta.data$seurat_clusters
   homotypic_prop <- modelHomotypic(annotations)
   nExp_poi <- round(job$expected_doublet_rate * ncol(seu))
   nExp_poi_adj <- round(nExp_poi * (1 - homotypic_prop))
 
   seu <- doubletFinder(seu, PCs = 1:n_pcs, pN = job$doubletfinder_pn, pK = optimal_pK,
-                        nExp = nExp_poi_adj, reuse.pANN = FALSE, sct = FALSE)
+                        nExp = nExp_poi_adj, sct = FALSE)
 
   pann_col <- grep("^pANN", colnames(seu@meta.data), value = TRUE)[1]
   class_col <- grep("^DF.classifications", colnames(seu@meta.data), value = TRUE)[1]
 
+  # --- NEW HARDENING #2: DoubletFinder names its own output columns
+  # dynamically (embedding pN/pK/nExp values into the column name
+  # itself, e.g. "pANN_0.25_0.09_44") -- if the installed DoubletFinder
+  # version's naming convention doesn't match what this grep() expects,
+  # pann_col/class_col silently become NA rather than erroring, and
+  # every downstream cell would get silently NA doublet scores. This
+  # HARD FAILS with a clear, actionable message instead of letting
+  # that propagate silently.
+  if (is.na(pann_col) || is.na(class_col)) {
+    stop(paste0(
+      "DoubletFinder did not produce the expected output columns in Seurat's ",
+      "metadata (looked for columns starting with 'pANN' and 'DF.classifications'). ",
+      "Actual columns present: ", paste(colnames(seu@meta.data), collapse = ", "), ". ",
+      "This usually means the installed DoubletFinder version uses a different ",
+      "column-naming convention than this pipeline expects -- check DoubletFinder's ",
+      "installed version/changelog."
+    ))
+  }
+
   match_idx <- match(qc_df$barcode, colnames(seu))
+
+  # --- NEW HARDENING #3: Seurat is known to sometimes alter cell
+  # barcode names during CreateSeuratObject() (e.g. "-" -> "_"
+  # substitution in some versions/configs) -- if that happens here,
+  # match() silently returns NA for every affected barcode, and those
+  # cells get silently NA doublet scores/classifications with no error
+  # at all. This computes and reports exactly how many/what fraction of
+  # cells were affected, so a partial silent failure is visible rather
+  # than hidden.
+  n_cells_total <- length(match_idx)
+  n_cells_unmatched <- sum(is.na(match_idx))
+  pct_cells_unmatched <- round(100 * n_cells_unmatched / n_cells_total, 1)
+  if (n_cells_unmatched > 0) {
+    cat(paste0(
+      "\u26a0\ufe0f WARNING: ", n_cells_unmatched, " of ", n_cells_total, " cells (",
+      pct_cells_unmatched, "%) could not be matched between the original barcode list ",
+      "and Seurat's own cell names -- these cells will have NA doublet scores/",
+      "classifications. This can happen if Seurat modified barcode names during ",
+      "CreateSeuratObject() (e.g. a '-' -> '_' substitution)."
+    ), "\n")
+  }
+
   qc_df$doublet_score <- seu@meta.data[[pann_col]][match_idx]
   qc_df$predicted_doublet <- seu@meta.data[[class_col]][match_idx] == "Doublet"
   qc_df$doubletfinder_cluster <- as.character(seu@meta.data$seurat_clusters)[match_idx]
   qc_df$doubletfinder_pK_used <- optimal_pK
+
+  # --- Diagnostic JSON, read back by sc_cellqc_manager.py's
+  # diagnose_doubletfinder_result() and rendered in the UI ---
+  doubletfinder_diagnostic <- list(
+    selected_pK = optimal_pK,
+    pK_range_min = pk_range_min,
+    pK_range_max = pk_range_max,
+    pK_at_edge = pk_at_edge,
+    n_cells_total = n_cells_total,
+    n_cells_unmatched = n_cells_unmatched,
+    pct_cells_unmatched = pct_cells_unmatched,
+    n_expected_doublets = nExp_poi_adj,
+    homotypic_proportion = round(homotypic_prop, 4)
+  )
+  write(toJSON(doubletfinder_diagnostic, auto_unbox = TRUE), file.path(job$output_dir, "doubletfinder_diagnostic.json"))
 
   cat(paste("Doublets flagged by DoubletFinder:", sum(qc_df$predicted_doublet, na.rm = TRUE), "of", nrow(qc_df)), "\n")
 } else {
   stop(paste("Doublet detection method not implemented:", job$doublet_method))
 }
 
+
 # --- Ambient RNA correction ---
 original_counts_mat <- counts(sce)
 if (job$ambient_method == "decontx") {
   suppressMessages(library(celda))
   decon_result <- decontX(sce)
-  qc_df$ambient_contamination <- decon_result$contamination
+  qc_df$ambient_contamination <- decon_result$decontX_contamination
   corrected_counts <- round(decontXcounts(decon_result))
   Matrix::writeMM(as(corrected_counts, "CsparseMatrix"), file.path(job$output_dir, "corrected_counts.mtx"))
-  cat(paste("DecontX mean per-cell contamination fraction:", round(mean(decon_result$contamination), 4)), "\n")
-} else if (job$ambient_method == "soupx") {
+  cat(paste("DecontX mean per-cell contamination fraction:", round(mean(decon_result$decontX_contamination), 4)), "\n")} else if (job$ambient_method == "soupx") {
   suppressMessages(library(SoupX))
   raw_sce <- read10xCounts(job$raw_matrix_dir, col.names = TRUE)
   sc <- SoupChannel(counts(raw_sce), counts(sce))
+  quick_clusters <- tryCatch({
+    suppressMessages(library(scran))
+    clusters <- quickCluster(sce)
+    setNames(as.character(clusters), colnames(sce))
+  }, error = function(e) {
+    cat(paste("Note: could not compute clustering for SoupX via scran::quickCluster() --",
+              conditionMessage(e), "-- SoupX requires the `scran` package to be installed."), "\n")
+    NULL
+  })
+  if (is.null(quick_clusters)) {
+    stop("SoupX ambient RNA correction requires the R package `scran` (for quickCluster()) to provide clustering information -- please install `scran` and try again.")
+  }
+  sc <- setClusters(sc, quick_clusters)
   sc <- autoEstCont(sc, doPlot = FALSE)
   corrected_counts <- adjustCounts(sc)
   qc_df$ambient_contamination <- sc$metaData$rho[match(qc_df$barcode, rownames(sc$metaData))]
@@ -620,6 +955,25 @@ def _run_r_script(script_text, script_path, r_args, timeout=1800):
     except subprocess.TimeoutExpired:
         return False, f"Cell-level QC timed out after {timeout} seconds."
 
+def resolve_mito_gene_ids(mito_gtf_path=None, mito_gene_ids_override=None):
+    """
+    Shared mitochondrial-gene-ID resolution logic -- used by BOTH
+    run_cellqc_analysis() (to build the R job spec) and
+    diagnose_starsolo_matrix_for_mito() (the fast pre-flight check run
+    the moment a sample is selected), so both paths always agree on
+    exactly which gene IDs count as mitochondrial for a given
+    reference, with no risk of the two independently drifting out of
+    sync over time.
+
+    Truthiness check (not "is not None") on mito_gene_ids_override --
+    an empty list means "no real override was ever resolved," and must
+    fall through to GTF auto-detection exactly like a genuinely absent
+    override (None) would (see the earlier empty-list-override
+    incident this same logic already fixes elsewhere in this module).
+    """
+    if mito_gene_ids_override:
+        return list(mito_gene_ids_override)
+    return get_mito_gene_ids_from_gtf(mito_gtf_path) if mito_gtf_path else []
 
 def run_cellqc_analysis(filtered_matrix_dir, output_dir, work_dir,
                          doublet_method=DEFAULT_DOUBLET_METHOD,
@@ -670,7 +1024,15 @@ def run_cellqc_analysis(filtered_matrix_dir, output_dir, work_dir,
     if timeout is None:
         timeout = 5400 if doublet_method == "doublet_finder" else 1800
 
-    if mito_gene_ids_override is not None:
+    if mito_gene_ids_override:
+        # Truthiness check (not "is not None") -- an empty list means
+        # "no real override was ever resolved," and must fall through
+        # to GTF auto-detection exactly like a genuinely absent
+        # override (None) would. A present-but-empty list previously
+        # short-circuited auto-detection entirely, silently disabling
+        # mitochondrial gene detection even on a fully correct,
+        # properly-annotated reference. See this patch's own module
+        # docstring for the full incident this fixes.
         mito_gene_ids = list(mito_gene_ids_override)
     else:
         mito_gene_ids = get_mito_gene_ids_from_gtf(mito_gtf_path) if mito_gtf_path else []
@@ -742,6 +1104,69 @@ def read_doubletfinder_pk_sweep(output_dir):
     if not os.path.exists(path):
         return None
     return pd.read_csv(path)
+
+def read_doubletfinder_diagnostic(output_dir):
+    "Read the doubletfinder_diagnostic.json written by a DoubletFinder run, or None if not present (e.g. scDblFinder was used instead, or this project predates this diagnostic)."
+    import os
+    import json
+    path = os.path.join(output_dir, "doubletfinder_diagnostic.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def diagnose_doubletfinder_result(diagnostic):
+    """
+    Build plain-language, tiered warnings from a DoubletFinder
+    diagnostic dict (see read_doubletfinder_diagnostic) -- surfaces the
+    real correctness risks hardened into the R script:
+      1. pK selected at the edge of its tested sweep range (may not be
+         a genuine optimum).
+      2. A meaningful fraction of cells couldn't be matched back to
+         Seurat's own cell names (silently NA doublet scores for those
+         cells).
+
+    Returns a dict:
+        {
+            "flagged": bool,          # True if ANY issue was found
+            "messages": [str, ...],   # one plain-language message per issue found
+        }
+    Returns {"flagged": False, "messages": []} if diagnostic is None
+    (nothing to check) or no issues were found.
+    """
+    if diagnostic is None:
+        return {"flagged": False, "messages": []}
+
+    messages = []
+
+    if diagnostic.get("pK_at_edge"):
+        edge = "minimum" if diagnostic.get("selected_pK") == diagnostic.get("pK_range_min") else "maximum"
+        messages.append(
+            f"⚠️ The selected pK ({diagnostic.get('selected_pK')}) sits at the **{edge}** edge of "
+            f"the tested range [{diagnostic.get('pK_range_min')}, {diagnostic.get('pK_range_max')}] -- "
+            "this can mean the true optimal pK lies outside what was tested, rather than genuinely "
+            "being the best value. Results may still be usable, but this parameter choice is less "
+            "certain than a pK selected comfortably within the tested range."
+        )
+
+    pct_unmatched = diagnostic.get("pct_cells_unmatched", 0)
+    if pct_unmatched and pct_unmatched > 0:
+        n_unmatched = diagnostic.get("n_cells_unmatched", 0)
+        n_total = diagnostic.get("n_cells_total", 0)
+        severity = "🔴" if pct_unmatched >= 5 else "🟡"
+        messages.append(
+            f"{severity} **{n_unmatched:,} of {n_total:,} cell(s) ({pct_unmatched}%)** could not be "
+            "matched between the original barcode list and Seurat's own cell names during "
+            "DoubletFinder's internal processing -- these cells have **no doublet score or "
+            "classification at all** (silently NA), rather than a real result. This most often "
+            "happens when Seurat's own barcode-parsing altered cell names slightly (e.g. a "
+            "\"-\" to \"_\" substitution). "
+            + ("This is a large enough fraction to treat DoubletFinder's results for this sample with real caution." if pct_unmatched >= 5 else "This is a small fraction, but still worth being aware of.")
+        )
+
+    return {"flagged": len(messages) > 0, "messages": messages}
+
 
 
 # ---------------------------------------------------------------------------
