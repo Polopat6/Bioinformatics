@@ -178,6 +178,30 @@ def shared_gene_symbol_map_path(species_key):
     "Shared gene_id -> gene_symbol mapping CSV for a preset species, built once from the shared reference and reused by every project using that species."
     return os.path.join(shared_reference_dir(species_key), "gene_symbol_map.csv")
 
+def qc_certificate_path(project_name):
+    """
+    Machine-readable QC Certificate JSON for this project -- see
+    qc_certificate_manager.py for what this records (a per-stage
+    rollup of every QC/flag signal produced across the pipeline run,
+    plus an overall passed/flagged status). Written once at the end of
+    every Advanced Mode / Monitor Mode run (success or error) via
+    qc_certificate_manager.save_qc_certificate(), and bundled into the
+    downloadable project package (see project_actions.py) so it
+    travels with the results to whoever receives them.
+    """
+    return os.path.join(project_dir(project_name), "qc_certificate.json")
+
+
+def qc_report_html_path(project_name):
+    """
+    Human-readable HTML companion to qc_certificate_path() above --
+    a single, self-contained (no external CSS/JS/image assets) HTML
+    file that opens standalone in any browser, giving a plain-language
+    overview of every pipeline stage's QC status. See
+    qc_certificate_manager.render_html_report() for how this is built.
+    """
+    return os.path.join(project_dir(project_name), "qc_report.html")
+
 
 def get_effective_reference_dir(project_name, species_key, is_custom):
     """

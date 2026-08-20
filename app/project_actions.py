@@ -162,9 +162,12 @@ def build_project_package_zip(project_name):
     Bundle a completed project's FastQC, MultiQC (pre- and post-trim),
     trimming (fastp reports only, not the trimmed reads themselves),
     alignment scores/info (Salmon or STAR, whichever this project used
-    -- log/summary files only, not the aligned reads themselves), and
-    the final gene counts matrix -- plus a project_info.json summary of
-    recorded step-completion status -- into a single in-memory zip
+    -- log/summary files only, not the aligned reads themselves), the
+    final gene counts matrix, and -- if this project was run via
+    Advanced Mode / Monitor Mode -- its QC Certificate (both the
+    machine-readable JSON and the human-readable HTML overview report,
+    see qc_certificate_manager.py) -- plus a project_info.json summary
+    of recorded step-completion status -- into a single in-memory zip
     file.
 
     Returns raw zip bytes, ready to hand straight to
@@ -189,9 +192,25 @@ def build_project_package_zip(project_name):
                     abs_path = os.path.join(root, fname)
                     rel_path = os.path.relpath(abs_path, src_dir)
                     zf.write(abs_path, arcname=os.path.join(arcname_prefix, rel_path))
+
         counts_path = pm.counts_matrix_path(project_name)
         if os.path.isfile(counts_path):
             zf.write(counts_path, arcname=os.path.join("quant", os.path.basename(counts_path)))
+
+        # --- QC Certificate (new) ---
+        # Best-effort/optional: a project run before this feature existed
+        # (or one run entirely through the interactive step-by-step
+        # workspaces, which don't currently generate a certificate at all)
+        # simply won't have these files yet -- packaging proceeds normally
+        # without them, exactly like the project_info.json load below
+        # already tolerates a missing/older project.
+        qc_cert_path = pm.qc_certificate_path(project_name)
+        if os.path.isfile(qc_cert_path):
+            zf.write(qc_cert_path, arcname="qc_certificate.json")
+        qc_report_path = pm.qc_report_html_path(project_name)
+        if os.path.isfile(qc_report_path):
+            zf.write(qc_report_path, arcname="qc_report.html")
+
         info = pm.load_info(project_name)
         zf.writestr("project_info.json", json.dumps(info, indent=2))
     buffer.seek(0)

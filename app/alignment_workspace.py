@@ -31,6 +31,52 @@ plain language.
 This module is fully self-contained. All alignment/counting development
 should happen here — editing this file has zero effect on
 spatial_workspace.py, bulk_rnaseq_workspace.py, or trimming_workspace.py.
+
+--- Stale-resource-during-rebuild race fix + mitochondrial reference
+    verification (2026-08-18) ---
+A real reported bug: a user force-rebuilding a shared STAR genome index
+navigated between radio-button pages while the rebuild was running (on
+an HPC host, confirmed still running via `top`) and, on navigating
+back, saw the index reported as "✅ already built" even though the real
+rebuild was still in progress. Root cause: reference_manager.py's
+ensure_shared_resource() builds a fresh copy into a private temp
+directory and only replaces the OLD resource via a single atomic
+os.rename() at the very END of a successful build -- so the old
+(stale) resource stays fully present on disk, and every existing
+readiness check here (rm._resource_is_ready, qm.star_index_exists,
+qm.salmon_index_exists) reports "ready" for the entire rebuild
+duration, with no way to distinguish a finished build from one that's
+actively being replaced.
+
+Fixed by using reference_manager.is_shared_resource_ready() /
+resource_build_in_progress() (see reference_manager.py's own docstring
+for these) as the authoritative readiness check at all FOUR shared-
+resource call sites in this file (Salmon transcriptome download, STAR
+genome+GTF download, Salmon index build, STAR index build), and by
+routing CUSTOM (non-shared, per-project) index builds through
+ensure_shared_resource() too -- previously those called
+qm.build_star_index()/qm.build_salmon_index() directly against
+index_dir with NO temp-dir staging, atomic replacement, or lock
+protection at all, so a custom reference's rebuild had the exact same
+stale-appears-ready symptom with even less of a safety net than the
+shared path. All build paths (shared and custom) now share the same
+temp-directory + atomic-rename + lock-file infrastructure, and the UI
+now shows an explicit "🔄 build in progress, please wait" status
+(blocking further action) instead of a misleading "not built yet" or
+"already built" message during an active rebuild.
+
+Also ported reference_manager.verify_preset_reference_mito_content()
+(already pipeline-agnostic infrastructure, originally wired into the
+Single-cell pipeline's Step 5) into this pipeline's Step 2 STAR
+reference section -- see _render_bulk_mito_verification() below. Even
+without per-cell QC, a preset reference silently missing its
+mitochondrial contig/genes still affects alignment accuracy for real
+mitochondrial-origin reads and means mitochondrial genes are simply
+absent from the resulting gene counts matrix; since this reference is
+SHARED with the Single-cell pipeline, catching this here too (with the
+same dedicated re-download action) closes a real gap. Skipped for
+bacterial/organelle-free presets (e.g. E. coli), which have no
+mitochondrial genome to check for.
 """
 
 import os
@@ -404,6 +450,90 @@ def _render_reference_file_input(purpose_label, key_prefix, file_extensions, des
         return selected_path
 
 
+def _render_bulk_mito_verification(species_key, species_labels, genome_fasta_expected, gtf_expected):
+    """
+    Verify + surface whether a PRESET reference's already-downloaded
+    files actually include the mitochondrial genome -- ported from the
+    Single-cell pipeline's singlecell_workspace._render_preset_mito_verification
+    (see that module, and reference_manager.verify_preset_reference_mito_content,
+    for the full original rationale).
+
+    Bulk RNA-Seq doesn't do per-cell QC, so a missing mitochondrial
+    contig/genes here doesn't produce a misleading "0%" metric the way
+    it does in single-cell Cell-level QC -- but it still silently
+    affects alignment accuracy for any real mitochondrial-origin reads,
+    and means mitochondrial genes are simply absent from the resulting
+    gene counts matrix. Since this reference is SHARED with the
+    Single-cell pipeline (same shared_genome_dir), catching this here
+    too -- with the same dedicated re-download action -- closes a real
+    gap rather than leaving Bulk users to discover it only indirectly.
+
+    Skipped entirely for bacterial/organelle-free presets (currently
+    just E. coli in REFERENCE_CATALOG), which have no mitochondrial
+    genome to check for -- identified generically via
+    entry["source"] != "ensembl" rather than hardcoding "ecoli", so any
+    future non-eukaryotic preset added to REFERENCE_CATALOG is
+    automatically excluded too.
+    """
+    entry = rm.REFERENCE_CATALOG[species_key]
+    if entry.get("source") != "ensembl":
+        return  # bacterial/non-eukaryotic preset -- no mitochondria to verify
+
+    verification = rm.verify_preset_reference_mito_content(genome_fasta_expected, gtf_expected)
+
+    if verification["verified"]:
+        st.success(
+            f"✅ Mitochondrial genome verified in this reference: the genome FASTA "
+            f"includes a mitochondrial contig, and {verification['gtf_mito_gene_count']} "
+            f"mitochondrial gene(s) were found in the annotation."
+        )
+        return
+
+    st.error(
+        "🔴 **Could not verify mitochondrial genome content in this already-downloaded "
+        "reference.** "
+        f"Genome FASTA mitochondrial contig found: {'✅ Yes' if verification['fasta_has_mito_contig'] else '❌ No'}. "
+        f"Mitochondrial genes found in annotation: {verification['gtf_mito_gene_count']}.\n\n"
+        "This reference is shared with the Single-cell pipeline -- if it was downloaded "
+        "before this check existed, or from a partial/interrupted earlier download, it may "
+        "be missing the mitochondrial chromosome entirely. This won't break alignment, but "
+        "any real mitochondrial-origin reads will have nowhere correct to map, and "
+        "mitochondrial genes will be entirely absent from your gene counts matrix."
+    )
+    if st.button(
+        f"🔄 Re-download {species_labels[species_key]} Reference (to include mitochondrial genome)",
+        key="bulk_ref_mito_redownload_btn", type="primary",
+    ):
+        shared_genome_dir = pm.shared_genome_dir(species_key)
+
+        def _build_fn(temp_dir, _species=species_key):
+            success, _paths, message = rm.download_genome_and_gtf(_species, temp_dir)
+            return success, message
+
+        wait_placeholder = st.empty()
+
+        def _wait_message(elapsed_seconds, _ph=wait_placeholder):
+            _ph.info(f"⏳ Another project/session is currently preparing this same reference -- waiting ({elapsed_seconds:.0f}s so far)...")
+
+        with st.spinner(f"Re-downloading reference for {species_labels[species_key]}..."):
+            success, message, _built = rm.ensure_shared_resource(
+                shared_genome_dir, build_fn=_build_fn, wait_message_callback=_wait_message, force=True,
+            )
+        wait_placeholder.empty()
+        if success:
+            st.success(f"✅ {message}")
+            st.warning(
+                "⚠️ **Important:** re-downloading the reference does NOT rebuild the STAR "
+                "genome index automatically -- both use a separately-cached, one-time build. "
+                "Scroll down to **rebuild the genome index** below, then re-run alignment "
+                "for every sample, before this fix will actually show up in your gene "
+                "counts matrix."
+            )
+            st.rerun()
+        else:
+            st.error(f"❌ Re-download failed: {message}")
+
+
 def render():
     st.title("🧮 RNA Alignment & Counts")
     st.markdown(
@@ -612,9 +742,22 @@ def render():
 
         if method == "salmon":
             shared_cdna_dir = pm.shared_cdna_fasta_dir(species_key)
-            already_downloaded = rm._resource_is_ready(shared_cdna_dir)
+            # See this module's docstring ("Stale-resource-during-rebuild
+            # race fix") -- a bare _resource_is_ready() check cannot tell
+            # a finished download apart from one that's actively being
+            # replaced by a force re-download in progress right now.
+            build_in_progress = rm.resource_build_in_progress(shared_cdna_dir)
+            already_downloaded = rm.is_shared_resource_ready(shared_cdna_dir)
 
-            if already_downloaded:
+            if build_in_progress:
+                st.warning(
+                    f"🔄 A download/re-download of the **{species_labels[species_key]}** "
+                    "reference is currently in progress (started by this or another "
+                    "session/pipeline) -- please wait. This page will show it as ready "
+                    "once the build finishes; re-check periodically rather than "
+                    "proceeding."
+                )
+            elif already_downloaded:
                 st.success(
                     f"✅ Reference already available for **{species_labels[species_key]}** "
                     "(shared across every project using this species)."
@@ -629,9 +772,9 @@ def render():
                     "again later."
                 )
 
-            dl_label = "⬇️ Download Reference" if not already_downloaded else None
+            dl_label = "⬇️ Download Reference" if (not already_downloaded and not build_in_progress) else None
             force_dl = False
-            if already_downloaded:
+            if already_downloaded and not build_in_progress:
                 with st.expander("🔁 Force a fresh re-download (advanced)"):
                     st.caption(
                         "⚠️ This reference is shared across every project "
@@ -679,13 +822,32 @@ def render():
 
         else:  # STAR
             shared_genome_dir = pm.shared_genome_dir(species_key)
-            already_downloaded = rm._resource_is_ready(shared_genome_dir)
+            # See this module's docstring -- same rebuild-visibility fix
+            # as the Salmon cDNA download above.
+            build_in_progress = rm.resource_build_in_progress(shared_genome_dir)
+            already_downloaded = rm.is_shared_resource_ready(shared_genome_dir)
 
-            if already_downloaded:
+            if build_in_progress:
+                st.warning(
+                    f"🔄 A download/re-download of the **{species_labels[species_key]}** "
+                    "reference is currently in progress (started by this or another "
+                    "session/pipeline) -- please wait. This page will show it as ready "
+                    "once the build finishes; re-check periodically rather than "
+                    "proceeding."
+                )
+            elif already_downloaded:
                 st.success(
                     f"✅ Reference already available for **{species_labels[species_key]}** "
                     "(shared across every project using this species)."
                 )
+                # --- Mitochondrial genome verification (2026-08-18) ---
+                # Ported from the Single-cell pipeline -- see
+                # _render_bulk_mito_verification's own docstring for the
+                # full rationale. Only meaningful once a download is
+                # confirmed genuinely ready (not mid-rebuild).
+                genome_fasta_expected = os.path.join(shared_genome_dir, f"{species_key}.genome.fa")
+                gtf_expected = os.path.join(shared_genome_dir, f"{species_key}.annotation.gtf")
+                _render_bulk_mito_verification(species_key, species_labels, genome_fasta_expected, gtf_expected)
             else:
                 st.info(
                     f"ℹ️ No project has downloaded a reference for "
@@ -702,9 +864,9 @@ def render():
                 "connection."
             )
 
-            dl_label = "⬇️ Download Genome + Annotation" if not already_downloaded else None
+            dl_label = "⬇️ Download Genome + Annotation" if (not already_downloaded and not build_in_progress) else None
             force_dl = False
-            if already_downloaded:
+            if already_downloaded and not build_in_progress:
                 with st.expander("🔁 Force a fresh re-download (advanced)"):
                     st.caption(
                         "⚠️ This reference is shared across every project "
@@ -712,7 +874,9 @@ def render():
                         "for everyone -- only do this if you have a "
                         "specific reason to believe the current copy is "
                         "corrupted or out of date, and ideally not while "
-                        "another project may be actively using it."
+                        "another project may be actively using it. If your "
+                        "specific concern is missing mitochondrial content, "
+                        "use the dedicated re-download button above instead."
                     )
                     force_dl = st.button("🔄 Re-download Reference for All Projects", key="download_genome_gtf_force_btn")
 
@@ -1147,18 +1311,19 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
 
     # Preset species reuse a SHARED, project-independent Salmon index
     # (built once per species, reused by every project) -- custom
-    # uploads keep their existing per-project index, since there's no
-    # guarantee two different projects' custom references are actually
-    # the same thing even if named similarly. See reference_manager.py's
-    # ensure_shared_resource() for how concurrent index-build requests
-    # across different projects/sessions are made safe.
+    # uploads previously kept an unprotected per-project index build;
+    # see this module's docstring -- both now go through
+    # reference_manager.py's ensure_shared_resource() for temp-dir +
+    # atomic-rename + lock protection, regardless of whether the index
+    # is actually shared across projects or private to this one.
     index_is_shared = not is_custom and bool(species_key)
     index_dir = pm.shared_salmon_index_dir(species_key) if index_is_shared else pm.salmon_index_dir(project)
-    # qm.salmon_index_exists just checks whether a valid-looking Salmon
-    # index is present at a given path -- this works identically
-    # whether that path happens to be the shared or per-project
-    # location, so the same check is used for both.
-    index_ready = qm.salmon_index_exists(index_dir)
+    # files_present alone (qm.salmon_index_exists) cannot tell a
+    # finished index apart from one that's actively being replaced by a
+    # rebuild in progress right now -- see this module's docstring.
+    files_present = qm.salmon_index_exists(index_dir)
+    build_in_progress = rm.resource_build_in_progress(index_dir)
+    index_ready = files_present and not build_in_progress
 
     index_threads = st.slider(
         "Threads for indexing:",
@@ -1174,7 +1339,14 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
         key="salmon_index_threads_slider",
     )
 
-    if index_ready:
+    if build_in_progress:
+        st.warning(
+            "🔄 **A Salmon index build/rebuild is currently in progress** "
+            "(started by this or another session) -- please wait. You "
+            "cannot run quantification until it finishes; re-check this "
+            "page periodically."
+        )
+    elif index_ready:
         st.success(
             "✅ Salmon index already built "
             + ("(shared across every project using this species)." if index_is_shared else "for this project's reference.")
@@ -1182,7 +1354,9 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
 
     build_clicked = False
     force_index = False
-    if not index_ready:
+    if build_in_progress:
+        pass  # no build controls shown while a build is already running
+    elif not index_ready:
         build_clicked = st.button("🔧 Build Salmon Index", key="build_salmon_index_btn")
     elif index_is_shared:
         with st.expander("🔁 Force a fresh re-index (advanced)"):
@@ -1195,29 +1369,33 @@ def _render_salmon_quantification(project, reference_dir, trimmed_dir, manifest)
             )
             force_index = st.button("🔄 Re-build Index for All Projects", key="build_salmon_index_force_btn")
     else:
-        build_clicked = st.button("🔄 Re-build Index", key="build_salmon_index_btn")
+        with st.expander("🔁 Force a fresh re-index (advanced)"):
+            st.caption(
+                "Only do this if you have a specific reason to believe the "
+                "current index is corrupted or out of date."
+            )
+            force_index = st.button("🔄 Re-build Index", key="build_salmon_index_custom_force_btn")
 
     if build_clicked or force_index:
         def _build_salmon_index_impl(temp_dir):
             return qm.build_salmon_index(transcriptome_fasta, temp_dir, threads=index_threads)
 
-        if index_is_shared:
-            status_placeholder = st.empty()
+        # Both shared and custom index builds now go through
+        # ensure_shared_resource() -- see this module's docstring for
+        # why the custom (per-project) path needed this protection too.
+        status_placeholder = st.empty()
 
-            def _wait_callback(elapsed):
-                status_placeholder.info(
-                    f"⏳ Another project is currently building this index. "
-                    f"Waiting for it to finish... ({int(elapsed)}s elapsed)"
-                )
+        def _wait_callback(elapsed):
+            status_placeholder.info(
+                f"⏳ Another project/session is currently building this index. "
+                f"Waiting for it to finish... ({int(elapsed)}s elapsed)"
+            )
 
-            with st.spinner("Building Salmon index... this may take a few minutes."):
-                success, log, built = rm.ensure_shared_resource(
-                    index_dir, _build_salmon_index_impl, wait_message_callback=_wait_callback, force=force_index,
-                )
-            status_placeholder.empty()
-        else:
-            with st.spinner("Building Salmon index... this may take a few minutes."):
-                success, log = qm.build_salmon_index(transcriptome_fasta, index_dir, threads=index_threads)
+        with st.spinner("Building Salmon index... this may take a few minutes."):
+            success, log, built = rm.ensure_shared_resource(
+                index_dir, _build_salmon_index_impl, wait_message_callback=_wait_callback, force=force_index,
+            )
+        status_placeholder.empty()
 
         if success:
             st.success("✅ Salmon index built successfully.")
@@ -1421,10 +1599,16 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
         )
 
     # Preset species reuse a SHARED, project-independent STAR index --
-    # same rationale as the Salmon index above.
+    # same rationale as the Salmon index above. Custom (per-project)
+    # index builds now ALSO go through ensure_shared_resource() for
+    # temp-dir + atomic-rename + lock protection -- see this module's
+    # docstring ("Stale-resource-during-rebuild race fix") for why this
+    # matters even for a non-shared, single-project index.
     index_is_shared = not is_custom and bool(species_key)
     index_dir = pm.shared_star_index_dir(species_key) if index_is_shared else pm.star_index_dir(project)
-    index_ready = qm.star_index_exists(index_dir)
+    files_present = qm.star_index_exists(index_dir)
+    build_in_progress = rm.resource_build_in_progress(index_dir)
+    index_ready = files_present and not build_in_progress
 
     index_threads = st.slider(
         "Threads for indexing:",
@@ -1443,7 +1627,17 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
         key="star_index_threads_slider",
     )
 
-    if index_ready:
+    if build_in_progress:
+        st.warning(
+            "🔄 **A STAR genome index build/rebuild is currently in progress** "
+            "(started by this or another session/pipeline) -- please wait. "
+            "You cannot run alignment until it finishes; re-check this page "
+            "periodically rather than proceeding. (A genuine rebuild for a "
+            "full genome legitimately takes several minutes or more -- if "
+            "this status disappears within a few seconds, something may not "
+            "have started correctly.)"
+        )
+    elif index_ready:
         st.success(
             "✅ STAR genome index already built "
             + ("(shared across every project using this species)." if index_is_shared else "for this project's reference.")
@@ -1451,20 +1645,29 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
 
     build_clicked = False
     force_index = False
-    if not index_ready:
+    if build_in_progress:
+        pass  # no build controls shown while a build is already running
+    elif not index_ready:
         build_clicked = st.button("🔧 Build STAR Index", key="build_star_index_btn")
     elif index_is_shared:
         with st.expander("🔁 Force a fresh re-index (advanced)"):
             st.caption(
                 "⚠️ This index is shared across every project using this "
-                "species. Rebuilding replaces it for everyone -- only do "
-                "this if you have a specific reason to believe the "
-                "current index is corrupted, and ideally not while "
-                "another project may be actively aligning against it."
+                "species (and with the Single-cell pipeline). Rebuilding "
+                "replaces it for everyone -- only do this if you have a "
+                "specific reason to believe the current index is corrupted "
+                "or out of date (e.g. after using the mitochondrial-genome "
+                "re-download button above), and ideally not while another "
+                "project may be actively aligning against it."
             )
             force_index = st.button("🔄 Re-build Index for All Projects", key="build_star_index_force_btn")
     else:
-        build_clicked = st.button("🔄 Re-build Index", key="build_star_index_btn")
+        with st.expander("🔁 Force a fresh re-index (advanced)"):
+            st.caption(
+                "Only do this if you have a specific reason to believe the "
+                "current index is corrupted or out of date."
+            )
+            force_index = st.button("🔄 Re-build Index", key="build_star_index_custom_force_btn")
 
     if build_clicked or force_index:
         def _build_star_index_impl(temp_dir):
@@ -1478,30 +1681,32 @@ def _render_star_quantification(project, reference_dir, trimmed_dir, manifest):
                 sjdb_overhang=sjdb_overhang,
             )
 
-        if index_is_shared:
-            status_placeholder = st.empty()
+        # Both shared and custom index builds now go through
+        # ensure_shared_resource() -- see this module's docstring.
+        status_placeholder = st.empty()
 
-            def _wait_callback(elapsed):
-                status_placeholder.info(
-                    f"⏳ Another project is currently building this index. "
-                    f"Waiting for it to finish... ({int(elapsed)}s elapsed)"
-                )
+        def _wait_callback(elapsed):
+            status_placeholder.info(
+                f"⏳ Another project/session is currently building this index. "
+                f"Waiting for it to finish... ({int(elapsed)}s elapsed)"
+            )
 
-            with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
-                success, log, built = rm.ensure_shared_resource(
-                    index_dir, _build_star_index_impl, wait_message_callback=_wait_callback, force=force_index,
-                )
-            status_placeholder.empty()
-        else:
-            with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
-                success, log = qm.build_star_index(
-                    genome_fasta, gtf_path, index_dir, threads=index_threads,
-                    sjdb_overhang=sjdb_overhang,
-                )
+        with st.spinner("Building STAR genome index... this can take a while, especially for larger genomes."):
+            success, log, built = rm.ensure_shared_resource(
+                index_dir, _build_star_index_impl, wait_message_callback=_wait_callback, force=force_index,
+            )
+        status_placeholder.empty()
 
         if success:
             st.success("✅ STAR genome index built successfully.")
             index_ready = True
+            if force_index:
+                st.warning(
+                    "⚠️ **Important:** rebuilding the index does NOT automatically "
+                    "re-run Step 3 alignment for any sample. Re-run alignment for "
+                    "every sample below before this fix will actually show up in "
+                    "your gene counts matrix."
+                )
         else:
             st.error("STAR indexing failed. Details below:")
             st.code(log)

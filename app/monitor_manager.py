@@ -473,15 +473,22 @@ def _build_project_config_for_folder(monitor_config, folder_path, project_name):
     Build the advanced_mode_orchestrator config dict for one dropped
     folder, starting from the monitor's preset pipeline_config_template
     and filling in this specific folder's FASTQ source + metadata.
+
     fastq_source_dir is pointed directly at the dropped folder itself
     (NOT copied into the project first) -- advanced_mode_orchestrator's
     own ingest stage already symlinks from whatever directory it's
     given into the project's own fastq_dir.
+
+    run_mode/monitor_id: purely for QC Certificate labeling (see
+    qc_certificate_manager.py) -- lets the resulting certificate record
+    which monitor launched this project, distinct from a plain Auto run.
     """
     config = dict(monitor_config.get("pipeline_config_template", {}))
     config["fastq_source"] = "directory"
     config["fastq_source_dir"] = folder_path
     config["metadata_path"] = pm.metadata_path(project_name)
+    config["run_mode"] = "monitor"
+    config["monitor_id"] = monitor_config["monitor_id"]
     return config
 
 

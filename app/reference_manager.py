@@ -26,6 +26,32 @@ differently (collection-based, less predictable), so instead we use
 NCBI RefSeq's assembly-specific FTP path for E. coli K-12 MG1655
 (GCF_000005845.2 / ASM584v2). NCBI keeps every assembly version at a
 permanently fixed path, so this URL will not go stale.
+
+--- Mitochondrial genome verification (2026-08-17) ---
+A real reported concern: a preset (auto-downloaded) reference's Step 5
+UI only ever checks "does this directory already have files in it?" to
+decide whether to show "✅ already prepared" -- it never actually
+verifies WHAT is in those files. Combined with a separate, now-fixed
+single-cell Cell-level QC bug where mitochondrial-gene detection relied
+solely on gene-symbol matching, this made it genuinely impossible for a
+user to tell whether a "0% mitochondrial" QC result meant "your cells
+are very healthy" or "this specific downloaded reference copy is
+missing the mitochondrial chromosome/contig entirely" (e.g. from an
+older cached copy, a partial/interrupted historical download, or an
+upstream Ensembl/NCBI change).
+
+genome_fasta_contains_mito_contig() below provides a fast, second,
+INDEPENDENT verification signal -- checking the actual downloaded
+genome FASTA's own sequence headers (not just the GTF single-cell's
+own get_mito_gene_ids_from_gtf() already checks) for a recognized
+mitochondrial contig name. This only scans header lines (each genome
+FASTA's ">chromosome_name ..." lines), never the sequence data itself,
+so it stays fast even for a multi-gigabyte primary-assembly file.
+Wired into singlecell_workspace.py's Step 5 preset-reference section
+(see that module for details) to surface a concrete, actionable
+"re-download this reference" option specifically when mitochondrial
+content can't be verified, rather than only offering a generic
+"force re-download" as a buried advanced/undifferentiated action.
 """
 
 import fcntl
@@ -102,17 +128,6 @@ REFERENCE_CATALOG = {
         "species_dir": "drosophila_melanogaster",
         "species_name": "Drosophila_melanogaster",
         "assembly": "BDGP6.54",
-        # Confirmed present on Ensembl's main FTP site (not the separate
-        # Ensembl Metazoa/Genomes portal), so the same current_fasta/
-        # current_gtf symlink pattern used for human/mouse/yeast applies
-        # unchanged. The exact "toplevel" vs. "primary_assembly" naming
-        # below is inferred from Drosophila's compact, well-finished
-        # genome structure (similar to yeast) rather than independently
-        # confirmed against a live directory listing -- if this doesn't
-        # match on first real use, _resolve_ensembl_filename() will
-        # return a clear "could not find a matching file" error rather
-        # than silently downloading the wrong thing, so this is safe to
-        # verify and correct on first actual use rather than a real risk.
         "genome_fasta_pattern": r"Drosophila_melanogaster\.BDGP6\.54\.dna\.toplevel\.fa\.gz",
         "cdna_fasta_pattern": r"Drosophila_melanogaster\.BDGP6\.54\.cdna\.all\.fa\.gz",
         "gtf_pattern": r"Drosophila_melanogaster\.BDGP6\.54\.\d+\.gtf\.gz",
@@ -123,9 +138,6 @@ REFERENCE_CATALOG = {
         "species_dir": "caenorhabditis_elegans",
         "species_name": "Caenorhabditis_elegans",
         "assembly": "WBcel235",
-        # Same note as Drosophila above re: pattern verification on
-        # first real use -- also confirmed on Ensembl's main FTP site,
-        # same current_fasta/current_gtf symlink pattern applies.
         "genome_fasta_pattern": r"Caenorhabditis_elegans\.WBcel235\.dna\.toplevel\.fa\.gz",
         "cdna_fasta_pattern": r"Caenorhabditis_elegans\.WBcel235\.cdna\.all\.fa\.gz",
         "gtf_pattern": r"Caenorhabditis_elegans\.WBcel235\.\d+\.gtf\.gz",
@@ -136,9 +148,6 @@ REFERENCE_CATALOG = {
         "species_dir": "danio_rerio",
         "species_name": "Danio_rerio",
         "assembly": "GRCz11",
-        # Zebrafish has a chromosome-level assembly like human/mouse, so
-        # it's distributed as "primary_assembly" (not "toplevel", which
-        # is used for the smaller/less-finished genomes above).
         "genome_fasta_pattern": r"Danio_rerio\.GRCz11\.dna\.primary_assembly\.fa\.gz",
         "cdna_fasta_pattern": r"Danio_rerio\.GRCz11\.cdna\.all\.fa\.gz",
         "gtf_pattern": r"Danio_rerio\.GRCz11\.\d+\.gtf\.gz",
@@ -151,23 +160,129 @@ REFERENCE_CATALOG = {
         "ncbi_base_url": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2",
         "genome_fasta_filename": "GCF_000005845.2_ASM584v2_genomic.fna.gz",
         "gtf_filename": "GCF_000005845.2_ASM584v2_genomic.gtf.gz",
-        # NCBI does not provide a separate transcriptome-only FASTA for
-        # this assembly by default, so for Salmon we extract transcript
-        # sequences from the genome + GTF instead.
         "cdna_fasta_filename": None,
-        # E. coli (and bacteria generally) have no introns, so NCBI's
-        # GTF only contains "gene"/"CDS" features with no separate
-        # transcript/mRNA parent line. gffread's parent-child ID
-        # matching (built for eukaryotic gene models) fails on this
-        # structure with "no valid ID found for GFF record". Since
-        # gene == transcript for organisms with no splicing, we extract
-        # sequences directly by gene coordinates instead of relying on
-        # gffread at all.
         "no_introns": True,
     },
 }
 
 ENSEMBL_BASE_URL = "https://ftp.ensembl.org/pub"
+
+
+# ---------------------------------------------------------------------------
+# Mitochondrial genome verification (2026-08-17) -- see module docstring
+# ---------------------------------------------------------------------------
+
+# Kept identical to sc_cellqc_manager.py's own _MITO_SEQNAME_ALIASES set
+# (that module's the authoritative GTF-gene-level check; this one is a
+# lightweight, FASTA-header-only cross-check) -- both independently
+# maintained since they check different file types, but should be kept
+# in sync if either is ever extended with new naming conventions.
+_MITO_SEQNAME_ALIASES = {"mt", "chrm", "chrmt", "m", "mitochondrion", "mtdna"}
+
+
+def genome_fasta_contains_mito_contig(fasta_path, max_headers_to_scan=5000):
+    """
+    Check whether a genome FASTA file's own sequence headers include a
+    recognized mitochondrial contig name (e.g. ">MT dna:chromosome...",
+    ">chrM ...") -- WITHOUT reading or scanning any actual sequence data,
+    so this stays fast even for a multi-gigabyte primary-assembly FASTA.
+
+    This exists specifically to let the UI answer "does this ALREADY-
+    DOWNLOADED reference actually include the mitochondrial genome?"
+    directly and quickly, rather than the previous behavior of only
+    checking "does this directory have files in it at all?" -- which
+    says nothing about their actual content, and left a real, reported
+    gap where a user had no way to distinguish a genuinely mito-free
+    reference (which would silently produce misleading "0% mitochondrial"
+    single-cell QC results) from a healthy one, without re-downloading
+    or manually inspecting the file.
+
+    fasta_path: path to a genome FASTA file (may be a large primary-
+        assembly/toplevel file -- this function is header-scan-only and
+        does not load sequence content into memory).
+    max_headers_to_scan: safety cap on how many ">"-prefixed header
+        lines to examine before giving up -- a real genome FASTA's
+        mitochondrial contig (if present) is essentially always
+        encountered within the first few dozen headers (contigs are
+        conventionally ordered chromosome 1, 2, 3, ..., MT/X/Y at the
+        end, or similar), so this cap is a defensive safety valve, not
+        a normal-path constraint.
+
+    Returns True if a mitochondrial-named header was found, False
+    otherwise (including if the file doesn't exist or can't be read).
+    """
+    if not fasta_path or not os.path.isfile(fasta_path):
+        return False
+
+    headers_scanned = 0
+    try:
+        with open(fasta_path, "r", errors="replace") as f:
+            for line in f:
+                if not line.startswith(">"):
+                    continue
+                headers_scanned += 1
+                if headers_scanned > max_headers_to_scan:
+                    break
+                # A FASTA header's sequence ID is the first whitespace-
+                # delimited token after ">" (e.g. ">MT dna:chromosome
+                # MT:GRCh38:MT:1:16569:1 REF" -> "MT").
+                seq_id = line[1:].split()[0].strip().lower()
+                if seq_id in _MITO_SEQNAME_ALIASES:
+                    return True
+    except OSError:
+        return False
+
+    return False
+
+
+def verify_preset_reference_mito_content(genome_fasta_path, gtf_path):
+    """
+    Combined mitochondrial-content verification for a PRESET (auto-
+    downloaded) reference's already-on-disk genome FASTA + GTF -- used
+    by singlecell_workspace.py's Step 5 to answer "can this already-
+    downloaded reference's mitochondrial content actually be confirmed?"
+    immediately, without needing to re-download or run a full Cell-level
+    QC pass first.
+
+    Uses TWO independent checks (mirroring the same two-method approach
+    already used for single-cell QC's own mito-gene detection):
+      1. genome_fasta_contains_mito_contig() above -- does the genome
+         FASTA's own sequence headers include a mitochondrial contig?
+      2. A local import of sc_cellqc_manager.get_mito_gene_ids_from_gtf()
+         -- does the GTF contain any gene-level features on a
+         mitochondrial contig? (Imported locally, not at module level,
+         to avoid a circular/unnecessary import for every other
+         reference_manager.py caller that has nothing to do with
+         single-cell QC.)
+
+    Returns a dict:
+        {
+            "fasta_has_mito_contig": bool,
+            "gtf_mito_gene_count": int,
+            "verified": bool,  # True only if BOTH checks succeed
+        }
+    """
+    fasta_ok = genome_fasta_contains_mito_contig(genome_fasta_path)
+
+    gtf_gene_count = 0
+    if gtf_path and os.path.isfile(gtf_path):
+        try:
+            # Local import: this module (reference_manager.py) is used
+            # by the Bulk RNA-Seq pipeline too, which has no reason to
+            # depend on single_cell/sc_cellqc_manager.py -- importing
+            # only here, only when this specific verification function
+            # is actually called, avoids adding an unconditional
+            # cross-pipeline import at module load time.
+            import sc_cellqc_manager as _cellqc
+            gtf_gene_count = len(_cellqc.get_mito_gene_ids_from_gtf(gtf_path))
+        except ImportError:
+            gtf_gene_count = 0
+
+    return {
+        "fasta_has_mito_contig": fasta_ok,
+        "gtf_mito_gene_count": gtf_gene_count,
+        "verified": fasta_ok and gtf_gene_count > 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +347,92 @@ def _resource_is_ready(resource_dir):
     building it while this one was waiting for the lock).
     """
     return os.path.isdir(resource_dir) and len(os.listdir(resource_dir)) > 0
+
+"""
+PATCH for reference_manager.py -- shared concurrency-safety fix.
+
+WHERE TO INSERT: directly after the existing `_resource_is_ready()`
+function and BEFORE `ensure_shared_resource()` (both currently live in
+the "Concurrency-safe shared resource preparation" section).
+
+WHY: ensure_shared_resource() already protects against two BUILDERS
+racing (via the .lock file + fcntl.flock), but it does nothing to stop
+a READER from seeing a stale result. A force=True rebuild builds into a
+private temp directory and only replaces the OLD resource via a single
+os.rename() at the very end -- so the old (stale) resource stays fully
+present on disk, and reads as "ready" to every existing check
+(_resource_is_ready, qm.star_index_exists, qm.salmon_index_exists), for
+the ENTIRE rebuild duration. This is exactly what let a user navigate
+away mid-rebuild and see a false "already built" status while the real
+build was still running (confirmed via `top` on the HPC host).
+
+The lock file that ensure_shared_resource() already maintains is the
+perfect signal to close this gap -- we just need to let READERS probe
+it non-blockingly, without needing to win the lock themselves.
+
+No other function in this file needs to change. Every CALLER (in both
+alignment_workspace.py and singlecell_workspace.py) needs to switch
+from checking readiness via _resource_is_ready()/qm.*_index_exists()
+ALONE to using is_shared_resource_ready() / resource_build_in_progress()
+below instead -- see the accompanying updated alignment_workspace.py
+and singlecell_workspace.py for exactly where.
+"""
+
+
+def resource_build_in_progress(resource_dir):
+    """
+    Non-blocking probe: is ANY process (this session, another browser
+    tab, another pipeline, another user) currently holding the build
+    lock for this shared resource RIGHT NOW?
+
+    Every "is this shared resource ready to use?" check across BOTH the
+    Bulk RNA-Seq and Single-cell pipelines must go through this (via
+    is_shared_resource_ready() below) instead of a bare
+    os.path.isdir()/os.listdir() check or a single marker-file check
+    (qm.star_index_exists's "SAindex" check, qm.salmon_index_exists's
+    "info.json" check, etc.) -- none of those can distinguish a
+    genuinely finished build from one that's actively being replaced in
+    the background, since the OLD resource is left fully intact right
+    up until ensure_shared_resource()'s final atomic os.rename().
+
+    Returns True if a build is in progress right now (lock currently
+    held by someone), False if the lock is free or has never been
+    taken at all (e.g. this resource has never been built).
+    """
+    lock_path = resource_dir.rstrip(os.sep) + ".lock"
+    if not os.path.isfile(lock_path):
+        return False  # nobody has ever attempted to build this -- nothing in progress
+    lock_file = open(lock_path, "a+")
+    try:
+        # Non-blocking probe only -- if we get the lock instantly, no
+        # one else holds it (free). We immediately release it again;
+        # this function only ever reports status, it never builds
+        # anything or holds the lock itself.
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True  # someone else currently holds the lock -> a build is running
+    finally:
+        lock_file.close()
+
+
+def is_shared_resource_ready(resource_dir):
+    """
+    THE authoritative "is this shared resource actually usable right
+    now?" check -- combines file-presence with the in-progress-build
+    probe above. A populated directory during an in-progress
+    force-rebuild is explicitly NOT ready, even though
+    _resource_is_ready() alone (or any single marker-file check) would
+    incorrectly say it is.
+
+    Use this (or resource_build_in_progress() directly, when you need
+    to distinguish "not ready because still building" from "not ready
+    because it's never been built at all" for messaging purposes) at
+    every call site that currently only checks
+    _resource_is_ready()/qm.star_index_exists()/qm.salmon_index_exists().
+    """
+    return _resource_is_ready(resource_dir) and not resource_build_in_progress(resource_dir)
 
 
 def ensure_shared_resource(resource_dir, build_fn, wait_message_callback=None,
@@ -299,9 +500,17 @@ def ensure_shared_resource(resource_dir, build_fn, wait_message_callback=None,
     # project sets up a given species) -- no lock needed at all. Never
     # taken when force=True, since the whole point of force is to
     # rebuild even though a ready copy already exists.
-    if not force and _resource_is_ready(resource_dir):
+    # Fast path: already fully built (the common case after the first
+    # project sets up a given species) -- no lock needed at all. Never
+    # taken when force=True, since the whole point of force is to
+    # rebuild even though a ready copy already exists. Uses
+    # is_shared_resource_ready() (not the bare _resource_is_ready())
+    # so this fast path correctly does NOT trigger while another
+    # process is actively mid-rebuild -- otherwise a caller could race
+    # past a real rebuild and silently reuse the stale, about-to-be-
+    # replaced old copy instead of waiting for the lock below.
+    if not force and is_shared_resource_ready(resource_dir):
         return True, "Already available (shared reference, reused from a previous build).", False
-
     lock_path = resource_dir.rstrip(os.sep) + ".lock"
     os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
 
@@ -499,32 +708,13 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
     up on disk for Salmon, regardless of whether the species' catalog
     entry has a ready-made cDNA FASTA or not.
 
-    For species with a direct cDNA FASTA (e.g. human, mouse, yeast,
-    Drosophila, C. elegans via Ensembl), this simply downloads it. For
-    species without one (e.g. E. coli via NCBI, which does not publish a
-    standalone transcriptome FASTA for this assembly), this automatically
-    falls back to downloading the genome + GTF and extracting transcript
-    sequences -- so the UI never has to expose that distinction to the
-    user or hand them a dead-end error message telling them to do
-    something manually that the interface doesn't otherwise support for
-    preset organisms.
-
-    For the extraction step, organisms flagged "no_introns" in the
-    catalog (bacteria/archaea) use direct gene-coordinate extraction
-    instead of gffread, since gffread's eukaryotic gene->transcript->
-    exon parent-child ID matching fails on NCBI's bacterial GTF format
-    (which has no separate transcript/mRNA feature line to anchor to).
-
     Returns (success: bool, fasta_path_or_None, message: str).
     """
     entry = REFERENCE_CATALOG[species_key]
 
-    # Direct path: a standalone cDNA FASTA is available for this species.
     if entry.get("cdna_fasta_filename") or entry.get("cdna_fasta_pattern"):
         return download_cdna_fasta(species_key, dest_dir, progress_callback)
 
-    # Fallback path: no standalone transcriptome FASTA published for this
-    # species/assembly -- download genome + GTF and extract transcripts.
     success, paths, message = download_genome_and_gtf(species_key, dest_dir, progress_callback)
     if not success:
         return False, None, f"Reference download failed: {message}"
@@ -561,54 +751,12 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
 # ---------------------------------------------------------------------------
 # Ensembl GTF -> GFF3 fallback (2026-08-17)
 # ---------------------------------------------------------------------------
-#
-# CONFIRMED: Ensembl is in the middle of retiring its classic species-
-# name-based FTP layout (this exact module's ENSEMBL_BASE_URL structure)
-# in favor of a new assembly-accession-based structure at
-# ftp.ebi.ac.uk/pub/ensemblorganisms/GCA/... -- see Ensembl's own blog
-# post "Updates to FTP site of the new Ensembl website" (26 June 2026),
-# which states the old species-name-based structure "will be retired"
-# and that "this change will affect workflows and pipelines pointing to
-# this site." A real, reproducible symptom of this transition was hit in
-# production: this module's "current_gtf/{species}/" directory 404'd for
-# human, while "current_fasta/{species}/dna/" (genome) and
-# "current_gff3/{species}/" (the GFF3 equivalent of the same annotation)
-# were BOTH independently confirmed still reachable at the same moment --
-# i.e. this is a partial, in-progress migration state, not a single fixed
-# bug with one correct permanent replacement URL.
-#
-# Because this is an ACTIVE, ongoing migration (today's failure mode may
-# not be tomorrow's), _download_ensembl_annotation() below does NOT
-# simply replace "current_gtf" with "current_gff3" outright -- it tries
-# GTF FIRST (in case Ensembl restores it, or it simply works for a
-# different species than the one that failed), and only falls back to
-# downloading GFF3 + converting to GTF via gffread (already a dependency
-# elsewhere in this module, and already part of this project's
-# environment.yml) if the GTF attempt specifically 404s. This keeps every
-# downstream consumer (extract_tx2gene_from_gtf, STARsolo, gffread-based
-# transcript extraction) working against a real .gtf file regardless of
-# which path was actually taken, with zero changes needed anywhere else.
-#
-# KNOWN FUTURE RISK, not yet acted on: Ensembl's blog post also states the
-# ENTIRE old species-name-based structure (including current_fasta, which
-# is still working today) is slated for eventual full retirement in favor
-# of the new GCA-accession-based site. If/when current_fasta itself starts
-# 404ing, this module will need a similarly real fallback to the new GCA
-# structure -- deliberately NOT implemented speculatively here, since that
-# is a materially different URL scheme (different domain, accession-number
-# based paths requiring a species -> GCA accession lookup) that hasn't yet
-# actually failed and would need its own real verification first, exactly
-# like this GTF->GFF3 fallback did.
 
 def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
     """
     Resolve and download this species' gene annotation from Ensembl,
     preferring GTF but automatically falling back to GFF3 (+ conversion
-    to GTF via gffread) if the "current_gtf" directory 404s -- see the
-    module-level comment above for why. Always returns a real .gtf file
-    at dest_dir/annotation.gtf regardless of which path was taken, so
-    callers never need to know or care which format Ensembl actually
-    served.
+    to GTF via gffread) if the "current_gtf" directory 404s.
 
     Returns (success: bool, gtf_path_or_None, message: str).
     """
@@ -617,9 +765,6 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
     try:
         gtf_filename = _resolve_ensembl_filename(gtf_dir_url, entry["gtf_pattern"])
     except RuntimeError:
-        # current_gtf itself unreachable (e.g. a 404 on the directory,
-        # not just no matching file within it) -- fall through to the
-        # GFF3 attempt below rather than failing immediately.
         gtf_filename = None
 
     if gtf_filename:
@@ -637,11 +782,6 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
 
     # --- GFF3 fallback ---
     gff3_dir_url = f"{ENSEMBL_BASE_URL}/current_gff3/{entry['species_dir']}/"
-    # Ensembl's GFF3 filenames follow the identical naming convention as
-    # their GTF filenames, just with "gff3" in place of "gtf" (confirmed
-    # against Ensembl's real directory structure) -- so the existing
-    # gtf_pattern can be reused directly via a simple substitution rather
-    # than maintaining a second, parallel pattern per species.
     gff3_pattern = entry["gtf_pattern"].replace("gtf", "gff3")
     try:
         gff3_filename = _resolve_ensembl_filename(gff3_dir_url, gff3_pattern)
@@ -680,10 +820,6 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
         return False, None, f"GFF3 decompression failed: {error}"
     os.remove(gff3_gz)
 
-    # gffread's -T flag outputs GTF format (its default output without -T
-    # is GFF3) -- the same conversion this project's own single-cell
-    # Step 5 UI already recommends to users manually for custom GFF3
-    # uploads, applied here automatically for preset species instead.
     try:
         subprocess.run(
             ["gffread", gff3_path, "-T", "-o", gtf_path],
@@ -707,12 +843,6 @@ def download_genome_and_gtf(species_key, dest_dir, progress_callback=None):
     Download the genome FASTA + GTF annotation for the given species key,
     for use with STAR (or for extracting transcripts via gffread if used
     as a Salmon fallback).
-
-    For Ensembl-sourced species, the annotation download automatically
-    falls back from GTF to GFF3 (+ gffread conversion) if Ensembl's
-    "current_gtf" directory is unreachable -- see
-    _download_ensembl_annotation()'s own docstring for why this exists
-    and is NOT just a one-time hardcoded URL swap.
 
     Returns (success: bool, (genome_fasta_path, gtf_path) or None, message: str).
     """
@@ -780,9 +910,7 @@ def download_genome_and_gtf(species_key, dest_dir, progress_callback=None):
 def extract_transcripts_with_gffread(genome_fasta_path, gtf_path, dest_fasta_path):
     """
     Extract transcript (cDNA) sequences from a genome FASTA + GTF/GFF
-    annotation using gffread. This is used when only a genome + annotation
-    are available (common for custom/non-model species) but a
-    transcriptome FASTA is needed for Salmon.
+    annotation using gffread.
 
     Returns (success: bool, message: str).
     """
@@ -808,10 +936,6 @@ def _parse_fasta_sequences(fasta_path):
     Minimal, dependency-free FASTA parser. Returns a dict mapping
     sequence ID (the first whitespace-delimited token after '>') to the
     full concatenated sequence string.
-
-    Used for direct gene-coordinate extraction on genomes small enough
-    to comfortably fit in memory (e.g. bacterial genomes), avoiding a
-    dependency on BioPython or samtools/pyfaidx for this simple case.
     """
     sequences = {}
     current_id = None
@@ -852,13 +976,6 @@ def extract_gene_level_transcripts(genome_fasta_path, gtf_path, dest_fasta_path)
     Extract one sequence per gene directly from a genome FASTA using
     gene-level coordinates from a GTF file, bypassing gffread entirely.
 
-    This is the appropriate approach for organisms with no introns
-    (bacteria, archaea) where "gene" and "transcript" are equivalent --
-    it sidesteps gffread's eukaryotic gene->transcript->exon parent-
-    child ID matching, which fails on NCBI's bacterial GTF format
-    (features are "gene"/"CDS" only, with no separate transcript/mRNA
-    line for gffread to anchor to).
-
     Returns (success: bool, message: str).
     """
     try:
@@ -891,8 +1008,6 @@ def extract_gene_level_transcripts(genome_fasta_path, gtf_path, dest_fasta_path)
                     n_skipped += 1
                     continue
 
-                # GTF coordinates are 1-based, inclusive; Python slicing
-                # is 0-based, exclusive on the end -- convert accordingly.
                 start_idx, end_idx = int(start) - 1, int(end)
                 gene_seq = genome_seqs[seqid][start_idx:end_idx]
 
@@ -967,45 +1082,13 @@ def count_transcripts_in_fasta(filepath):
 # ---------------------------------------------------------------------------
 # tx2gene mapping extraction (for tximport gene-level collapsing)
 # ---------------------------------------------------------------------------
-#
-# Salmon quantifies at the transcript level. To collapse transcript-level
-# counts to gene-level (the standard, recommended input for DESeq2), a
-# transcript-to-gene (tx2gene) mapping is needed. The correct source for
-# this mapping differs depending on how the reference was obtained:
-#
-#   - Ensembl-downloaded cDNA (human/mouse/yeast/Drosophila/C. elegans
-#     presets): the gene ID is embedded directly in each FASTA header,
-#     so no separate GTF parsing is needed -- see
-#     extract_tx2gene_from_ensembl_fasta.
-#
-#   - No-intron organisms (e.g. E. coli): our own gene-level extraction
-#     (extract_gene_level_transcripts, above) already writes one
-#     sequence per gene using the gene ID as the header, so transcript
-#     ID == gene ID by construction -- see build_identity_tx2gene.
-#
-#   - Custom eukaryote uploads processed via gffread: gffread's output
-#     FASTA headers don't reliably carry gene information, but the
-#     original GTF's 'transcript' feature lines always do -- see
-#     extract_tx2gene_from_gtf.
 
 def extract_tx2gene_from_ensembl_fasta(fasta_path):
     """
     Parse a transcript-to-gene mapping directly from an Ensembl-style
-    cDNA FASTA's header lines. Ensembl's cDNA headers embed the parent
-    gene ID directly, e.g.:
+    cDNA FASTA's header lines.
 
-        >ENST00000456328.2 cdna chromosome:GRCh38:1:11869:14409:1
-        gene:ENSG00000223972.5 gene_biotype:lncRNA ...
-
-    This means no separate GTF download is needed just to build a
-    tx2gene mapping for Ensembl-sourced references (human/mouse/yeast/
-    Drosophila/C. elegans presets) -- the mapping is already present in
-    the FASTA we already downloaded for Salmon.
-
-    Returns a dict {transcript_id: gene_id}. Returns an empty dict if no
-    headers matched the expected pattern (e.g. a non-Ensembl FASTA was
-    passed in) -- callers should treat an empty result as "mapping not
-    available" rather than assuming success.
+    Returns a dict {transcript_id: gene_id}.
     """
     tx2gene = {}
     with open(fasta_path, "r", errors="ignore") as f:
@@ -1023,33 +1106,9 @@ def extract_tx2gene_from_ensembl_fasta(fasta_path):
 def extract_gene_symbol_map_from_ensembl_fasta(fasta_path):
     """
     Parse a gene_id -> gene_symbol mapping directly from an Ensembl-style
-    cDNA FASTA's header lines -- the same file already downloaded for
-    Salmon and already parsed for tx2gene by
-    extract_tx2gene_from_ensembl_fasta, so no extra download is needed
-    just to get gene symbols for preset (human/mouse/yeast/Drosophila/
-    C. elegans/zebrafish) references.
+    cDNA FASTA's header lines.
 
-    Ensembl's cDNA headers embed both the parent gene ID and (when
-    available) a human-readable symbol, e.g.:
-
-        >ENST00000456328.2 cdna chromosome:GRCh38:1:11869:14409:1
-        gene:ENSG00000223972.5 gene_biotype:lncRNA transcript_biotype:...
-        gene_symbol:DDX11L1 description:...
-
-    Not every gene has a populated "gene_symbol" field -- this is common
-    for well-curated model organisms like human/mouse/zebrafish, but
-    many genes even in those species (and more so in less-studied
-    organisms) only have a systematic/locus identifier and no separate
-    symbol. For any gene_id with no gene_symbol found on any of its
-    transcripts, the gene_id itself is used as the "symbol" so every
-    gene still gets a usable, human-facing label in the volcano plot
-    and gene tables rather than being silently dropped from the
-    mapping.
-
-    Returns a dict {gene_id: gene_symbol}. Returns an empty dict if no
-    headers matched the expected "gene:" pattern at all (e.g. a
-    non-Ensembl FASTA was passed in) -- callers should treat an empty
-    result as "mapping not available" rather than assuming success.
+    Returns a dict {gene_id: gene_symbol}.
     """
     gene_symbol = {}
     gene_ids_seen = set()
@@ -1074,21 +1133,9 @@ def extract_gene_symbol_map_from_ensembl_fasta(fasta_path):
 def extract_gene_symbol_map_from_gtf(gtf_path):
     """
     Parse a gene_id -> gene_symbol mapping from a GTF file's feature
-    lines, using the "gene_name" attribute -- the conventional GTF field
-    for a gene's human-readable symbol (e.g. "TP53"), separate from its
-    stable "gene_id" (e.g. "ENSG00000141510"). Used for custom
-    eukaryotic reference uploads, where a GTF/GFF3 annotation is
-    available but no Ensembl-style "gene_symbol:" FASTA header field
-    exists (see extract_gene_symbol_map_from_ensembl_fasta for that
-    preset-species path).
+    lines, using the "gene_name" attribute.
 
-    Falls back to the gene_id itself for any gene whose GTF entry has
-    no gene_name attribute (common for less-annotated or non-model
-    organisms), so every gene still gets a usable label.
-
-    Returns a dict {gene_id: gene_symbol}. Returns an empty dict if no
-    'gene_id' attributes were found at all (e.g. a malformed or
-    unexpected annotation format).
+    Returns a dict {gene_id: gene_symbol}.
     """
     gene_symbol = {}
     gene_ids_seen = set()
@@ -1115,11 +1162,7 @@ def extract_gene_symbol_map_from_gtf(gtf_path):
 def save_gene_symbol_map_csv(gene_symbol_map, dest_path):
     """
     Write a gene_id -> gene_symbol mapping dict to a CSV with columns
-    "gene_id", "gene_name" -- matching the exact column names the
-    Differential Expression workspace's gene-name-mapping loader already
-    expects (see differential_expression_workspace.py's gene ID -> gene
-    name CSV format), so this file can be read straight back in without
-    any renaming step.
+    "gene_id", "gene_name".
     """
     import csv
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -1134,14 +1177,9 @@ def save_gene_symbol_map_csv(gene_symbol_map, dest_path):
 def extract_tx2gene_from_gtf(gtf_path):
     """
     Parse a transcript-to-gene mapping from a GTF file's 'transcript'
-    feature lines (columns: transcript_id, gene_id attributes). This is
-    the appropriate source for custom eukaryotic references where
-    transcripts were extracted from a genome + GTF via gffread -- gffread's
-    output FASTA header doesn't reliably carry gene information, but the
-    original GTF always does.
+    feature lines.
 
-    Returns a dict {transcript_id: gene_id}. Returns an empty dict if no
-    'transcript' feature lines with both attributes were found.
+    Returns a dict {transcript_id: gene_id}.
     """
     tx2gene = {}
     with open(gtf_path, "r", errors="ignore") as f:
@@ -1162,12 +1200,7 @@ def extract_tx2gene_from_gtf(gtf_path):
 def build_identity_tx2gene(fasta_path):
     """
     Build an identity tx2gene mapping (transcript_id == gene_id) from a
-    FASTA's header lines. Appropriate for no-intron organisms (bacteria,
-    archaea) where our own gene-level extraction (see
-    extract_gene_level_transcripts) already writes one sequence per gene
-    using the gene ID as the FASTA header -- so "collapsing" is a no-op
-    by construction, but we still return an explicit mapping for
-    consistency with the other tx2gene sources.
+    FASTA's header lines.
     """
     tx2gene = {}
     with open(fasta_path, "r", errors="ignore") as f:
@@ -1180,8 +1213,7 @@ def build_identity_tx2gene(fasta_path):
 
 def save_tx2gene_csv(tx2gene, dest_path):
     """
-    Write a tx2gene mapping dict to a CSV with columns TXNAME, GENEID --
-    the column names tximport's tx2gene argument expects by convention.
+    Write a tx2gene mapping dict to a CSV with columns TXNAME, GENEID.
     """
     import csv
 

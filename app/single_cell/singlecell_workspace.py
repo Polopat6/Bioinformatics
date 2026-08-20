@@ -3,107 +3,171 @@ single_cell/singlecell_workspace.py
 
 Streamlit UI for the Single-cell RNA-Seq pipeline -- Phase 1: Steps 1-6
 (Ingestion + Chemistry -> Pre-trim QC -> Trimming -> Post-trim QC ->
-Reference Setup -> STARsolo Alignment/Quantification/Cell-calling).
+Reference Setup -> STARsolo Alignment/Quantification/Cell-calling), plus
+Phase 2: Cell-level QC (doublet detection, ambient RNA correction,
+per-cell filtering with standard visualizations and a downloadable
+results package).
 
-Scope: droplet-based UMI methods only -- 10x Genomics (all chemistry
-generations), Drop-seq, inDrops, BD Rhapsody -- via STARsolo. Plate-based
-(Smart-seq) and combinatorial-barcoding (Parse/split-seq) methods are NOT
-supported; see chemistry_manager.py's module docstring for why.
+--- Preset-reference mitochondrial verification + redownload (2026-08-17) ---
+A real reported gap: Step 5's preset ("auto") reference section only
+ever checked "does this directory already have files?" to decide
+whether to show "✅ already prepared" -- never what's actually IN those
+files. Combined with the mito-detection bug fixed the same day (see
+sc_cellqc_manager.py's own module docstring), this made it genuinely
+impossible to tell whether an already-downloaded preset reference
+actually includes the mitochondrial genome, without either
+re-downloading blindly or manually inspecting files on disk.
 
---- Step 6 execution wiring (2026-08-17) ---
-Previously, Step 6's "Run Alignment" button only showed an st.info()
-placeholder describing what it WOULD do. This is now wired to real
-execution, confirmed against the Bulk RNA-Seq pipeline's actual
-quantification_manager.py and alignment_workspace.py source (pasted
-directly rather than inferred -- both files' real interfaces were
-independently confirmed before writing this):
+Fixed by calling reference_manager.verify_preset_reference_mito_content()
+immediately after an "already prepared" preset reference is found,
+surfacing the result prominently (not buried in an unrelated "advanced"
+expander), and offering a DEDICATED "🔄 Re-download to include
+mitochondrial genome" button specifically when verification fails --
+distinct from (and more discoverable than) the pre-existing generic
+"force re-download" advanced option, which existed but gave no
+indication of WHY someone might want to use it.
 
-- STARsolo uses the IDENTICAL genome index as ordinary STAR (confirmed
-  directly from STAR's own official STARsolo.md: "The genome index is
-  the same as for normal STAR runs") -- so this reuses
-  quantification_manager.py's REAL qm.build_star_index()/
-  qm.star_index_exists()/qm.detect_fastq_read_length() directly, exactly
-  the same functions alignment_workspace.py's STAR path already calls,
-  rather than reimplementing index-building logic in this pipeline.
-- Preset species reuse the bulk pipeline's OWN shared, project-
-  independent STAR index (project_manager.shared_star_index_dir(),
-  confirmed real from alignment_workspace.py's exact same shared-vs-
-  custom index selection logic) via reference_manager.ensure_shared_resource()
-  -- a human genome's STAR index built by a bulk project is
-  automatically reused here, and vice versa. Custom (non-preset)
-  references get a per-project index instead (sc_project_manager.
-  star_index_dir()), mirroring bulk's own project_manager.star_index_dir()
-  convention for custom references.
-- The actual alignment step calls starsolo_manager.run_starsolo_align(),
-  which mirrors qm.run_star_align()'s exact confirmed subprocess pattern
-  (capture_output/text/check=True, 2-hour timeout, returning
-  (success, log, sample_output_dir)).
-- Mapping-rate QC reuses quantification_manager.qm.parse_star_mapping_rate()
-  and qm.classify_mapping_rate() UNCHANGED -- confirmed via direct testing
-  (a real local subprocess run) that STARsolo writes Log.final.out in the
-  exact same format as regular STAR, so bulk's existing parsing/
-  classification logic works on single-cell's STARsolo output with zero
-  modification. Cell-count reporting (STARsolo-specific, no bulk
-  equivalent) uses starsolo_manager.parse_starsolo_summary()/
-  get_cells_detected() instead.
+--- Custom-reference mitochondrial gene resolution UX (2026-08-17,
+    later same day) ---
+For a CUSTOM (user-uploaded) reference, Step 5 now runs the same direct
+GTF-based mito auto-detection immediately after GTF confirmation. If
+that finds zero genes, three explicit resolution paths are offered
+(rather than silently reporting a misleading 0%):
+  1. "Not applicable for this organism" -- explicit opt-out.
+  2. "Try matching against a preset organism's known mitochondrial gene
+     symbols" -- uses sc_cellqc_manager.get_mito_gene_symbols_from_gtf()
+     on a chosen PRESET species' own already-downloaded GTF, then
+     match_custom_genes_by_mito_symbol() to search the custom GTF for
+     matching gene_name values. Only offered for preset species whose
+     reference has actually already been downloaded on this system
+     (checked via reference_manager). Always shown with an explicit
+     lower-confidence disclaimer, since this assumes shared gene-naming
+     convention between the custom reference and the chosen preset --
+     not a verified identity.
+  3. "Specify manually" -- free-text gene ID/symbol entry, matched
+     directly against the custom GTF.
+Whichever path is used, the resolved gene ID list (and a "mito_source"
+label describing which path was used) is persisted into this project's
+saved reference_choice dict, so Phase 2's Cell-level QC page doesn't
+need to re-resolve it on every run.
 
---- Aligner-choice / genome-index ordering fix (2026-08-17, later same day) ---
-The STAR genome-index build UI was moved into Step 5 earlier today (see
-_render_genome_index_step's docstring) so it sits right next to genome
-selection instead of being buried in Step 6. That move, on its own,
-introduced a NEW ordering bug: Step 6's aligner choice (STARsolo vs.
-alevin-fry) was still selected AFTER Step 5's index was already built --
-so Step 5 would unconditionally build a STAR genomeGenerate index even
-if the user was about to pick alevin-fry, which needs a completely
-different artifact (a salmon index over a splici/spliceu reference, per
-starsolo_manager.py's build_alevin_fry_commands()), not a STAR index.
-Fixed by moving the aligner radio itself to the top of Step 5 (see
-_render_aligner_choice()) and gating the genome-index build UI on that
-choice -- STARsolo's STAR index only builds when STARsolo is selected;
-alevin-fry shows its existing "not wired up yet" placeholder instead of
-building the wrong index. Step 6 reads the confirmed choice back via
-sc_project_manager.get_aligner_choice(project) rather than re-rendering
-the radio a second time (which would raise a duplicate-widget-key error).
+--- Downloadable QC results package (2026-08-17, later same day) ---
+render_cell_qc() now offers a "📦 Download QC Package (.zip)" button
+after a completed run, bundling the per-cell metrics CSV, QC thresholds,
+mitochondrial-gene diagnostic, top-ambient-genes table, DoubletFinder's
+pK sweep (if used), a self-contained markdown summary (via
+sc_cellqc_manager.build_qc_summary_markdown()), and PNG renders of
+every QC visualization (via Plotly's kaleido-based image export,
+already a project dependency) into a single zip file -- so a completed
+run's full results can be shared or archived without this app open.
 
---- Aligner choice persistence (2026-08-17, same day) ---
-The aligner choice is saved to the project's own project_info.json via
-sc_project_manager.save_aligner_choice()/get_aligner_choice(), the same
-"save unconditionally on every rerun" pattern already used for chemistry
-(scpm.save_chemistry_choice, in _render_step1) -- so a previously
-confirmed choice survives reopening the project after a restart instead
-of always resetting to the STARsolo default, and Step 6 reads this same
-persisted value directly rather than relying on st.session_state (which
-would reset on a restart, and which _render_step5 rendering before
-_render_step6 within the same run only accidentally makes work).
+--- Genome-index force-rebuild bug fix + stale-index diagnostic
+    (2026-08-17, later same day) ---
+A real reported bug, discovered after a user re-indexed a preset human
+reference (following the mitochondrial-verification fix above), saw the
+"reindex" complete in ~15 seconds (versus the genuine 10-15 minutes a
+real STAR human-genome index build takes), re-ran Step 6 alignment, and
+STILL saw zero mitochondrial genes in Cell-level QC afterward.
 
-alevin-fry itself remains intentionally NOT fully wired up (no splici/
-salmon-index build step, no real subprocess execution, no MTX/QC parsing
-compatible with its output format) -- this was evaluated and deliberately
-deferred as a larger follow-up piece of work, since STARsolo is already
-the fully-functional recommended default and nothing downstream (Phase 2
-cell-level QC) depends on alevin-fry existing.
+Root cause: _render_genome_index_step's "🔄 Re-build Index" (force
+re-index) button set the SAME build_clicked flag used for "build an
+index that doesn't exist yet", and BOTH cases fell through to the
+identical ref.ensure_shared_resource(index_dir, _build_index_impl,
+wait_message_callback=_wait_cb) call -- with NO force=True ever passed.
+ensure_shared_resource()'s own documented behavior is to return
+immediately with "already available" WITHOUT ever invoking build_fn if
+force is not explicitly set AND the resource directory already has
+files in it -- which is exactly the case for a force-reindex click,
+since the whole point of that button is that an index already exists.
+So "Re-build Index" silently did nothing beyond a fast existence check,
+every time it was clicked, for every preset/shared reference in this
+app -- explaining both the suspiciously-fast "reindex" and why
+mitochondrial genes never appeared afterward (the STALE index, built
+before the reference's mitochondrial content was confirmed/fixed, was
+never actually replaced, so STARsolo's own features.tsv -- generated
+once, AT INDEX-BUILD TIME, and never revisited at alignment time --
+still had no mitochondrial gene rows in it, regardless of what the
+CURRENT reference GTF says).
 
-Since single-cell projects use their own sc_project_manager.py rather
-than the bulk pm module quantification_manager.py's functions were
-originally written against, this workspace calls those qm functions
-directly with single-cell-specific paths (sc_project_manager's
-directory helpers) passed in as plain arguments -- qm's functions take
-plain paths, not a project_manager module reference, so this works with
-zero changes needed to quantification_manager.py itself.
+Fixed by tracking build_clicked and force_rebuild as TWO SEPARATE
+flags and passing force=force_rebuild explicitly to
+ref.ensure_shared_resource() -- this now exactly mirrors the Bulk
+RNA-Seq pipeline's own real, original alignment_workspace.py pattern
+(confirmed against that module's actual source), which already tracked
+build_clicked/force_index separately and passed force=force_index
+correctly. The single-cell version had collapsed this into one flag
+during an earlier reconstruction, introducing this regression.
+
+Also added: sc_cellqc_manager.diagnose_starsolo_matrix_for_mito(), a
+fast, R-independent, PRE-FLIGHT check run automatically the moment a
+sample is selected in render_cell_qc() -- BEFORE the (much slower)
+full R-based Cell-level QC pipeline runs. It reads STARsolo's own
+features.tsv directly to check whether THIS SAMPLE's already-aligned
+count matrix has any mitochondrial gene rows at all, independent of
+what the reference GTF currently says. This distinguishes, immediately
+and without needing a full QC re-run:
+  1. The matrix already has mitochondrial genes -> proceed normally.
+  2. The matrix has genes overall but ZERO are mitochondrial -> a
+     STALE INDEX/alignment (the exact bug above) -- surfaced with a
+     specific, actionable message pointing at Step 5's real rebuild
+     button and Step 6's re-run-alignment action, NOT a suggestion to
+     just re-run Cell-level QC again (which cannot fix this, since QC
+     only re-reads existing STARsolo output and never re-aligns).
+
+--- Stale-resource-during-rebuild race fix (2026-08-18) ---
+A real reported bug: a user force-rebuilding a shared STAR genome index
+navigated between radio-button pages while the rebuild was running (on
+an HPC host, confirmed still running via `top`) and, on navigating
+back, saw the index reported as "✅ already built" even though the real
+rebuild was still in progress. Root cause: reference_manager.py's
+ensure_shared_resource() builds a fresh copy into a private temp
+directory and only replaces the OLD index via a single atomic
+os.rename() at the very END of a successful build -- so the old
+(stale) index stays fully present on disk, and any existence-only
+check (qm.star_index_exists) reports "ready" for the ENTIRE rebuild
+duration, with no way to distinguish a finished build from one that's
+actively being replaced.
+
+Fixed by using reference_manager.resource_build_in_progress() (a
+non-blocking probe on the resource's existing .lock file) as part of
+the authoritative readiness check in _resolve_star_index_dir(), and by
+showing an explicit "🔄 build in progress, please wait" status in
+_render_genome_index_step() that blocks further build actions while
+true. Also, CUSTOM (non-shared, per-project) index builds now route
+through ref.ensure_shared_resource() too -- previously that branch
+called qm.build_star_index() DIRECTLY against index_dir with NO
+temp-dir staging, atomic replacement, or lock-file protection at all,
+so a custom reference's rebuild had the identical stale-appears-ready
+symptom with even less of a safety net than the shared path. Both
+branches now share the same temp-directory + atomic-rename + lock-file
+infrastructure -- there is no longer a separate "shared" vs. "custom"
+code path for the actual build call, only for which directory is
+targeted. Because _render_starsolo_run_controls() in Step 6 also calls
+_resolve_star_index_dir() for its own "is the index ready?" gate, this
+fix automatically blocks alignment too while a rebuild is in progress,
+with no separate Step 6 change needed.
+
+See sc_project_manager.py and sc_cellqc_manager.py's own module
+docstrings for full detail on all other Phase 1/Phase 2 design
+decisions and fixes made earlier the same day.
 """
+import io
 import os
+import zipfile
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-import project_manager as pm  # reused directly for get_recommended_thread_count()
+import project_manager as pm
 import reference_manager as ref
 import file_browser as fb
-import fastqc_manager as fastqc  # reused directly from the Bulk RNA-Seq pipeline
-import fastp_manager as fastp_mgr  # reused directly for post-trim QC
-import quantification_manager as qm  # reused directly for STAR index build + mapping-rate QC -- see module docstring
+import fastqc_manager as fastqc
+import fastp_manager as fastp_mgr
+import quantification_manager as qm
 
-import sra_manager as sra  # reused directly for accession validation -- see sc_sra_manager.py
+import sra_manager as sra
 
 import sc_project_manager as scpm
 import chemistry_manager as chem
@@ -111,6 +175,7 @@ import singlecell_ingestion_manager as ing
 import singlecell_trim_manager as trim
 import starsolo_manager as star
 import sc_sra_manager as scsra
+import sc_cellqc_manager as cellqc
 
 STAGE_LABELS = {
     "ingest": "1. FASTQ ingestion + chemistry + metadata",
@@ -681,11 +746,6 @@ _ANNOTATION_GFF_EXTENSIONS = (".gff", ".gff3", ".gff.gz", ".gff3.gz")
 _ANNOTATION_ALL_EXTENSIONS = (".gtf", ".gtf.gz") + _ANNOTATION_GFF_EXTENSIONS
 _FASTA_EXTENSIONS = (".fa", ".fasta", ".fna", ".fa.gz", ".fasta.gz", ".fna.gz")
 
-# Aligner choice keys -- shared between Step 5 (where the choice is made
-# and used to gate genome-index building) and Step 6 (where the choice
-# determines which quantification path runs). See the module docstring's
-# "Aligner-choice / genome-index ordering fix" section for why this
-# choice now lives in Step 5 rather than Step 6.
 ALIGNER_STARSOLO = "starsolo"
 ALIGNER_ALEVIN_FRY = "alevin_fry"
 
@@ -729,49 +789,6 @@ _ALIGNER_LABEL_TO_KEY = {
 
 
 def _render_aligner_choice(project):
-    """
-    Alignment/quantification method choice (STARsolo vs. alevin-fry) --
-    rendered at the TOP of Step 5, immediately before genome/reference
-    selection (moved here 2026-08-17, same day as the genome-index build
-    UI's own move into Step 5).
-
-    WHY THIS MOVED: the genome-index build UI was moved into Step 5
-    earlier today so it sits next to genome selection instead of being
-    buried in Step 6 -- but that move alone introduced a NEW ordering
-    bug, since Step 6's aligner radio was still selected AFTER Step 5's
-    index was already built. STARsolo and alevin-fry need fundamentally
-    different index artifacts (a STAR genomeGenerate index vs. a salmon
-    index built from a splici/spliceu reference, per
-    starsolo_manager.py's build_alevin_fry_commands()) -- so building
-    "the" genome index before knowing which aligner was chosen risked
-    silently building the wrong one. Moving the choice here, ABOVE the
-    index-build UI, and gating that UI on this choice, fixes this.
-
-    PERSISTENCE (added same day): the choice is now saved to this
-    project's own project_info.json via sc_project_manager.py's
-    save_aligner_choice(), the same "save unconditionally on every
-    rerun" pattern _render_step1 already uses for chemistry
-    (scpm.save_chemistry_choice) -- so a previously-made choice survives
-    reopening the project after a restart, rather than always resetting
-    to the STARsolo default. The radio's own default index is likewise
-    read back from scpm.get_aligner_choice() rather than hardcoded, so a
-    returning project shows its last confirmed choice pre-selected.
-
-    Returns one of ALIGNER_STARSOLO / ALIGNER_ALEVIN_FRY. Step 6 reads
-    this same value back out via scpm.get_aligner_choice(project) --
-    the persisted source of truth -- rather than out of
-    st.session_state, so Step 6 is correct even if it's ever reached
-    without Step 5 re-rendering first in the same run (e.g. a future
-    direct-navigation entry point), not just within the current
-    Streamlit session.
-
-    Also warns (mirroring the Bulk RNA-Seq pipeline's own Salmon<->STAR
-    switch warning in alignment_workspace.py) if this choice differs
-    from the previously persisted one -- switching aligners means Step 5
-    (reference/index setup) and Step 6 (alignment/quantification/cell-
-    calling) need to be redone for the newly selected method; previous
-    results from the other method are left on disk but won't be reused.
-    """
     st.markdown("**🧬 Alignment/Quantification Method**")
 
     saved_aligner = scpm.get_aligner_choice(project)
@@ -809,6 +826,192 @@ def _render_aligner_choice(project):
             "through Step 5/6, or come back once alevin-fry support is added."
         )
     return aligner
+
+
+def _render_preset_mito_verification(species_choice, species_labels, genome_fasta_expected, gtf_expected):
+    """
+    Verify + surface whether a PRESET reference's already-downloaded
+    files actually include the mitochondrial genome -- see this module's
+    own docstring, "Preset-reference mitochondrial verification +
+    redownload", for the full rationale.
+
+    Rendered immediately after Step 5's "✅ Reference files already
+    prepared" message for a preset species -- NOT buried in the
+    unrelated generic "force re-download" advanced expander below it,
+    since this is a concrete, actionable, and fairly likely-to-matter
+    result (as opposed to the generic re-download option, which exists
+    for a vaguer "I suspect corruption" scenario).
+    """
+    verification = ref.verify_preset_reference_mito_content(genome_fasta_expected, gtf_expected)
+
+    if verification["verified"]:
+        st.success(
+            f"✅ Mitochondrial genome verified in this reference: the genome FASTA includes a "
+            f"mitochondrial contig, and {verification['gtf_mito_gene_count']} mitochondrial "
+            f"gene(s) were found in the annotation."
+        )
+        return
+
+    st.error(
+        "🔴 **Could not verify mitochondrial genome content in this already-downloaded "
+        "reference.** "
+        f"Genome FASTA mitochondrial contig found: {'✅ Yes' if verification['fasta_has_mito_contig'] else '❌ No'}. "
+        f"Mitochondrial genes found in annotation: {verification['gtf_mito_gene_count']}.\n\n"
+        "If this reference was downloaded before this check existed, or from a partial/"
+        "interrupted earlier download, it may be missing the mitochondrial chromosome entirely -- "
+        "this would make single-cell mitochondrial QC metrics meaningless (a misleading 0% for "
+        "every cell), and could also affect alignment accuracy for any real mitochondrial-"
+        "origin reads in both this and the Bulk RNA-Seq pipeline, since they share this same "
+        "downloaded reference."
+    )
+    if st.button(
+        f"🔄 Re-download {species_labels[species_choice]} Reference (to include mitochondrial genome)",
+        key="sc_ref_mito_redownload_btn", type="primary",
+    ):
+        target_dir = pm.shared_genome_dir(species_choice)
+
+        def _build_fn(temp_dir, _species=species_choice):
+            success, _paths, message = ref.download_genome_and_gtf(_species, temp_dir)
+            return success, message
+
+        wait_placeholder = st.empty()
+
+        def _wait_message(elapsed_seconds, _ph=wait_placeholder):
+            _ph.info(f"⏳ Another project is currently preparing this same reference -- waiting ({elapsed_seconds:.0f}s so far)...")
+
+        with st.spinner(f"Re-downloading reference for {species_labels[species_choice]}..."):
+            success, message, _built = ref.ensure_shared_resource(
+                target_dir, build_fn=_build_fn, wait_message_callback=_wait_message, force=True,
+            )
+        wait_placeholder.empty()
+        if success:
+            st.success(f"✅ {message}")
+            st.warning(
+                "⚠️ **Important:** re-downloading the reference does NOT rebuild the STAR genome "
+                "index or re-run alignment automatically -- both use a separately-cached, one-time "
+                "build. Scroll down to **rebuild the genome index** (using the real force-rebuild fix "
+                "below), then revisit **Step 6** to re-run alignment for every sample, before this "
+                "fix will actually show up in Cell-level QC results."
+            )
+            st.rerun()
+        else:
+            st.error(f"❌ Re-download failed: {message}")
+
+
+_MITO_RESOLUTION_OPTIONS = [
+    "Not applicable for this organism",
+    "Try matching against a preset organism's known mitochondrial gene symbols",
+    "Specify manually",
+]
+
+
+def _render_custom_mito_resolution(project, custom_gtf_path):
+    """
+    For a CUSTOM reference whose GTF has zero mitochondrial genes found
+    via direct seqname lookup, offer three explicit resolution paths --
+    see this module's own docstring, "Custom-reference mitochondrial
+    gene resolution UX", for the full rationale.
+
+    Persists the resolved gene ID list (plus a "mito_source" label) into
+    this project's saved reference_choice dict via
+    scpm.save_reference_choice(), so Phase 2 doesn't need to re-resolve
+    it on every Cell-level QC run.
+    """
+    st.markdown("**🧬 Mitochondrial Gene Resolution**")
+    st.warning(
+        "⚠️ No mitochondrial genes could be identified directly from this reference's GTF "
+        "(by chromosome/contig lookup). A mitochondrial percentage of 0% for every cell in "
+        "Phase 2's Cell-level QC would not be a meaningful biological result if left "
+        "unresolved -- choose how to proceed:"
+    )
+    resolution_choice = st.radio(
+        "How would you like to handle mitochondrial gene identification for this reference?",
+        _MITO_RESOLUTION_OPTIONS, key="sc_custom_mito_resolution_choice",
+    )
+
+    resolved_gene_ids = []
+    mito_source = "not_applicable"
+
+    if resolution_choice == _MITO_RESOLUTION_OPTIONS[0]:
+        st.caption("ℹ️ Mitochondrial QC will be skipped for this project -- mitochondrial % will always read 0%, and adaptive mito-based filtering will have no effect.")
+
+    elif resolution_choice == _MITO_RESOLUTION_OPTIONS[1]:
+        st.caption(
+            "⚠️ **Lower confidence than a direct match.** This assumes your custom reference's "
+            "gene-naming convention happens to overlap with the chosen preset species' naming -- "
+            "not a verified identity. Different annotation sources, assembly versions, or a "
+            "sufficiently divergent organism could produce few or no matches, or in rare cases "
+            "an incorrect match. **Interpret mitochondrial QC metrics from this project with "
+            "extra caution if you use this option.**"
+        )
+        species_options = list(ref.REFERENCE_CATALOG.keys())
+        species_labels = {k: v["label"] for k, v in ref.REFERENCE_CATALOG.items()}
+        # Only offer species whose reference has actually already been
+        # downloaded on this system -- matching against a species that
+        # hasn't been prepared yet would have nothing real to compare
+        # against.
+        available_species = [
+            k for k in species_options
+            if os.path.isdir(pm.shared_genome_dir(k)) and len(os.listdir(pm.shared_genome_dir(k))) > 0
+        ]
+        if not available_species:
+            st.info("ℹ️ No preset species reference has been downloaded on this server yet -- prepare one via a Bulk RNA-Seq or single-cell project first to unlock this option.")
+        else:
+            preset_species_choice = st.selectbox(
+                "Match against which preset species' known mitochondrial gene symbols?",
+                options=available_species, format_func=lambda k: species_labels[k], key="sc_custom_mito_preset_species",
+            )
+            preset_gtf_path = os.path.join(pm.shared_genome_dir(preset_species_choice), f"{preset_species_choice}.annotation.gtf")
+            preset_symbols = cellqc.get_mito_gene_symbols_from_gtf(preset_gtf_path)
+            st.caption(f"Found {len(preset_symbols)} known mitochondrial gene symbol(s) for {species_labels[preset_species_choice]}.")
+            if st.button("🔍 Search Custom Reference for Matching Gene Symbols", key="sc_custom_mito_symbol_match_btn"):
+                matched = cellqc.match_custom_genes_by_mito_symbol(custom_gtf_path, preset_symbols)
+                st.session_state["sc_custom_mito_symbol_matches"] = matched
+            matched = st.session_state.get("sc_custom_mito_symbol_matches")
+            if matched is not None:
+                if matched:
+                    st.success(f"✅ Found {len(matched)} matching gene(s) in your custom reference.")
+                    resolved_gene_ids = matched
+                    mito_source = f"custom_symbol_match:{preset_species_choice}"
+                else:
+                    st.warning("⚠️ No matching gene symbols found -- this reference's naming convention doesn't appear to overlap with the chosen preset species.")
+
+    else:  # "Specify manually"
+        st.caption(
+            "Enter gene IDs or gene symbols (one per line, or comma-separated) known to be "
+            "mitochondrial for your organism -- matched against your custom GTF's gene_id and "
+            "gene_name fields (case-insensitive)."
+        )
+        manual_text = st.text_area("Gene IDs or symbols:", key="sc_custom_mito_manual_entry", height=100)
+        if manual_text and st.button("🔍 Match Manual Entry Against Reference", key="sc_custom_mito_manual_match_btn"):
+            manual_terms = [t.strip() for t in manual_text.replace(",", "\n").splitlines() if t.strip()]
+            # Match manual entries against BOTH gene symbols (gene_name,
+            # via match_custom_genes_by_mito_symbol) and, separately,
+            # gene IDs across the ENTIRE GTF (via
+            # find_gene_ids_matching_terms -- NOT the contig-restricted
+            # get_mito_gene_ids_from_gtf, which would trivially return
+            # empty here since that's exactly why this manual-entry path
+            # was reached in the first place). A user may reasonably
+            # supply either symbols or IDs.
+            symbol_matched = cellqc.match_custom_genes_by_mito_symbol(custom_gtf_path, manual_terms)
+            direct_id_matches = cellqc.find_gene_ids_matching_terms(custom_gtf_path, manual_terms)
+            combined = sorted(set(symbol_matched) | set(direct_id_matches))
+            st.session_state["sc_custom_mito_manual_matches"] = combined
+        manual_matches = st.session_state.get("sc_custom_mito_manual_matches")
+        if manual_matches is not None:
+            if manual_matches:
+                st.success(f"✅ Found {len(manual_matches)} matching gene(s).")
+                resolved_gene_ids = manual_matches
+                mito_source = "custom_manual_entry"
+            else:
+                st.warning("⚠️ No matching genes found for the entered terms.")
+
+    if st.button("💾 Save Mitochondrial Gene Resolution", key="sc_custom_mito_save_btn"):
+        existing_cfg = scpm.get_reference_choice(project) or {}
+        existing_cfg["mito_gene_ids"] = resolved_gene_ids
+        existing_cfg["mito_source"] = mito_source
+        scpm.save_reference_choice(project, existing_cfg)
+        st.success(f"✅ Saved ({len(resolved_gene_ids)} mitochondrial gene(s), source: {mito_source}).")
 
 
 def _render_step5(project, pairs):
@@ -855,6 +1058,9 @@ def _render_step5(project, pairs):
         if already_ready and os.path.isfile(genome_fasta_expected) and os.path.isfile(gtf_expected):
             st.success(f"✅ Reference files already prepared (shared, reused across projects): `{os.path.basename(genome_fasta_expected)}` + `{os.path.basename(gtf_expected)}`")
             reference_cfg.update({"custom_genome_fasta": genome_fasta_expected, "custom_gtf": gtf_expected, "annotation_format": "gtf"})
+
+            # --- Mitochondrial genome verification (2026-08-17) ---
+            _render_preset_mito_verification(species_choice, species_labels, genome_fasta_expected, gtf_expected)
         else:
             st.info("ℹ️ This reference hasn't been downloaded on this server yet. Downloading can take several minutes -- this only needs to happen ONCE per species.")
             if st.button("⬇️ Download & Prepare Reference", key="sc_ref_download_btn", type="primary"):
@@ -880,6 +1086,24 @@ def _render_step5(project, pairs):
                     st.error(f"❌ Reference preparation failed: {message}")
             reference_cfg.update({"custom_genome_fasta": None, "custom_gtf": None})
 
+        with st.expander("🔁 Force a fresh re-download (advanced -- generic, e.g. suspected corruption)"):
+            st.caption(
+                "⚠️ This reference is shared across every project using this species. "
+                "Re-downloading replaces it for everyone. Use the dedicated mitochondrial-"
+                "genome re-download button above instead if that's specifically your concern."
+            )
+            if st.button("🔄 Re-download Reference for All Projects", key="sc_ref_download_force_btn"):
+                def _build_fn(temp_dir, _species=species_choice):
+                    success, _paths, message = ref.download_genome_and_gtf(_species, temp_dir)
+                    return success, message
+                with st.spinner("Re-downloading..."):
+                    success, message, _built = ref.ensure_shared_resource(target_dir, build_fn=_build_fn, force=True)
+                if success:
+                    st.success(f"✅ {message}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {message}")
+
     elif source.startswith("📂"):
         genome_fasta = fb.render_server_file_browser(
             key_prefix="sc_ref_genome_browse_hpc", file_extensions=list(_FASTA_EXTENSIONS),
@@ -893,6 +1117,15 @@ def _render_step5(project, pairs):
         if gtf_path:
             reference_cfg["annotation_format"] = _detect_annotation_format(gtf_path)
         _render_reference_file_validation(genome_fasta, gtf_path)
+
+        if gtf_path and reference_cfg.get("annotation_format") == "gtf":
+            mito_ids = cellqc.get_mito_gene_ids_from_gtf(gtf_path)
+            if mito_ids:
+                st.success(f"✅ {len(mito_ids)} mitochondrial gene(s) auto-detected directly from this GTF.")
+                reference_cfg["mito_gene_ids"] = mito_ids
+                reference_cfg["mito_source"] = "gtf_auto_detect"
+            else:
+                _render_custom_mito_resolution(project, gtf_path)
 
     else:  # "📤 Upload from my computer"
         custom_dir = scpm.custom_reference_dir(project)
@@ -923,16 +1156,17 @@ def _render_step5(project, pairs):
             reference_cfg["annotation_format"] = _detect_annotation_format(gtf_path)
         _render_reference_file_validation(genome_fasta, gtf_path)
 
+        if gtf_path and reference_cfg.get("annotation_format") == "gtf":
+            mito_ids = cellqc.get_mito_gene_ids_from_gtf(gtf_path)
+            if mito_ids:
+                st.success(f"✅ {len(mito_ids)} mitochondrial gene(s) auto-detected directly from this GTF.")
+                reference_cfg["mito_gene_ids"] = mito_ids
+                reference_cfg["mito_source"] = "gtf_auto_detect"
+            else:
+                _render_custom_mito_resolution(project, gtf_path)
+
     _render_gff3_warning_if_needed(reference_cfg)
 
-    # --- Genome index status/build -- STARsolo-specific, gated on aligner choice ---
-    # Moved into Step 5 on 2026-08-17 so it sits right after genome
-    # selection instead of being buried in Step 6. Later the same day,
-    # gated on `aligner == ALIGNER_STARSOLO` -- see _render_aligner_choice's
-    # docstring and the module docstring's "Aligner-choice / genome-index
-    # ordering fix" section for why: STARsolo and alevin-fry need
-    # different index artifacts, so this STAR-specific build UI must not
-    # run unconditionally before the aligner is even chosen.
     st.markdown("---")
     if aligner == ALIGNER_STARSOLO:
         _render_genome_index_step(project, reference_cfg, pairs)
@@ -970,56 +1204,92 @@ def _render_step5(project, pairs):
         if missing:
             st.error(f"⚠️ Missing: {', '.join(missing)} -- provide these above before confirming.")
         else:
+            # Preserve any already-resolved mito_gene_ids/mito_source
+            # (e.g. set via _render_custom_mito_resolution's own save
+            # button) rather than overwriting them with this call, which
+            # doesn't itself carry that resolution state.
+            prior_cfg = scpm.get_reference_choice(project) or {}
+            for key in ("mito_gene_ids", "mito_source"):
+                if key in prior_cfg and key not in reference_cfg:
+                    reference_cfg[key] = prior_cfg[key]
             scpm.save_reference_choice(project, reference_cfg)
             scpm.mark_step_complete(project, "reference")
             st.success("✅ Reference setup confirmed.")
 
 
 # ---------------------------------------------------------------------------
-# Step 6: STARsolo alignment -- REAL EXECUTION (2026-08-17)
+# Step 6: STARsolo alignment -- REAL EXECUTION
 # ---------------------------------------------------------------------------
-def _resolve_star_index_dir(project, reference_cfg):
-    """
-    Resolve (WITHOUT building) the STAR genome index location this
-    project's alignment will use -- reusing quantification_manager.py's
-    REAL qm.star_index_exists() directly (confirmed against that
-    module's actual source), since STARsolo's genome index is identical
-    to ordinary STAR's (confirmed from STAR's own official STARsolo.md).
-    Preset species reuse the bulk pipeline's OWN shared index location
-    (project_manager.shared_star_index_dir()) -- mirroring
-    alignment_workspace.py's exact same shared-vs-custom index selection
-    logic (confirmed against that real module's source) -- so a human
-    STAR index already built by a bulk project is reused here
-    automatically, and vice versa. Custom references get a per-project
-    index instead (sc_project_manager.star_index_dir()).
 
-    Returns (index_dir: str, ready: bool, index_is_shared: bool).
-    """
+def _resolve_star_index_dir(project, reference_cfg):
     is_custom = reference_cfg.get("is_custom", False)
     species_key = reference_cfg.get("species_key")
     index_is_shared = not is_custom and bool(species_key)
     index_dir = pm.shared_star_index_dir(species_key) if index_is_shared else scpm.star_index_dir(project)
-    ready = qm.star_index_exists(index_dir)
+    # files_present alone (qm.star_index_exists -- checks for the
+    # "SAindex" marker file) cannot tell a genuinely finished index
+    # apart from an OLD index that's actively being replaced by a
+    # force-rebuild in progress right now -- ensure_shared_resource()
+    # builds into a private temp dir and only swaps it in via a single
+    # atomic os.rename() at the very END of a successful build, so the
+    # old index stays fully present (and looks "ready") for the entire
+    # rebuild duration. See reference_manager.resource_build_in_progress()
+    # for the full rationale (this was a real reported bug: navigating
+    # away mid-rebuild and back showed a false "already built" status
+    # while the real rebuild was still running, confirmed via `top`).
+    #
+    # This check now applies uniformly to BOTH shared (preset) and
+    # custom (per-project) indexes, since _render_genome_index_step
+    # below now routes BOTH build paths through
+    # ref.ensure_shared_resource() -- previously only the shared path
+    # had a lock file to probe at all.
+    files_present = qm.star_index_exists(index_dir)
+    ready = files_present and not ref.resource_build_in_progress(index_dir)
     return index_dir, ready, index_is_shared
 
 
 def _render_genome_index_step(project, reference_cfg, pairs):
     """
     Genome index status + build UI -- shown in Step 5 immediately after
-    genome selection (moved here 2026-08-17; previously lived buried in
-    Step 6, well below the aligner/cell-calling choices, disconnected
-    from the genome selection it actually depends on).
+    genome selection, STARsolo-specific (gated on aligner choice).
 
-    STARsolo-specific: only called from _render_step5 when the aligner
-    choice (rendered above, at the top of Step 5 -- see
-    _render_aligner_choice) is ALIGNER_STARSOLO. See the module
-    docstring's "Aligner-choice / genome-index ordering fix" section for
-    why this gating was added.
+    --- Force-rebuild bug fix (2026-08-17) ---
+    build_clicked (no index yet) and force_rebuild (an index already
+    exists, user explicitly wants it replaced) are tracked as TWO
+    SEPARATE flags -- see this module's earlier docstring for the
+    original flag-collapse regression this fixed.
 
-    Requires reference_cfg to already have a real genome_fasta + gtf_path
-    on disk (from Step 5's genome selection above this call) -- if
-    either is missing, shows nothing at all rather than a confusing
-    "index status" for a reference that isn't even selected yet.
+    --- Stale-resource-during-rebuild race fix (2026-08-18) ---
+    A real reported bug: a user force-rebuilding a shared STAR genome
+    index navigated between radio-button pages while the rebuild was
+    running (confirmed still running via `top` on the HPC host) and,
+    on navigating back, saw the index reported as "✅ already built"
+    even though the real rebuild was still in progress. Root cause:
+    reference_manager.ensure_shared_resource() builds into a private
+    temp directory and only replaces the OLD index via a single atomic
+    os.rename() at the very END of a successful build -- so the old
+    (stale) index stays fully present on disk, and any existence-only
+    check (qm.star_index_exists) reports "ready" for the ENTIRE rebuild
+    duration, with no way to distinguish a finished build from one
+    that's actively being replaced.
+
+    Fixed by using ref.resource_build_in_progress() (a non-blocking
+    probe on the resource's existing .lock file) as part of the
+    authoritative readiness check in _resolve_star_index_dir() above,
+    and by showing an explicit "🔄 build in progress, please wait"
+    status here that blocks further build actions while true.
+
+    Also: CUSTOM (non-shared, per-project) index builds now route
+    through ref.ensure_shared_resource() too, exactly like the shared
+    path -- previously the custom branch called qm.build_star_index()
+    DIRECTLY against index_dir with NO temp-dir staging, atomic
+    replacement, or lock-file protection at all, so a custom
+    reference's rebuild had the identical stale-appears-ready symptom
+    with even less of a safety net than the shared path had. Both
+    branches now share the same temp-directory + atomic-rename +
+    lock-file infrastructure -- there is no longer a separate "shared"
+    vs. "custom" code path for the actual build call, only for which
+    directory is targeted.
     """
     genome_fasta = reference_cfg.get("custom_genome_fasta")
     gtf_path = reference_cfg.get("custom_gtf")
@@ -1033,14 +1303,11 @@ def _render_genome_index_step(project, reference_cfg, pairs):
     )
 
     index_dir, index_ready, index_is_shared = _resolve_star_index_dir(project, reference_cfg)
+    build_in_progress = ref.resource_build_in_progress(index_dir)
+
     detected_cores, recommended_threads = pm.get_recommended_thread_count()
     index_threads = st.slider("Threads for indexing:", min_value=1, max_value=detected_cores, value=recommended_threads, key="sc_star_index_threads")
 
-    # --- Detect R2 read length for STAR's --sjdbOverhang -- confirmed via
-    # quantification_manager.qm.detect_fastq_read_length(), same function
-    # alignment_workspace.py already uses for bulk. Detected from R2 (the
-    # biological cDNA read), NOT R1 (fixed-length barcode+UMI structure,
-    # which would give a meaningless "read length" for this purpose).
     detected_read_length = None
     for entry in pairs.values():
         if entry["r2_files"]:
@@ -1053,56 +1320,82 @@ def _render_genome_index_step(project, reference_cfg, pairs):
     else:
         st.caption("📏 Could not detect R2 read length automatically -- falling back to the default `--sjdbOverhang 100`.")
 
-    if index_ready:
+    if build_in_progress:
+        st.warning(
+            "🔄 **A genome index build/rebuild is currently in progress** (started by "
+            "this or another session/pipeline) -- please wait. You cannot proceed to "
+            "alignment until it finishes; re-check this page periodically rather than "
+            "assuming a quick 'complete' means it actually is. (A genuine rebuild for a "
+            "full genome legitimately takes several minutes or more -- if this status "
+            "disappears within seconds, something may not have started correctly.)"
+        )
+    elif index_ready:
         st.success("✅ STAR genome index already built " + ("(shared across every project using this species)." if index_is_shared else "for this project's reference."))
     else:
         st.info("ℹ️ **No genome index found yet -- build it below before alignment can run.** This is a one-time step per reference and can take a while for larger genomes.")
 
+    # --- THE FIX: two separate flags, not one -- AND both builds now
+    # route through ensure_shared_resource() (see below) ---
     build_clicked = False
-    if not index_ready:
+    force_rebuild = False
+    if build_in_progress:
+        pass  # no build controls shown while a build is already running
+    elif not index_ready:
         build_clicked = st.button("🔧 Build Genome Index", key="sc_build_star_index_btn", type="primary")
     else:
         with st.expander("🔁 Force a fresh re-index (advanced)"):
-            st.caption("⚠️ Only do this if you have a specific reason to believe the current index is corrupted.")
+            st.caption(
+                "⚠️ Only do this if you have a specific reason to believe the current index is "
+                "corrupted or out of date (e.g. the reference's genome/annotation was "
+                "re-downloaded since this index was built -- such as after using the "
+                "mitochondrial-genome re-download button above)."
+                + (" This index is shared across every project using this species -- rebuilding "
+                   "replaces it for everyone." if index_is_shared else "")
+            )
             if st.button("🔄 Re-build Index", key="sc_build_star_index_force_btn"):
-                build_clicked = True
+                force_rebuild = True
+            st.caption(
+                "ℹ️ A genuine STAR index rebuild for a full genome (e.g. human/mouse) legitimately "
+                "takes several minutes -- if this completes in just a few seconds, something did "
+                "not rebuild correctly; please report this."
+            )
 
-    if build_clicked:
-        def _build_index_impl(temp_dir_or_final):
-            return qm.build_star_index(genome_fasta, gtf_path, temp_dir_or_final, threads=index_threads, sjdb_overhang=sjdb_overhang)
+    if build_clicked or force_rebuild:
+        def _build_index_impl(temp_dir):
+            return qm.build_star_index(genome_fasta, gtf_path, temp_dir, threads=index_threads, sjdb_overhang=sjdb_overhang)
 
-        if index_is_shared:
-            status_placeholder = st.empty()
+        # Both shared (preset) AND custom (per-project) index builds
+        # now go through ensure_shared_resource() -- previously only
+        # the shared branch got temp-dir + atomic-rename + lock
+        # protection here; a custom reference's rebuild wrote STAR's
+        # output directly into index_dir with no protection at all.
+        # See this function's docstring for the full rationale.
+        status_placeholder = st.empty()
 
-            def _wait_cb(elapsed):
-                status_placeholder.info(f"⏳ Another project is currently building this index. Waiting... ({int(elapsed)}s elapsed)")
+        def _wait_cb(elapsed):
+            status_placeholder.info(f"⏳ Another project/session is currently building this index. Waiting... ({int(elapsed)}s elapsed)")
 
-            with st.spinner("Building genome index... this may take a while for larger genomes."):
-                success, message, built = ref.ensure_shared_resource(index_dir, _build_index_impl, wait_message_callback=_wait_cb)
-            status_placeholder.empty()
-        else:
-            with st.spinner("Building genome index... this may take a while for larger genomes."):
-                success, message = qm.build_star_index(genome_fasta, gtf_path, index_dir, threads=index_threads, sjdb_overhang=sjdb_overhang)
+        with st.spinner("Building genome index... this may take a while for larger genomes."):
+            success, message, built = ref.ensure_shared_resource(
+                index_dir, _build_index_impl, wait_message_callback=_wait_cb, force=force_rebuild,
+            )
+        status_placeholder.empty()
 
         if success:
             st.success("✅ Genome index built successfully.")
+            if force_rebuild:
+                st.warning(
+                    "⚠️ **Important:** rebuilding the index does NOT automatically re-run Step 6 "
+                    "alignment for any sample. Revisit Step 6 and re-run alignment for every "
+                    "sample before this fix will actually show up in downstream results (e.g. "
+                    "Cell-level QC's mitochondrial gene detection)."
+                )
         else:
             st.error("Genome indexing failed. Details below:")
             st.code(message)
 
 
 def _render_mapping_rate_qc(results_df, rate_column):
-    """
-    Render the 3-tier plain-language mapping-rate QC summary (poor/
-    caution/good) for a results_df that has a numeric rate_column (e.g.
-    "Uniquely Mapped (%)") -- factored out of _render_step6's run-block
-    2026-08-17 so the exact same tiering logic can be reused both right
-    after a fresh run AND when re-displaying previously PERSISTED
-    results on reopening a project (see _render_step6's restructuring
-    for why persisted results need to be shown independent of a fresh
-    run). Mirrors the Bulk RNA-Seq pipeline's own
-    alignment_workspace._render_mapping_rate_qc pattern exactly.
-    """
     poor = [(row["Sample"], qm.classify_mapping_rate(row[rate_column])) for _, row in results_df.iterrows() if qm.classify_mapping_rate(row[rate_column])["tier"] == "poor"]
     caution = [(row["Sample"], qm.classify_mapping_rate(row[rate_column])) for _, row in results_df.iterrows() if qm.classify_mapping_rate(row[rate_column])["tier"] == "caution"]
     if poor:
@@ -1116,27 +1409,6 @@ def _render_mapping_rate_qc(results_df, rate_column):
 
 
 def _render_starsolo_run_controls(project, pairs, cell_filter):
-    """
-    STAR/STARsolo tool + reference + index availability checks, and the
-    actual "Run/Re-run Alignment" button + execution -- factored out of
-    _render_step6 2026-08-17 as part of a bug fix (see _render_step6's
-    docstring/comments): previously these live-availability checks ran
-    BEFORE checking whether alignment had already completed, so if
-    STAR/the genome index/reference files were ever momentarily
-    unreachable (e.g. right after an environment/session restart, before
-    a scratch mount or conda env was back in place), Step 6 would bail
-    out early and never even show that alignment had already succeeded
-    -- even though that completion flag was safely persisted the whole
-    time. Now this function is ONLY invoked when the user is actually
-    about to run (or re-run) alignment, not merely to view prior status.
-
-    On a successful run, persists the per-sample results to disk via
-    scpm.save_alignment_results() (new 2026-08-17) in addition to the
-    existing boolean scpm.mark_step_complete() flag -- previously only
-    the boolean was saved, so the actual metrics table (Cells Detected,
-    Uniquely Mapped %, Quality) had no way to reappear after a reload
-    without re-running alignment from scratch.
-    """
     if not star.star_tool_available():
         st.error("⚠️ STAR was not found on this system. See DEPLOYMENT.md / the ⚙️ Setup & Deployment page.")
         return
@@ -1165,12 +1437,6 @@ def _render_starsolo_run_controls(project, pairs, cell_filter):
 
     detected_cores, recommended_threads = pm.get_recommended_thread_count()
 
-    # --- Genome index readiness check ONLY -- the actual build UI (with
-    # its own thread slider) now lives in Step 5, immediately after
-    # genome selection and gated on the STARsolo aligner choice (see
-    # _render_genome_index_step, moved there 2026-08-17 so it's not
-    # buried below the aligner/cell-calling choices, disconnected from
-    # the genome selection it depends on).
     index_dir, index_ready, index_is_shared = _resolve_star_index_dir(project, reference_cfg)
     if not index_ready:
         st.warning("⚠️ No genome index has been built yet for this reference. Revisit **Step 5** (right after genome selection) to build it before alignment can run.")
@@ -1178,7 +1444,6 @@ def _render_starsolo_run_controls(project, pairs, cell_filter):
 
     st.markdown("---")
 
-    # --- Alignment execution ---
     st.markdown("**🚀 Run STARsolo Alignment**")
     align_dir = scpm.starsolo_output_dir(project)
     align_done = scpm.has_completed_step(project, "alignment")
@@ -1201,9 +1466,6 @@ def _render_starsolo_run_controls(project, pairs, cell_filter):
                 output_base_dir=align_dir, cell_filter=cell_filter, threads=align_threads,
                 strand=chemistry_spec["strand"],
             )
-            # Reuses the REAL bulk qm.parse_star_mapping_rate() UNCHANGED --
-            # confirmed via direct testing that STARsolo writes Log.final.out
-            # in the exact same format regular STAR does.
             mapping_rate = qm.parse_star_mapping_rate(sample_out_dir, sample_name) if success else None
             quality = qm.classify_mapping_rate(mapping_rate) if success else None
             summary_dict = star.parse_starsolo_summary(sample_out_dir, sample_name) if success else {}
@@ -1226,8 +1488,6 @@ def _render_starsolo_run_controls(project, pairs, cell_filter):
 
         if (results_df["Status"] == "✅ Success").any():
             scpm.mark_step_complete(project, "alignment")
-            # Persist the actual per-sample metrics, not just the boolean
-            # completion flag -- see this function's docstring for why.
             scpm.save_alignment_results(project, results)
             st.success("✅ STARsolo alignment & cell-calling complete for at least one sample.")
 
@@ -1237,16 +1497,6 @@ def _render_starsolo_run_controls(project, pairs, cell_filter):
 def _render_step6(project, pairs):
     st.subheader("Step 6: Alignment, Quantification & Cell-calling (STARsolo)")
 
-    # Aligner choice is now made at the top of Step 5 (see
-    # _render_aligner_choice) rather than rendered here -- re-rendering
-    # the same radio here (with the same key) would raise a duplicate-
-    # widget-key error, so we just read the confirmed choice back
-    # instead. Read from the PERSISTED project setting
-    # (scpm.get_aligner_choice()) rather than st.session_state, so this
-    # is correct even across a restart or a fresh session where Step 5
-    # hasn't rendered yet in the current run -- not just within a single
-    # continuous Streamlit session. Defaults to STARsolo if never set
-    # (e.g. a project created before this setting existed).
     aligner = scpm.get_aligner_choice(project) or ALIGNER_STARSOLO
     aligner_label = "STARsolo (recommended)" if aligner == ALIGNER_STARSOLO else "alevin-fry (faster, alignment-free)"
     st.caption(f"Using alignment/quantification method chosen in Step 5: **{aligner_label}**.")
@@ -1264,23 +1514,6 @@ def _render_step6(project, pairs):
 
     st.markdown("---")
 
-    # --- Completion status + persisted results -- checked and shown
-    # FIRST, before any live STAR/reference/index availability checks.
-    # THIS IS THE FIX for a real reported bug (2026-08-17): previously,
-    # _render_step6 ran star.star_tool_available()/genome+GTF file
-    # existence/whitelist/genome-index-readiness checks BEFORE ever
-    # looking at scpm.has_completed_step(project, "alignment") -- so if
-    # ANY of those live checks failed (e.g. right after an environment
-    # reload, before STAR was back on PATH or a scratch-mounted
-    # reference/index was remounted), the function returned early with a
-    # warning/error and never reached the "already completed" check at
-    # all, even though that completion flag -- and now, the actual
-    # per-sample results too -- were safely persisted in
-    # project_info.json/alignment_results.json the whole time. Viewing
-    # PAST results no longer requires STAR, the index, or reference
-    # files to currently be reachable; those are only required to
-    # actually (re-)run alignment, which now lives in the "Re-run"
-    # expander below via _render_starsolo_run_controls().
     align_done = scpm.has_completed_step(project, "alignment")
     persisted_results = scpm.get_alignment_results(project) if align_done else None
 
@@ -1298,14 +1531,6 @@ def _render_step6(project, pairs):
             )
 
         st.markdown("---")
-        # nav_request target "🔬 SC Cell-level QC" -- confirmed 2026-08-17
-        # against the real app.py: this requires a matching entry in
-        # PIPELINE_GROUPS["single_cell"]["options"] (so the nav_request ->
-        # radio-key lookup in app.py actually finds it) AND a matching
-        # elif branch in app.py's routing chain calling render_cell_qc()
-        # below -- both added alongside this button. Without both, this
-        # button would set active_workspace to a value matching no elif
-        # branch, silently rendering a blank page.
         if st.button("➡️ Proceed to Phase 2: Cell-level QC", key="sc_proceed_to_cellqc_btn", type="primary"):
             st.session_state["nav_request"] = "🔬 SC Cell-level QC"
             st.rerun()
@@ -1320,6 +1545,486 @@ def _render_step6(project, pairs):
             _render_starsolo_run_controls(project, pairs, cell_filter)
     else:
         _render_starsolo_run_controls(project, pairs, cell_filter)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Cell-level QC visualizations
+# ---------------------------------------------------------------------------
+def _render_stale_index_diagnostic(diagnostic, sample_name):
+    """
+    Render sc_cellqc_manager.diagnose_starsolo_matrix_for_mito()'s result
+    -- a fast, pre-flight check of THIS sample's already-aligned matrix,
+    run BEFORE the (much slower) full Cell-level QC pipeline, so a
+    stale-index situation is caught and explained immediately rather than
+    only discovered after re-running the whole R pipeline again. See this
+    module's own docstring, "Genome-index force-rebuild bug fix +
+    stale-index diagnostic", for the full rationale.
+    """
+    if diagnostic is None:
+        return  # no features.tsv found -- _render_step6/filtered_dir check already covers this
+    if not diagnostic["likely_stale_index"]:
+        return  # matrix has mito genes -- nothing to warn about here
+
+    st.error(
+        f"🔴 **This sample's (`{sample_name}`) already-aligned matrix has "
+        f"{diagnostic['total_genes']:,} genes total, but ZERO of them are mitochondrial.** "
+        "This is the specific signature of a **stale STAR index/alignment** -- Cell-level QC "
+        "only re-reads this existing matrix; it does NOT re-align, so running (or re-running) "
+        "QC on this sample **cannot fix this** no matter what mitochondrial gene resolution is "
+        "configured in Step 5.\n\n"
+        "**To actually fix this:**\n"
+        "1. Confirm the reference itself has mitochondrial content (Step 5's verification, above "
+        "the reference selection).\n"
+        "2. If needed, use Step 5's **'🔁 Force a fresh re-index'** to genuinely rebuild the STAR "
+        "genome index (a real rebuild for a full genome takes several minutes -- if it finishes "
+        "in seconds, it did not actually rebuild).\n"
+        "3. Revisit **Step 6** and **re-run alignment** for this sample -- this regenerates the "
+        "matrix with the corrected gene set.\n"
+        "4. **Then** re-run Cell-level QC here."
+    )
+
+
+def _render_mito_diagnostic(diagnostic):
+    if diagnostic is None:
+        st.caption(
+            "ℹ️ This project's cell-level QC run predates the mitochondrial-gene detection "
+            "diagnostic -- re-run to see this breakdown."
+        )
+        return
+
+    symbol_count = diagnostic.get("symbol_match_count", 0)
+    gtf_count = diagnostic.get("gtf_derived_count", 0)
+    union_count = diagnostic.get("union_count", 0)
+    mito_source = diagnostic.get("mito_source", "gtf_auto_detect")
+
+    if diagnostic.get("warning") == "no_mito_genes_found" or union_count == 0:
+        st.error(
+            "🔴 **Zero mitochondrial genes were identified in this reference, by either detection "
+            "method.** A mitochondrial percentage of 0% for every cell is almost never a real "
+            "biological result -- it's the expected symptom of this. This most likely means the "
+            "**reference genome/GTF used for this project's alignment does not include the "
+            "mitochondrial chromosome/contig at all**, its chromosome-naming convention wasn't "
+            "recognized, OR this sample's STAR index/alignment is STALE (built before the "
+            "reference's mitochondrial content was confirmed/fixed) -- see the diagnostic above, "
+            "if shown, for that specific check. **Mitochondrial QC filtering is not meaningful "
+            "until this is resolved.**\n\n"
+            f"- Gene-symbol ('^MT-' prefix) matches: {symbol_count}\n"
+            f"- GTF/override-derived matches: {gtf_count}\n"
+        )
+    else:
+        sample_ids = diagnostic.get("sample_gene_ids") or []
+        sample_note = f" (e.g. `{'`, `'.join(sample_ids[:3])}`)" if sample_ids else ""
+        source_note = {
+            "gtf_auto_detect": "direct GTF chromosome lookup",
+        }.get(mito_source, mito_source.replace("_", " "))
+        st.success(
+            f"🟢 **{union_count} mitochondrial gene(s)** identified in this reference{sample_note} "
+            f"-- {symbol_count} via gene-symbol matching, {gtf_count} via {source_note}."
+        )
+
+
+def _render_cellqc_visualizations(qc_df, output_dir, doublet_method_used):
+    st.markdown("### 📊 QC Visualizations")
+
+    figures = {}
+
+    st.markdown("**Per-cell QC metric distributions**")
+    violin_cols = st.columns(3)
+    metric_specs = [
+        ("sum", "Total UMI counts", violin_cols[0]),
+        ("detected", "Genes detected", violin_cols[1]),
+        ("subsets_Mito_percent", "Mitochondrial %", violin_cols[2]),
+    ]
+    for col_name, label, col in metric_specs:
+        if col_name not in qc_df.columns:
+            continue
+        fig = go.Figure()
+        fig.add_trace(go.Violin(y=qc_df[col_name], box_visible=True, points="outliers", name=label, meanline_visible=True))
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), title=label, showlegend=False)
+        with col:
+            st.plotly_chart(fig, use_container_width=True)
+        figures[f"qc_violin_{col_name}"] = fig
+
+    st.caption(
+        "Standard first-look QC plots: too-low counts/genes suggest empty droplets or "
+        "low-quality cells; unusually high counts/genes can indicate doublets; elevated "
+        "mitochondrial % suggests stressed or dying cells."
+    )
+
+    if all(c in qc_df.columns for c in ("sum", "detected", "subsets_Mito_percent")):
+        st.markdown("**Total counts vs. genes detected** (colored by mitochondrial %)")
+        scatter_fig = px.scatter(
+            qc_df, x="sum", y="detected", color="subsets_Mito_percent",
+            color_continuous_scale="Inferno_r",
+            labels={"sum": "Total UMI counts", "detected": "Genes detected", "subsets_Mito_percent": "Mito %"},
+            opacity=0.6,
+        )
+        scatter_fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(scatter_fig, use_container_width=True)
+        figures["qc_scatter_counts_vs_genes"] = scatter_fig
+        st.caption(
+            "Cells that are both low-count AND high-mito (bright points in the lower-left) are "
+            "the strongest candidates for exclusion -- low complexity alone can still be "
+            "biologically real for some cell types."
+        )
+
+    if "doublet_score" in qc_df.columns:
+        st.markdown(f"**Doublet score distribution** ({doublet_method_used})")
+        hist_fig = px.histogram(
+            qc_df, x="doublet_score", color="predicted_doublet" if "predicted_doublet" in qc_df.columns else None,
+            nbins=50, labels={"doublet_score": "Doublet score", "predicted_doublet": "Predicted doublet"},
+            color_discrete_map={True: "#d62728", False: "#1f77b4"},
+        )
+        hist_fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(hist_fig, use_container_width=True)
+        figures["doublet_score_histogram"] = hist_fig
+        st.caption(
+            "A healthy doublet score distribution is typically **bimodal** -- most cells scored "
+            "near 0 (singlets), with a distinct, separated group scored near 1 (real doublets)."
+        )
+
+        if "sum" in qc_df.columns and "predicted_doublet" in qc_df.columns:
+            st.markdown("**Total UMI counts, split by doublet call**")
+            split_fig = go.Figure()
+            for is_doublet, label, color in [(False, "Singlet", "#1f77b4"), (True, "Doublet", "#d62728")]:
+                subset = qc_df[qc_df["predicted_doublet"] == is_doublet]
+                if not subset.empty:
+                    split_fig.add_trace(go.Violin(y=subset["sum"], name=label, box_visible=True, meanline_visible=True, line_color=color))
+            split_fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Total UMI counts")
+            st.plotly_chart(split_fig, use_container_width=True)
+            figures["doublet_split_violin"] = split_fig
+            st.caption(
+                "Predicted doublets should generally show HIGHER total UMI counts than singlets."
+            )
+
+    if "ambient_contamination" in qc_df.columns and qc_df["ambient_contamination"].notna().any():
+        st.markdown("**Ambient RNA contamination fraction distribution**")
+        contam_fig = px.histogram(qc_df, x="ambient_contamination", nbins=40, labels={"ambient_contamination": "Contamination fraction"})
+        contam_fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(contam_fig, use_container_width=True)
+        figures["ambient_contamination_histogram"] = contam_fig
+        st.caption(
+            "DecontX reports a genuine per-cell distribution here; SoupX applies one global "
+            "estimate to every cell, so this histogram will show a single spike instead."
+        )
+
+    top_ambient_df = cellqc.read_top_ambient_genes(output_dir)
+    if top_ambient_df is not None and not top_ambient_df.empty:
+        st.markdown("**Top genes contributing to ambient RNA signal**")
+        bar_fig = px.bar(
+            top_ambient_df.head(15).sort_values("counts_removed"),
+            x="counts_removed", y="symbol", orientation="h",
+            labels={"counts_removed": "Total UMI counts removed", "symbol": "Gene"},
+        )
+        bar_fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(bar_fig, use_container_width=True)
+        figures["top_ambient_genes_bar"] = bar_fig
+        st.caption(
+            "These are typically a small number of highly-expressed marker genes from the most "
+            "abundant cell type(s) in the sample, leaking into every droplet as background 'soup'."
+        )
+
+    return figures
+
+
+def _build_qc_package_zip(sample_name, qc_df, output_dir, mito_diagnostic, thresholds,
+                           doublet_method, ambient_method, figures):
+    """
+    Bundle a completed Cell-level QC run's full results into a single
+    in-memory zip file -- see this module's own docstring, "Downloadable
+    QC results package", for the full rationale.
+
+    Includes: the raw per-cell metrics CSV, QC thresholds JSON, mito
+    diagnostic JSON, top-ambient-genes CSV, DoubletFinder's pK sweep CSV
+    (if this run used it), a self-contained markdown summary, and a PNG
+    render of every QC visualization figure passed in (via Plotly's
+    kaleido-based image export). Image export failures (e.g. kaleido
+    unavailable for some reason) are caught individually and noted in
+    the summary rather than failing the whole package.
+
+    Returns the zip file's raw bytes, ready for st.download_button.
+    """
+    buffer = io.BytesIO()
+    summary = cellqc.summarize_cellqc_results(qc_df)
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("cell_qc_metrics.csv", qc_df.to_csv(index=False))
+
+        if thresholds:
+            import json as _json
+            zf.writestr("qc_thresholds.json", _json.dumps(thresholds, indent=2))
+        if mito_diagnostic:
+            import json as _json
+            zf.writestr("mito_gene_diagnostic.json", _json.dumps(mito_diagnostic, indent=2))
+
+        top_ambient_df = cellqc.read_top_ambient_genes(output_dir)
+        if top_ambient_df is not None:
+            zf.writestr("top_ambient_genes.csv", top_ambient_df.to_csv(index=False))
+
+        pk_sweep_df = cellqc.read_doubletfinder_pk_sweep(output_dir)
+        if pk_sweep_df is not None:
+            zf.writestr("doubletfinder_pk_sweep.csv", pk_sweep_df.to_csv(index=False))
+
+        summary_md = cellqc.build_qc_summary_markdown(
+            sample_name, summary, mito_diagnostic, thresholds, doublet_method, ambient_method,
+        )
+        zf.writestr("SUMMARY.md", summary_md)
+
+        image_errors = []
+        for fig_name, fig in (figures or {}).items():
+            try:
+                png_bytes = fig.to_image(format="png", width=1000, height=600, scale=2)
+                zf.writestr(f"plots/{fig_name}.png", png_bytes)
+            except Exception as e:
+                image_errors.append(f"{fig_name}: {e}")
+        if image_errors:
+            zf.writestr(
+                "plots/_export_errors.txt",
+                "Some plots could not be exported as images (kaleido issue?):\n" + "\n".join(image_errors),
+            )
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def render_cell_qc():
+    """
+    Phase 2 entry point -- Cell-level QC (scDblFinder/DoubletFinder
+    doublet detection, DecontX/SoupX ambient RNA correction, adaptive
+    per-cell filtering with standard visualizations and a
+    downloadable results package).
+    """
+    st.title("🔬 Single-cell Cell-level QC")
+    st.markdown(
+        "Doublet detection, ambient RNA correction, and adaptive per-cell "
+        "filtering -- applied to STARsolo's filtered cell x gene matrix "
+        "from Step 6."
+    )
+    st.markdown("---")
+    project, pairs = _require_project_with_source_dir()
+    if not pairs:
+        return
+    if not scpm.has_completed_step(project, "alignment"):
+        st.warning("⚠️ Complete **Step 6** (🧬 SC Alignment & Cell-Calling) first -- this page needs a completed STARsolo run's filtered cell x gene matrix to work from.")
+        return
+
+    if not cellqc.cellqc_tools_available():
+        st.error(
+            "⚠️ Rscript was not found on this system. R with the DropletUtils, scuttle, "
+            "scDblFinder, and celda (DecontX) [and, if selected, SoupX] packages needs to be "
+            "installed in your environment before this step can run."
+        )
+        return
+
+    align_dir = scpm.starsolo_output_dir(project)
+    sample_names = list(pairs.keys())
+    if not sample_names:
+        st.warning("⚠️ No samples found for this project.")
+        return
+    sample_name = st.selectbox("Sample to run cell-level QC on:", options=sample_names, key="sc_cellqc_sample_select")
+
+    sample_out_dir = os.path.join(align_dir, sample_name)
+    output_prefix = os.path.join(sample_out_dir, f"{sample_name}_")
+    filtered_dir = star.filtered_counts_matrix_dir(output_prefix)
+    raw_dir = star.counts_matrix_dir(output_prefix)
+
+    if not os.path.isdir(filtered_dir):
+        st.error(f"⚠️ Could not find STARsolo's filtered matrix directory for `{sample_name}` at `{filtered_dir}`. Re-run Step 6 for this sample if this is unexpected.")
+        return
+
+    # --- Stale-index pre-flight diagnostic (2026-08-17) ---
+    # Fast, R-independent check run the MOMENT a sample is selected --
+    # before the (much slower) full Cell-level QC R pipeline below --
+    # see this module's own docstring, "Genome-index force-rebuild bug
+    # fix + stale-index diagnostic", for the full rationale.
+    stale_diagnostic = cellqc.diagnose_starsolo_matrix_for_mito(filtered_dir)
+    _render_stale_index_diagnostic(stale_diagnostic, sample_name)
+
+    reference_cfg = scpm.get_reference_choice(project) or {}
+    mito_gtf_path = reference_cfg.get("custom_gtf")
+    # Prefer an already-resolved override list (e.g. from custom-
+    # reference symbol matching or manual entry in Step 5) over a fresh
+    # GTF auto-parse -- see run_cellqc_analysis()'s own docstring.
+    mito_gene_ids_override = reference_cfg.get("mito_gene_ids")
+    mito_source = reference_cfg.get("mito_source", "gtf_auto_detect")
+
+    st.markdown("---")
+    st.markdown("**🧬 Doublet Detection**")
+    doublet_method_keys = list(cellqc.DOUBLET_METHOD_OPTIONS.keys())
+    doublet_method = st.radio(
+        "Doublet detection method:", doublet_method_keys,
+        format_func=lambda k: cellqc.DOUBLET_METHOD_OPTIONS[k]["label"],
+        index=doublet_method_keys.index(cellqc.DEFAULT_DOUBLET_METHOD), key="sc_doublet_method_choice",
+    )
+    st.caption(cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["explanation"])
+    if not cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["implemented"]:
+        st.warning("⚠️ This method isn't implemented yet -- select scDblFinder to continue.")
+        return
+
+    simulation_mode = cellqc.DEFAULT_SIMULATION_MODE
+    doubletfinder_n_pcs = cellqc.DEFAULT_DOUBLETFINDER_N_PCS
+    doubletfinder_cluster_resolution = cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION
+
+    if doublet_method == "scDblFinder":
+        sim_mode_keys = list(cellqc.DOUBLET_SIMULATION_MODES.keys())
+        simulation_mode = st.radio(
+            "Doublet simulation mode:", sim_mode_keys,
+            format_func=lambda k: cellqc.DOUBLET_SIMULATION_MODES[k]["label"],
+            index=sim_mode_keys.index(cellqc.DEFAULT_SIMULATION_MODE), key="sc_doublet_sim_mode_choice",
+        )
+        st.caption(cellqc.DOUBLET_SIMULATION_MODES[simulation_mode]["explanation"])
+    else:
+        st.info(
+            "⏱️ **DoubletFinder runs noticeably slower than scDblFinder** -- it computes its own "
+            "internal PCA/clustering, then sweeps many candidate 'pK' parameter values to find the "
+            "best one automatically. Expect this to take several minutes."
+        )
+        with st.expander("⚙️ DoubletFinder internal preprocessing settings (advanced)"):
+            st.caption(
+                "These control DoubletFinder's own required internal PCA/clustering step -- "
+                "**not** the pipeline's future Phase 3 clustering feature."
+            )
+            doubletfinder_n_pcs = st.slider(
+                "Number of principal components:", min_value=5, max_value=50,
+                value=cellqc.DEFAULT_DOUBLETFINDER_N_PCS, key="sc_doubletfinder_n_pcs",
+            )
+            doubletfinder_cluster_resolution = st.slider(
+                "Clustering resolution:", min_value=0.1, max_value=2.0,
+                value=cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION, step=0.1, key="sc_doubletfinder_cluster_res",
+            )
+
+    persisted_results = scpm.get_alignment_results(project) or []
+    cells_detected = next((r.get("Cells Detected") for r in persisted_results if r.get("Sample") == sample_name), None)
+    default_dbr = cellqc.compute_expected_doublet_rate(cells_detected) if isinstance(cells_detected, (int, float)) else 0.008
+    expected_doublet_rate = st.slider(
+        "Expected doublet rate:", min_value=0.0, max_value=0.30, value=float(default_dbr), step=0.001,
+        format="%.3f", key="sc_expected_doublet_rate",
+        help=(
+            f"Auto-computed as ~0.8% per 1,000 cells loaded" +
+            (f" ({cells_detected:,} cells detected in Step 6 -> {default_dbr:.3f})" if cells_detected else "") +
+            "."
+        ),
+    )
+
+    st.markdown("---")
+    st.markdown("**🧪 Ambient RNA Correction**")
+    ambient_method_keys = list(cellqc.AMBIENT_METHOD_OPTIONS.keys())
+    ambient_method = st.radio(
+        "Ambient RNA correction method:", ambient_method_keys,
+        format_func=lambda k: cellqc.AMBIENT_METHOD_OPTIONS[k]["label"],
+        index=ambient_method_keys.index(cellqc.DEFAULT_AMBIENT_METHOD), key="sc_ambient_method_choice",
+    )
+    st.caption(cellqc.AMBIENT_METHOD_OPTIONS[ambient_method]["explanation"])
+    if ambient_method == "soupx" and not os.path.isdir(raw_dir):
+        st.error(f"⚠️ SoupX requires STARsolo's raw (unfiltered) matrix, which wasn't found at `{raw_dir}`.")
+        return
+
+    st.markdown("---")
+    st.markdown("**🎚️ Per-cell Filtering Thresholds**")
+    st.caption(
+        "Adaptive thresholds (3 median-absolute-deviations from the median) are computed "
+        "automatically per-sample for total counts, genes detected, and mitochondrial %."
+    )
+    nmads = st.slider(
+        "MAD sensitivity (lower = stricter):", min_value=1.0, max_value=5.0, value=float(cellqc.DEFAULT_MAD_NMADS), step=0.5,
+        key="sc_cellqc_nmads",
+    )
+    if reference_cfg.get("is_custom") and mito_gene_ids_override is not None:
+        st.caption(f"ℹ️ Using {len(mito_gene_ids_override)} previously-resolved mitochondrial gene(s) for this custom reference (source: {mito_source}).")
+
+    output_dir = os.path.join(sample_out_dir, "cellqc")
+    work_dir = os.path.join(sample_out_dir, "cellqc_work")
+
+    spinner_text = (
+        "Running DoubletFinder (PCA + clustering + pK sweep) and ambient RNA correction... "
+        "this can take several minutes." if doublet_method == "doublet_finder" else
+        "Running doublet detection + ambient RNA correction... this may take a few minutes."
+    )
+    if st.button("▶️ Run Cell-level QC", key="sc_run_cellqc_btn", type="primary"):
+        with st.spinner(spinner_text):
+            success, log = cellqc.run_cellqc_analysis(
+                filtered_matrix_dir=filtered_dir, output_dir=output_dir, work_dir=work_dir,
+                doublet_method=doublet_method, simulation_mode=simulation_mode,
+                expected_doublet_rate=expected_doublet_rate, ambient_method=ambient_method,
+                raw_matrix_dir=raw_dir if ambient_method == "soupx" else None, nmads=nmads,
+                mito_gtf_path=mito_gtf_path, mito_gene_ids_override=mito_gene_ids_override,
+                mito_source=mito_source,
+                doubletfinder_n_pcs=doubletfinder_n_pcs,
+                doubletfinder_cluster_resolution=doubletfinder_cluster_resolution,
+            )
+        if not success:
+            st.error("Cell-level QC failed. Details below:")
+            st.code(log)
+        else:
+            st.success("✅ Cell-level QC completed.")
+            with st.expander("📜 Run log"):
+                st.code(log)
+
+    qc_df = cellqc.read_cell_qc_metrics(output_dir)
+    if qc_df is not None:
+        st.markdown("---")
+        st.markdown("**📊 Results**")
+
+        mito_diagnostic = cellqc.read_mito_gene_diagnostic(output_dir)
+        _render_mito_diagnostic(mito_diagnostic)
+
+        summary = cellqc.summarize_cellqc_results(qc_df)
+        if summary:
+            st.markdown(summary["messages"]["adaptive_qc"])
+            st.markdown(summary["messages"]["doublet"])
+            st.markdown(summary["messages"]["ambient"])
+        thresholds = cellqc.read_qc_thresholds(output_dir)
+        if thresholds:
+            st.caption(
+                f"Adaptive thresholds used: total counts > {thresholds.get('sum_lower', 0):.0f}, "
+                f"genes detected > {thresholds.get('detected_lower', 0):.0f}, "
+                f"mitochondrial % < {thresholds.get('mito_upper', 0):.1f}%"
+            )
+
+        pk_sweep_df = cellqc.read_doubletfinder_pk_sweep(output_dir)
+        if pk_sweep_df is not None and not pk_sweep_df.empty:
+            with st.expander("🔍 DoubletFinder pK parameter sweep details"):
+                st.caption(
+                    "Each row is a candidate 'pK' value DoubletFinder tested; the one with the "
+                    "highest **BCmetric** was automatically selected and used for the final "
+                    "classification above."
+                )
+                if "doubletfinder_pK_used" in qc_df.columns and not qc_df["doubletfinder_pK_used"].empty:
+                    st.caption(f"✅ Selected pK: **{qc_df['doubletfinder_pK_used'].iloc[0]}**")
+                chart_df = pk_sweep_df.copy()
+                if "pK" in chart_df.columns:
+                    chart_df["pK"] = chart_df["pK"].astype(str)
+                    chart_df = chart_df.set_index("pK")
+                if "BCmetric" in chart_df.columns:
+                    st.bar_chart(chart_df["BCmetric"])
+                st.dataframe(pk_sweep_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        figures = _render_cellqc_visualizations(qc_df, output_dir, doublet_method)
+
+        st.markdown("---")
+        st.markdown("**📦 Download Full QC Package**")
+        st.caption(
+            "Bundles the per-cell metrics table, QC thresholds, mitochondrial-gene diagnostic, "
+            "top-ambient-genes table, DoubletFinder's pK sweep (if used), a plain-text summary, "
+            "and PNG copies of every plot above into a single .zip file."
+        )
+        try:
+            zip_bytes = _build_qc_package_zip(
+                sample_name, qc_df, output_dir, mito_diagnostic, thresholds,
+                doublet_method, ambient_method, figures,
+            )
+            st.download_button(
+                "📦 Download QC Package (.zip)", data=zip_bytes,
+                file_name=f"{sample_name}_cellqc_package.zip", mime="application/zip",
+                key="sc_cellqc_download_package_btn",
+            )
+        except Exception as e:
+            st.error(f"⚠️ Could not build the QC package: {e}")
+
+        st.markdown("---")
+        with st.expander("📋 Full per-cell QC table"):
+            st.dataframe(qc_df, use_container_width=True, hide_index=True)
 
 
 def _require_project_with_source_dir():
@@ -1386,34 +2091,3 @@ def render_alignment():
     _render_step5(project, pairs)
     st.markdown("---")
     _render_step6(project, pairs)
-
-
-def render_cell_qc():
-    """
-    Phase 2 entry point -- Cell-level QC (scDblFinder doublet detection,
-    SoupX/DecontX ambient RNA correction, interactive per-cell
-    filtering). Added 2026-08-17 as a real (not dead-end) navigation
-    target for Step 6's "➡️ Proceed to Phase 2: Cell-level QC" button --
-    intentionally a placeholder for now, pending the actual Phase 2
-    manager module(s) and UI (not yet built). Requires alignment
-    (Step 6) to have completed for the active project, mirroring every
-    other render_*() entry point's own step-gating pattern in this file.
-    """
-    st.title("🔬 Single-cell Cell-level QC")
-    st.markdown(
-        "Doublet detection (scDblFinder), ambient RNA correction "
-        "(SoupX/DecontX), and interactive per-cell filtering -- applied "
-        "to STARsolo's filtered cell x gene matrix from Step 6."
-    )
-    st.markdown("---")
-    project, pairs = _require_project_with_source_dir()
-    if not pairs:
-        return
-    if not scpm.has_completed_step(project, "alignment"):
-        st.warning("⚠️ Complete **Step 6** (🧬 SC Alignment & Cell-Calling) first -- this page needs a completed STARsolo run's filtered cell x gene matrix to work from.")
-        return
-    st.info(
-        "🚧 **Coming soon.** Phase 2 (cell-level QC) hasn't been built yet -- this page is a "
-        "placeholder so navigation from Step 6 works correctly in the meantime. Your completed "
-        "alignment results are safe and waiting here for when this is implemented."
-    )

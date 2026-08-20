@@ -38,6 +38,61 @@ utility page rather than a pipeline step. Three sections:
    detection only -- NOT remote job submission/execution, which would be
    a separate, explicitly-scoped future feature building on top of a
    working, tested connection profile.
+
+--- Single-cell Phase 2 dependency-detection gap fix (2026-08-17) ---
+A real reported bug: the new Cell-level QC packages (DropletUtils,
+scuttle, scDblFinder, Seurat, SoupX, celda/DecontX, remotes,
+DoubletFinder) were added to environment.yml but never added to this
+file's hand-maintained _R_PACKAGES/_PYTHON_PACKAGES dicts -- so the
+Environment Check simply never checked for them at all, meaning they
+could never show up as "missing" and could therefore never be offered
+for install. Fixed by adding entries for all of them below. While
+auditing this gap, alevin-fry (CLI) and the Phase 3 Python analysis-
+layer packages (scanpy, anndata, python-igraph, leidenalg, harmonypy,
+celltypist) were ALSO found missing from detection for the identical
+root-cause reason, and the stale, deprecated kaleido pin
+("python-kaleido=0.2.*") was corrected to match environment.yml's own
+already-unpinned entry.
+
+--- Batched R-check crash-isolation + timeout bytes/str fixes (2026-08-17,
+    later same day) ---
+Two real reported bugs, both in _check_r_packages_batched(): (1) a hard
+R error loading one heavy package (e.g. Seurat, or celda's rstan/
+stanheaders dependency) could abort the entire batched Rscript call and
+wipe out previously-printed results for OTHER, perfectly-fine packages
+checked earlier in the same run -- fixed by wrapping each
+requireNamespace() call in its own tryCatch(), plus flush(stdout())
+after every line as defense in depth; (2) a genuine timeout on a slow-
+loading package crashed with `TypeError: a bytes-like object is
+required, not 'str'`, because Python's subprocess.TimeoutExpired.stdout
+is raw bytes even when text=True was passed to subprocess.run() -- a
+documented quirk where that decoding only applies to a successful
+CompletedProcess, not the timeout exception. Fixed by making
+_parse_r_check_output() defensively decode bytes input. See that
+function's and _check_r_packages_batched()'s own docstrings for the
+full detail on both fixes.
+
+--- GitHub-only R package: real one-click install, not just a manual
+    command (2026-08-17, later same day) ---
+DoubletFinder has no conda/CRAN/Bioconductor release at all (GitHub-
+only: chris-mcginnis-ucsf/DoubletFinder). Previously, if missing, this
+page only ever showed the manual `remotes::install_github(...)` command
+for the user to copy/run themselves. Now, if r-remotes is CONFIRMED
+installed (checked via the same batched Rscript call as every other R
+package), a real "📥 Install via GitHub" button is offered instead,
+launching the actual install in the background via
+deployment_manager.launch_github_r_install() -- the SAME background-
+thread + JSON-status-file + log-tail polling pattern already used for
+every conda-based install on this page (see that function's own
+docstring). If r-remotes is NOT yet installed (or its own check
+couldn't be confirmed), the manual command is still shown as a fallback,
+along with a nudge that installing r-remotes first (via "Install
+Missing Dependencies" below) will unlock the one-click button on the
+next check. The install command itself is built programmatically (see
+deployment_manager.build_github_r_install_command()) from a plain
+"owner/repo" string rather than a hand-written shell command, so the
+button's actual subprocess call and the displayed fallback command can
+never silently drift apart from each other.
 """
 import importlib.util
 import shutil
@@ -70,12 +125,22 @@ _PYTHON_PACKAGES = {
     "streamlit": {"label": "streamlit", "conda_spec": "streamlit=1.37.*"},
     "pandas": {"label": "pandas", "conda_spec": "pandas=2.2.*"},
     "plotly": {"label": "plotly", "conda_spec": "plotly=5.22.*"},
-    "kaleido": {"label": "python-kaleido (Plotly PDF/image export)", "conda_spec": "python-kaleido=0.2.*"},
+    # UNPINNED -- corrected 2026-08-17 from the stale, deprecated
+    # "python-kaleido=0.2.*" pin, matching environment.yml's own fix.
+    "kaleido": {"label": "python-kaleido (Plotly PDF/image export)", "conda_spec": "python-kaleido"},
     "duckdb": {"label": "duckdb", "conda_spec": "duckdb=1.0.*"},
     "openpyxl": {"label": "openpyxl (.xlsx metadata upload support)", "conda_spec": "openpyxl=3.1.*"},
     "scipy": {"label": "scipy", "conda_spec": "scipy=1.13.*"},
     "paramiko": {"label": "paramiko (SSH connections, this page's own HPC section)", "conda_spec": "paramiko=3.4.*"},
     "requests": {"label": "requests (NCBI/SRA lookups)", "conda_spec": "requests=2.32.*"},
+
+    # --- Single-cell RNA-Seq: Python analysis layer (Phase 3) additions ---
+    "scanpy": {"label": "scanpy (single-cell normalization/clustering/UMAP)", "conda_spec": "scanpy"},
+    "anndata": {"label": "anndata (scanpy's underlying data structure)", "conda_spec": "anndata"},
+    "igraph": {"label": "python-igraph (required by leidenalg for clustering)", "conda_spec": "python-igraph"},
+    "leidenalg": {"label": "leidenalg (Leiden clustering algorithm)", "conda_spec": "leidenalg"},
+    "harmonypy": {"label": "harmonypy (Harmony batch-correction algorithm)", "conda_spec": "harmonypy"},
+    "celltypist": {"label": "celltypist (optional automated cell-type annotation)", "conda_spec": "celltypist"},
 }
 
 _CLI_TOOLS = {
@@ -90,33 +155,70 @@ _CLI_TOOLS = {
     # installs sra-tools only ONCE even if both are missing.
     "prefetch": {"label": "SRA Toolkit -- prefetch (NCBI/SRA download)", "conda_spec": "sra-tools=3.1.*"},
     "fasterq-dump": {"label": "SRA Toolkit -- fasterq-dump (NCBI/SRA download)", "conda_spec": "sra-tools=3.1.*"},
+    # --- Single-cell RNA-Seq: alevin-fry (Phase 1 optional alternate) ---
+    "alevin-fry": {"label": "alevin-fry (optional faster alternate to STARsolo)", "conda_spec": "alevin-fry"},
 }
 
 # One combined Rscript call checks every R/Bioconductor package at once,
 # rather than spawning a separate R subprocess per package -- R's own
 # startup overhead (loading the base R environment) is the dominant cost
-# per invocation, so batching avoids paying that cost N times over.
+# per invocation, so batching avoids paying that cost N times over. See
+# _check_r_packages_batched() for the crash-isolation + timeout-handling
+# fixes (2026-08-17) that make this batching safe even when one package's
+# namespace load hard-errors or takes too long.
 #
 # --- Version-pinning policy correction (2026-08-17) ---
 # These conda_spec values previously included exact "=X.YY.*" patch pins
-# (e.g. "bioconductor-deseq2=1.44.*") copied from an earlier draft of
-# environment.yml. A real HPC install failed with mamba reporting several
-# of those exact versions as "does not exist" -- Bioconductor packages are
-# only rebuilt on Bioconductor's twice-yearly release cadence and not every
-# package gets a version bump every cycle, so a hand-picked exact version
-# can easily name a release that was simply never published. These specs
-# are now UNPINNED, exactly matching environment.yml's own corrected
-# entries -- letting mamba/conda's solver pick whichever real version is
-# compatible with the pinned r-base, rather than every hardcoded guess
-# risking the same failure mode across 13 different Bioconductor packages
-# that don't share a synchronized release history.
+# copied from an earlier draft of environment.yml. A real HPC install
+# failed with mamba reporting several of those exact versions as "does
+# not exist" -- Bioconductor packages are only rebuilt on Bioconductor's
+# twice-yearly release cadence and not every package gets a version bump
+# every cycle, so a hand-picked exact version can easily name a release
+# that was simply never published. These specs are now UNPINNED, exactly
+# matching environment.yml's own corrected entries.
 _R_PACKAGES = {
     "DESeq2": {"label": "DESeq2 (differential expression)", "conda_spec": "bioconductor-deseq2"},
-    "jsonlite": {"label": "jsonlite (DESeq2 job-spec I/O)", "conda_spec": "r-jsonlite"},
+    "jsonlite": {"label": "jsonlite (DESeq2/cell-QC job-spec I/O)", "conda_spec": "r-jsonlite"},
     "tximport": {"label": "tximport (Salmon transcript->gene count collapsing)", "conda_spec": "bioconductor-tximport"},
     "clusterProfiler": {"label": "clusterProfiler (bitr() ID mapping; GO/KEGG enrichment)", "conda_spec": "bioconductor-clusterprofiler"},
     "ReactomePA": {"label": "ReactomePA (Reactome pathway enrichment)", "conda_spec": "bioconductor-reactompa"},
     "GOSemSim": {"label": "GOSemSim (GO term semantic-similarity simplification)", "conda_spec": "bioconductor-gosemsim"},
+    "limma": {"label": "limma (removeBatchEffect() for DESeq2's batch-adjusted PCA view)", "conda_spec": "bioconductor-limma"},
+
+    # --- Single-cell RNA-Seq: R-based cell-level QC (Phase 2) ---
+    "DropletUtils": {"label": "DropletUtils (loads STARsolo's 10x-format MTX output)", "conda_spec": "bioconductor-dropletutils"},
+    "scuttle": {"label": "scuttle (per-cell QC metrics + adaptive MAD thresholds)", "conda_spec": "bioconductor-scuttle"},
+    "scDblFinder": {"label": "scDblFinder (doublet detection -- default method)", "conda_spec": "bioconductor-scdblfinder"},
+    "Seurat": {"label": "Seurat (required by DoubletFinder's internal PCA/clustering step)", "conda_spec": "r-seurat"},
+    "SoupX": {"label": "SoupX (ambient RNA correction -- alternative method)", "conda_spec": "r-soupx"},
+    "celda": {"label": "celda (provides DecontX -- ambient RNA correction, default method)", "conda_spec": "bioconductor-celda"},
+    "remotes": {"label": "remotes (needed to install DoubletFinder from GitHub -- see below)", "conda_spec": "r-remotes"},
+}
+
+# --- DoubletFinder: special case, NOT installable via conda/mamba ---
+# DoubletFinder is not distributed via conda-forge, bioconda, CRAN, or
+# Bioconductor at all -- confirmed GitHub-only
+# (chris-mcginnis-ucsf/DoubletFinder). Its presence is still CHECKED via
+# the same batched, crash-isolated requireNamespace() call as every other
+# R package, but is rendered and handled separately in
+# _render_environment_check() -- deliberately never added to the
+# "missing" dict that feeds deployment_manager.launch_install(), since
+# that function only knows how to run conda/mamba installs and there is
+# no conda package for this to install.
+#
+# --- One-click GitHub install (2026-08-17) ---
+# github_repo (a plain "owner/repo" string) is used to build the actual
+# install command programmatically via
+# deployment_manager.build_github_r_install_command(), for BOTH the
+# real one-click button (when r-remotes is confirmed present) and the
+# manual-fallback display command (when it isn't) -- see
+# _render_environment_check()'s R-packages section for how this dict is
+# used, and this file's own module docstring for the full rationale.
+_R_GITHUB_PACKAGES = {
+    "DoubletFinder": {
+        "label": "DoubletFinder (optional alternate doublet-detection method)",
+        "github_repo": "chris-mcginnis-ucsf/DoubletFinder",
+    },
 }
 
 # One entry per PRESET species in reference_manager.py's REFERENCE_CATALOG
@@ -144,18 +246,54 @@ def _check_cli_tool(executable_name):
     return shutil.which(executable_name) is not None
 
 
-def _check_r_packages_batched(package_names, timeout=30):
+def _check_r_packages_batched(package_names, timeout=90):
     """
     Check every name in package_names in a SINGLE Rscript invocation,
-    returning {package_name: bool}. If Rscript itself isn't on PATH, R is
-    reported as entirely unavailable rather than failing per-package (a
-    single clear reason, not N confusing ones caused by the same root
-    issue).
+    returning (statuses: dict or None, unreached: list[str]).
+
+    statuses: {package_name: bool} for every package whose check line
+        actually executed and printed a result -- includes packages
+        confirmed present (True) AND packages confirmed absent/broken
+        (False). Returns None (instead of a dict) if Rscript itself
+        isn't on PATH at all.
+    unreached: list of requested package_names that got NO result line
+        back at all -- meaning the script terminated (crashed/timed out)
+        before that package's check ever ran. Distinguishing "confirmed
+        missing" from "never got checked" lets the UI show an honest
+        "❓ could not be checked" instead of implying a package needs
+        installing when its real status is simply unknown.
+
+    --- Crash-isolation fix (2026-08-17) ---
+    Each requireNamespace() call is wrapped in its OWN tryCatch(...,
+    error = function(e) FALSE) -- requireNamespace() actually LOADS a
+    package's namespace, unlike a simpler "is this installed" check, so
+    a package with a broken/partial install (common for heavy compiled
+    dependency chains, e.g. Seurat, or celda's rstan/stanheaders
+    dependency) can throw a hard, UNCAUGHT R error rather than quietly
+    returning FALSE -- which, unwrapped, would abort the ENTIRE batched
+    script and (since stdout is block-buffered through a pipe) could
+    wipe out ALL previously-printed results, even for packages checked
+    successfully earlier in the same run. flush(stdout()) after every
+    line is defense in depth against an even more catastrophic failure
+    (a true process crash/segfault) a plain tryCatch cannot protect
+    against.
+
+    --- TimeoutExpired bytes/str fix (2026-08-17, later same day) ---
+    A genuinely slow-loading package can legitimately exceed `timeout`.
+    On a real timeout, Python's subprocess.TimeoutExpired.stdout
+    attribute is populated with RAW BYTES, not decoded text, regardless
+    of whether the original subprocess.run() call used text=True -- a
+    documented quirk (the text=True decoding wrapper only applies to a
+    successful CompletedProcess, not the exception raised on timeout).
+    _parse_r_check_output() now defensively decodes bytes input (see
+    its own docstring), so a timeout now correctly falls through to
+    "whatever completed before the timeout is preserved, remaining
+    requested packages are reported as unreached" instead of crashing.
     """
     if not shutil.which("Rscript"):
-        return None  # signals "R itself not found" to the caller
+        return None, []
     r_lines = "\n".join(
-        f'cat("{name}\\t", requireNamespace("{name}", quietly=TRUE), "\\n", sep="")'
+        f'cat("{name}\\t", tryCatch(requireNamespace("{name}", quietly=TRUE), error = function(e) FALSE), "\\n", sep=""); flush(stdout())'
         for name in package_names
     )
     script = f"suppressWarnings({{\n{r_lines}\n}})"
@@ -164,15 +302,43 @@ def _check_r_packages_batched(package_names, timeout=30):
             ["Rscript", "-e", script],
             capture_output=True, text=True, timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return {name: False for name in package_names}
+    except subprocess.TimeoutExpired as e:
+        # See this function's own "TimeoutExpired bytes/str fix"
+        # docstring section above for why e.stdout may be bytes here
+        # even though text=True was passed to subprocess.run() above --
+        # _parse_r_check_output() handles either type safely.
+        statuses = _parse_r_check_output(e.stdout)
+        unreached = [name for name in package_names if name not in statuses]
+        return statuses, unreached
+
+    statuses = _parse_r_check_output(result.stdout)
+    unreached = [name for name in package_names if name not in statuses]
+    return statuses, unreached
+
+
+def _parse_r_check_output(stdout_data):
+    """
+    Parse tab-separated 'name\\tTRUE/FALSE' lines from
+    _check_r_packages_batched's R script output into a {name: bool}
+    dict.
+
+    stdout_data may be either str (the normal case, from a completed
+    subprocess.run(..., text=True) call) OR bytes (the case on a
+    subprocess.TimeoutExpired -- see _check_r_packages_batched's own
+    "TimeoutExpired bytes/str fix" docstring section). Decoded
+    defensively here, rather than only at each call site, so this
+    function is safe regardless of which caller/code path passes it
+    which type.
+    """
+    if isinstance(stdout_data, bytes):
+        stdout_data = stdout_data.decode("utf-8", errors="replace")
     statuses = {}
-    for line in result.stdout.strip().splitlines():
+    for line in (stdout_data or "").strip().splitlines():
         if "\t" not in line:
             continue
         name, status = line.split("\t", 1)
         statuses[name.strip()] = status.strip().upper() == "TRUE"
-    return {name: statuses.get(name, False) for name in package_names}
+    return statuses
 
 
 def _render_status_row(label, found, conda_spec):
@@ -183,6 +349,57 @@ def _render_status_row(label, found, conda_spec):
     if not found:
         with col2:
             st.caption(f"`{conda_spec}`")
+
+
+def _render_unreached_row(label):
+    "For a package whose check never completed (script crashed/timed out before reaching it) -- distinct from a confirmed-missing ❌, since its real status is genuinely unknown."
+    st.markdown(f"❓ {label} — *could not be checked (see warning above)*")
+
+
+def _render_github_package_row(pkg_name, spec, r_statuses, unreached, remotes_available):
+    """
+    Render one _R_GITHUB_PACKAGES entry -- unlike a regular R package row,
+    this offers a REAL one-click install button (not just a manual
+    command) when r-remotes is confirmed available, since
+    remotes::install_github() is what actually performs the install.
+
+    See this file's own module docstring, "GitHub-only R package: real
+    one-click install" section, for the full rationale.
+    """
+    if pkg_name in unreached:
+        _render_unreached_row(spec["label"])
+        return
+
+    found = r_statuses.get(pkg_name, False)
+    icon = "✅" if found else "❌"
+    st.markdown(f"{icon} {spec['label']}")
+    if found:
+        return
+
+    display_command = " ".join(dm.build_github_r_install_command(spec["github_repo"]))
+
+    if remotes_available:
+        st.caption(
+            "Not available via conda/mamba (GitHub-only) -- but `r-remotes` is installed, "
+            "so this can be installed directly from here:"
+        )
+        st.code(display_command, language="bash")
+        button_key = f"setup_github_install_btn_{pkg_name}"
+        if st.button(f"📥 Install {pkg_name} via GitHub", key=button_key):
+            success, message = dm.launch_github_r_install(spec["label"], spec["github_repo"])
+            if success:
+                st.session_state["setup_install_just_launched"] = True
+                st.rerun()
+            else:
+                st.error(f"❌ {message}")
+    else:
+        st.caption(
+            "Not available via conda/mamba (GitHub-only), and `r-remotes` isn't confirmed "
+            "installed yet -- install `r-remotes` first (see \"Install Missing Dependencies\" "
+            "below), then re-run this check to unlock a one-click install here. Until then, "
+            "you can run this manually inside the environment:"
+        )
+        st.code(display_command, language="bash")
 
 
 def _render_environment_check():
@@ -227,9 +444,14 @@ def _render_environment_check():
             missing.setdefault(spec["conda_spec"], spec["label"])
 
     st.markdown("**📊 R / Bioconductor packages**")
+    # DoubletFinder's presence is checked in the SAME batched, crash-
+    # isolated Rscript call as everything else (cheap to add to the same
+    # call, avoids a second R startup) -- but see _R_GITHUB_PACKAGES' own
+    # comment for why it's rendered and handled separately below.
     all_r_specs = {**_R_PACKAGES, **_R_ORGANISM_PACKAGES}
+    all_r_check_names = list(all_r_specs.keys()) + list(_R_GITHUB_PACKAGES.keys())
     with st.spinner("Checking R packages (this batches every package into one Rscript call)..."):
-        r_statuses = _check_r_packages_batched(list(all_r_specs.keys()))
+        r_statuses, unreached = _check_r_packages_batched(all_r_check_names)
     if r_statuses is None:
         st.error(
             "❌ `Rscript` was not found on PATH at all -- R itself doesn't "
@@ -239,7 +461,21 @@ def _render_environment_check():
         )
         missing.setdefault("r-base=4.3.*", "r-base (R itself)")
     else:
+        if unreached:
+            st.warning(
+                f"⚠️ {len(unreached)} R package check(s) could not complete -- the R process "
+                "likely crashed, timed out, or errored while loading one of the packages below "
+                "(this can happen with slow/heavy-to-load packages like Seurat or celda on a "
+                "busy or memory-constrained machine, or a broken/partial install). Packages "
+                "below marked ❓ have an UNKNOWN status, not a confirmed-missing one -- try "
+                "running the check again, or check that package individually with "
+                "`Rscript -e 'library(<package>)'` to see the actual error."
+            )
+
         for pkg_name, spec in _R_PACKAGES.items():
+            if pkg_name in unreached:
+                _render_unreached_row(spec["label"])
+                continue
             found = r_statuses.get(pkg_name, False)
             _render_status_row(spec["label"], found, spec["conda_spec"])
             if not found:
@@ -247,10 +483,23 @@ def _render_environment_check():
 
         st.markdown("**🧬 Organism annotation packages** (one per preset species in `reference_manager.py`'s `REFERENCE_CATALOG`)")
         for pkg_name, spec in _R_ORGANISM_PACKAGES.items():
+            if pkg_name in unreached:
+                _render_unreached_row(spec["label"])
+                continue
             found = r_statuses.get(pkg_name, False)
             _render_status_row(spec["label"], found, spec["conda_spec"])
             if not found:
                 missing.setdefault(spec["conda_spec"], spec["label"])
+
+        # --- DoubletFinder: rendered separately, never added to `missing` ---
+        # See _R_GITHUB_PACKAGES' own comment above for why this can't go
+        # through the SAME conda-install path as everything else -- but
+        # DOES now offer its own real one-click install path when
+        # r-remotes is confirmed available (see _render_github_package_row).
+        remotes_available = ("remotes" not in unreached) and r_statuses.get("remotes", False)
+        st.markdown("**🔀 GitHub-only R packages** (not installable via conda/mamba)")
+        for pkg_name, spec in _R_GITHUB_PACKAGES.items():
+            _render_github_package_row(pkg_name, spec, r_statuses, unreached, remotes_available)
 
     st.session_state["setup_missing_specs"] = missing
 
@@ -258,7 +507,9 @@ def _render_environment_check():
     st.caption(
         "See **DEPLOYMENT.md** for full Docker / local / HPC setup "
         "instructions. Anything missing above can be installed directly "
-        "from this page -- see \"Install Missing Dependencies\" below."
+        "from this page -- see \"Install Missing Dependencies\" below "
+        "(GitHub-only packages have their own install option shown "
+        "inline above, once `r-remotes` is available)."
     )
 
 
@@ -270,6 +521,12 @@ def _render_install_status_panel():
     if not status:
         return
     st.markdown("**📡 Install Status**")
+    # Distinguish a GitHub-based R package install from a conda/mamba
+    # install -- same status dict shape otherwise (status/started_at/
+    # finished_at/returncode all mean the same thing for both), just a
+    # different label so it's clear at a glance which kind just ran.
+    if status.get("install_type") == "github_r_package":
+        st.caption("Install type: 🔀 GitHub R package (via `remotes::install_github()`)")
     if status["status"] == "running":
         st.info(f"🔄 Installing -- started {status['started_at']}...")
     elif status["status"] == "complete":
@@ -317,7 +574,9 @@ def _render_install_missing_section():
     if dm.is_install_in_progress():
         st.markdown(
             "An install is currently running (see status below) -- wait "
-            "for it to finish before starting another."
+            "for it to finish before starting another. This includes any "
+            "GitHub-based R package install started above, since it shares "
+            "the same lock as a conda/mamba install."
         )
         _render_install_status_panel()
         return

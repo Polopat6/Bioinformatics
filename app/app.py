@@ -13,8 +13,8 @@ in its own module:
   - setup_workspace.py         -> Setup & Deployment (environment check, HPC SSH connections)
   - single_cell/singlecell_workspace.py -> Single-cell RNA-Seq (Phase 1: ingestion
     through STARsolo alignment/cell-calling, plus a Phase 2 Cell-level QC
-    placeholder page; see that module's own docstring for scope --
-    droplet-based UMI methods only)
+    page; see that module's own docstring for scope -- droplet-based UMI
+    methods only)
 
 Keeping workspaces in separate files means work on one pipeline (e.g. Bulk
 RNA-Seq) can never accidentally break another (e.g. Spatial Transcriptomics).
@@ -56,26 +56,27 @@ while other pipelines stay tucked away until you navigate into them.
 --- single_cell/ subfolder import note (2026-08-17) ---
 singlecell_workspace.py and its supporting modules (sc_project_manager.py,
 chemistry_manager.py, singlecell_ingestion_manager.py,
-singlecell_trim_manager.py, starsolo_manager.py) live in a single_cell/
-subfolder rather than directly alongside this file, for cleaner file
-organization as this pipeline grows. Since Streamlit is always launched
-via `cd repo/app && streamlit run app.py` (see DEPLOYMENT.md), app.py's own
-working directory is repo/app/ -- sys.path.insert below adds single_cell/
-onto the import path so `import singlecell_workspace` resolves normally,
-the same as any other top-level module in this app, without needing
-package-relative imports or an __init__.py-based package structure.
+singlecell_trim_manager.py, starsolo_manager.py, sc_cellqc_manager.py)
+live in a single_cell/ subfolder rather than directly alongside this
+file, for cleaner file organization as this pipeline grows. Since
+Streamlit is always launched via `cd repo/app && streamlit run app.py`
+(see DEPLOYMENT.md), app.py's own working directory is repo/app/ --
+sys.path.insert below adds single_cell/ onto the import path so `import
+singlecell_workspace` resolves normally, the same as any other
+top-level module in this app, without needing package-relative imports
+or an __init__.py-based package structure.
 
 --- Single-cell Phase 2 placeholder route added (2026-08-17) ---
 Added "🔬 SC Cell-level QC" as a fourth option in the "single_cell"
 pipeline group below, plus a matching elif branch calling
 singlecell_workspace.render_cell_qc(). This was added specifically so
-Step 6's (STARsolo alignment) new "➡️ Proceed to Phase 2: Cell-level QC"
+Step 6's (STARsolo alignment) "➡️ Proceed to Phase 2: Cell-level QC"
 button has a real, working navigation target -- without a matching
 PIPELINE_GROUPS entry AND elif branch, that button's nav_request would
 set active_workspace to a value matching no branch below, silently
-rendering a blank page. render_cell_qc() itself is currently a
-placeholder (Phase 2's actual scDblFinder/SoupX/DecontX implementation
-hasn't been built yet) -- only the navigation plumbing is real so far.
+rendering a blank page. render_cell_qc() itself now runs real Phase 2
+logic (scDblFinder doublet detection, DecontX/SoupX ambient RNA
+correction, adaptive per-cell filtering) via sc_cellqc_manager.py.
 """
 import os
 import sys
@@ -149,7 +150,7 @@ PIPELINE_GROUPS = {
     # of giving this drawer the same step-by-step radio flow Bulk
     # RNA-Seq already has, not as a separate patch on top of it.
     #
-    # --- Phase 2 placeholder route added (2026-08-17) ---
+    # --- Phase 2 route added (2026-08-17) ---
     # "🔬 SC Cell-level QC" appended as a fourth option -- gives Step 6's
     # "Proceed to Phase 2" button (singlecell_workspace.py) a real
     # navigation target; see this file's own module docstring section
@@ -355,8 +356,8 @@ elif assay_choice == "🧪 SC Trimming & Post-Trim QC":
 elif assay_choice == "🧬 SC Alignment & Cell-Calling":
     singlecell_workspace.render_alignment()
 
-# Phase 2 placeholder route (2026-08-17) -- see this file's own module
-# docstring section "Single-cell Phase 2 placeholder route added" and
+# Phase 2 route (2026-08-17) -- see this file's own module docstring
+# section "Single-cell Phase 2 placeholder route added" and
 # singlecell_workspace.render_cell_qc()'s own docstring for context.
 elif assay_choice == "🔬 SC Cell-level QC":
     singlecell_workspace.render_cell_qc()

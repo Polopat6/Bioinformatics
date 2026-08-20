@@ -92,6 +92,7 @@ import ingestion_manager as ingest
 import fastqc_manager as fastqc
 import fastp_manager as fastp
 import sra_manager as sra
+import qc_certificate_manager as qccert  
 
 # Ordered list of (stage_key, project_manager step_name) -- this order
 # IS the pipeline's execution order, and matches the step-tracking
@@ -627,6 +628,43 @@ def _run_trimming(project_name, config):
 # Stage 4: Reference setup (download/build index for preset OR custom)
 # ---------------------------------------------------------------------------
 
+"""
+PATCH for advanced_mode_orchestrator.py -- replace the ENTIRE existing
+_run_reference() function with this version.
+
+WHY: see the accompanying reference_manager.py one-line fix (change
+ensure_shared_resource()'s fast-path check from _resource_is_ready() to
+is_shared_resource_ready()) -- that fix only takes effect at call sites
+that actually CALL ensure_shared_resource() unconditionally. The
+previous version of this function gated the index-build call behind
+`if not qm.salmon_index_exists(index_dir):` / `if not
+qm.star_index_exists(index_dir):` -- a bare existence check with no
+lock-awareness at all -- so if a rebuild was genuinely in progress
+elsewhere when this automated stage ran, it would see the OLD
+(stale-but-still-present) index, conclude "already built", and skip
+calling ensure_shared_resource() entirely: no waiting, no warning, no
+record of which version got used. This is exactly the mechanism behind
+the Auto/Monitor silent-reproducibility-break risk discussed earlier.
+
+Additionally, the previous custom (non-shared, per-project) branch
+called qm.build_salmon_index()/qm.build_star_index() DIRECTLY against
+index_dir with NO temp-dir staging, atomic replacement, or lock
+protection at all -- the same original bug already fixed in
+alignment_workspace.py and singlecell_workspace.py, but never ported
+here.
+
+FIX: both branches (shared and custom) now call
+rm.ensure_shared_resource(index_dir, _build_index) UNCONDITIONALLY --
+no existence pre-check by this caller at all. ensure_shared_resource()
+itself (once patched per reference_manager.py) correctly handles all
+three cases on its own: return immediately if genuinely ready, wait for
+a concurrent rebuild in progress and reuse its result, or acquire the
+lock and build it fresh -- for ANY resource_dir, shared or custom
+alike, since there's nothing shared-specific about needing atomic
+temp-dir-then-rename + lock protection.
+"""
+
+
 def _run_reference(project_name, config):
     ref_cfg = config["reference"]
     method = config["alignment_method"]
@@ -668,18 +706,15 @@ def _run_reference(project_name, config):
                     raise RuntimeError(f"gffread transcript extraction failed for custom reference: {extraction_message}")
             index_dir = pm.salmon_index_dir(project_name)
 
-        if not qm.salmon_index_exists(index_dir):
-            def _build_index(temp_dir_or_final):
-                return qm.build_salmon_index(transcriptome_fasta, temp_dir_or_final, threads=_threads(config, "salmon_index"))
+        # Always route through ensure_shared_resource() -- for BOTH shared
+        # and custom index directories, unconditionally, with no existence
+        # pre-check by this caller. See this patch's module docstring.
+        def _build_index(temp_dir_or_final):
+            return qm.build_salmon_index(transcriptome_fasta, temp_dir_or_final, threads=_threads(config, "salmon_index"))
 
-            if not is_custom and species_key:
-                success, message, built = rm.ensure_shared_resource(index_dir, _build_index)
-                if not success:
-                    raise RuntimeError(f"Salmon indexing failed: {message}")
-            else:
-                success, log = qm.build_salmon_index(transcriptome_fasta, index_dir, threads=_threads(config, "salmon_index"))
-                if not success:
-                    raise RuntimeError(f"Salmon indexing failed:\n{log}")
+        success, message, built = rm.ensure_shared_resource(index_dir, _build_index)
+        if not success:
+            raise RuntimeError(f"Salmon indexing failed: {message}")
 
     else:  # star
         if not is_custom and species_key:
@@ -704,36 +739,30 @@ def _run_reference(project_name, config):
             gtf_path = ref_cfg["custom_gtf"]
             index_dir = pm.star_index_dir(project_name)
 
-        if not qm.star_index_exists(index_dir):
-            # Read length affects sjdbOverhang; use a representative
-            # trimmed FASTQ if trimming has already run, otherwise fall
-            # back to STAR/quantification_manager's own default.
-            trimmed_dir = pm.trimmed_fastq_dir(project_name)
-            sjdb_overhang = 100
-            if os.path.isdir(trimmed_dir):
-                sample_files = os.listdir(trimmed_dir)
-                if sample_files:
-                    read_len = qm.detect_fastq_read_length(os.path.join(trimmed_dir, sample_files[0]))
-                    if read_len:
-                        sjdb_overhang = max(read_len - 1, 1)
+        # Read length affects sjdbOverhang; use a representative
+        # trimmed FASTQ if trimming has already run, otherwise fall
+        # back to STAR/quantification_manager's own default.
+        trimmed_dir = pm.trimmed_fastq_dir(project_name)
+        sjdb_overhang = 100
+        if os.path.isdir(trimmed_dir):
+            sample_files = os.listdir(trimmed_dir)
+            if sample_files:
+                read_len = qm.detect_fastq_read_length(os.path.join(trimmed_dir, sample_files[0]))
+                if read_len:
+                    sjdb_overhang = max(read_len - 1, 1)
 
-            def _build_index(temp_dir_or_final):
-                return qm.build_star_index(
-                    genome_fasta, gtf_path, temp_dir_or_final,
-                    threads=_threads(config, "star_index"), sjdb_overhang=sjdb_overhang,
-                )
+        # Always route through ensure_shared_resource() -- for BOTH shared
+        # and custom index directories, unconditionally, with no existence
+        # pre-check by this caller. See this patch's module docstring.
+        def _build_index(temp_dir_or_final):
+            return qm.build_star_index(
+                genome_fasta, gtf_path, temp_dir_or_final,
+                threads=_threads(config, "star_index"), sjdb_overhang=sjdb_overhang,
+            )
 
-            if not is_custom and species_key:
-                success, message, built = rm.ensure_shared_resource(index_dir, _build_index)
-                if not success:
-                    raise RuntimeError(f"STAR indexing failed: {message}")
-            else:
-                success, log = qm.build_star_index(
-                    genome_fasta, gtf_path, index_dir,
-                    threads=_threads(config, "star_index"), sjdb_overhang=sjdb_overhang,
-                )
-                if not success:
-                    raise RuntimeError(f"STAR indexing failed:\n{log}")
+        success, message, built = rm.ensure_shared_resource(index_dir, _build_index)
+        if not success:
+            raise RuntimeError(f"STAR indexing failed: {message}")
 
     pm.mark_step_complete(project_name, "reference_ready")
     return f"Reference + {method} index ready at {reference_dir}"
@@ -883,7 +912,15 @@ def run_pipeline(project_name, config):
     DESeq2 or Ontology Analysis -- see module docstring).
 
     config: a dict matching the shape documented above this module's
-        "Config shape" comment block.
+        "Config shape" comment block. Optionally includes "run_mode"
+        ("auto" or "monitor", default "auto") and "monitor_id" (the
+        launching monitor's ID, only meaningful when run_mode ==
+        "monitor") -- these are purely for QC Certificate labeling
+        (see qc_certificate_manager.py) and have no effect on pipeline
+        execution itself. monitor_manager.py's
+        _build_project_config_for_folder() sets both; Auto's own
+        config (built in advanced_mode_workspace.py) omits them, so
+        they default to a plain "auto" run with no monitor_id.
 
     Returns the final status dict (same shape written to
     status_path(project_name)). Raises nothing -- all stage errors are
@@ -903,6 +940,9 @@ def run_pipeline(project_name, config):
     status["error"] = None
     _save_status(project_name, status)
 
+    run_mode = config.get("run_mode", "auto")
+    monitor_id = config.get("monitor_id")
+
     for stage_key, step_name in PIPELINE_STAGES:
         if pm.has_completed_step(project_name, step_name):
             _set_stage_status(project_name, status, stage_key, "skipped", "Already completed previously.")
@@ -917,11 +957,24 @@ def run_pipeline(project_name, config):
             status["error"] = error_detail
             status["pipeline_status"] = "error"
             _set_stage_status(project_name, status, stage_key, "error", str(e))
+            # NEW: generate a QC Certificate even for an errored run, so
+            # whatever stages DID complete before the failure still get
+            # a certificate reflecting exactly how far the run got --
+            # never silently absent just because the run didn't finish.
+            try:
+                qccert.save_qc_certificate(project_name, run_mode=run_mode, monitor_id=monitor_id)
+            except Exception:
+                pass  # QC certificate generation must never mask the real pipeline error above
             return status
 
     status["pipeline_status"] = "complete"
     status["current_stage"] = None
     _save_status(project_name, status)
+    # NEW: generate the QC Certificate for a successfully completed run.
+    try:
+        qccert.save_qc_certificate(project_name, run_mode=run_mode, monitor_id=monitor_id)
+    except Exception:
+        pass  # QC certificate generation must never mask a successful pipeline result
     return status
 
 

@@ -38,13 +38,52 @@
 #   - celltypist: optional automated first-pass cell type annotation
 #     (Phase 3) -- its own bioconda recipe already depends on
 #     scanpy/anndata/leidenalg, so no separate pins are needed for those
-#   - bioconductor-scdblfinder: doublet detection (Phase 2)
-#   - r-soupx: ambient RNA correction, DEFAULT choice (Phase 2) -- confirmed
-#     on CRAN, with a bioconda-built "r-soupx" conda package also confirmed
-#     available (r-universe listing: "Conda: r-soupx-1.6.2")
-#   - bioconductor-decontx: ambient RNA correction, ALTERNATIVE choice
-#     (Phase 2) -- confirmed as its own standalone Bioconductor package
-#     (not just bundled inside the larger `celda` package)
+#   - bioconductor-scdblfinder: doublet detection, DEFAULT method (Phase 2)
+#   - bioconductor-celda: provides DecontX, ambient RNA correction DEFAULT
+#     choice (Phase 2) -- per-cell contamination estimate; works from the
+#     filtered matrix alone, no raw/unfiltered matrix required.
+#     [NAMING CORRECTION, 2026-08-17: this file previously listed
+#     "bioconductor-decontx" here, believing DecontX to be its own
+#     standalone Bioconductor package separate from celda. DecontX HAS
+#     since been split out into its own "decontX" Bioconductor package,
+#     and "bioconductor-decontx" IS a real, valid conda package -- but
+#     sc_cellqc_manager.py's actual R script loads DecontX via
+#     `library(celda)`, not `library(decontX)` (both work identically,
+#     per the decontX package's own maintainer), so the conda spec
+#     tracked here now matches what the code actually calls:
+#     "bioconductor-celda". This was previously a real discrepancy
+#     between environment.yml and the actual R code -- functionally
+#     harmless only because bioconda's bioconductor-decontx recipe
+#     itself transitively depends on bioconductor-celda -- but corrected
+#     now so environment.yml's declared package matches the real
+#     library() call directly rather than by transitive-dependency
+#     coincidence. setup_workspace.py's own dependency checker was
+#     corrected to match in the same pass.]
+#   - r-soupx: ambient RNA correction, ALTERNATIVE choice (Phase 2) --
+#     confirmed on CRAN, with a bioconda-built "r-soupx" conda package
+#     also confirmed available (r-universe listing: "Conda: r-soupx-1.6.2")
+#
+# --- Single-cell Cell-level QC additions (2026-08-17, later same day) ---
+# Confirmed missing after implementing sc_cellqc_manager.py's actual R
+# script (which loads STARsolo's MTX output and runs BOTH doublet-
+# detection methods end to end, not just scDblFinder):
+#   - bioconductor-dropletutils: read10xCounts() -- loads STARsolo's
+#     filtered/raw 10x-format MTX output (STARsolo mirrors Cell Ranger's
+#     own MTX directory layout, confirmed from STARsolo's own docs)
+#   - bioconductor-scuttle: perCellQCMetrics() + isOutlier() -- computes
+#     per-cell QC metrics and this pipeline's adaptive MAD-based
+#     thresholds (the default per-cell filtering strategy; see
+#     sc_cellqc_manager.py's module docstring for why adaptive thresholds
+#     were chosen over a fixed cutoff)
+#   - r-seurat: required by DoubletFinder (Seurat object, NormalizeData,
+#     RunPCA, FindNeighbors, FindClusters) -- DoubletFinder needs its own
+#     internal PCA/clustering step to run its pK parameter sweep and
+#     homotypic-doublet adjustment; see sc_cellqc_manager.py's
+#     "DoubletFinder-specific settings" comment for why this is a
+#     separate, minimal preprocessing step and NOT the same as the
+#     future Phase 3 clustering workspace
+#   - r-remotes: needed to install DoubletFinder itself (see note below --
+#     DoubletFinder is NOT available via conda/CRAN/Bioconductor)
 # NOT included: scvi-tools (a heavier, GPU-oriented alternative to Harmony
 # for batch correction) -- Harmony is the recommended default and covers
 # the common case; scvi-tools can be added when/if that specific optional
@@ -57,16 +96,21 @@
 #   mamba env create -f environment.yml
 #   mamba activate bioportal
 #   python -c "import kaleido; kaleido.get_chrome_sync()"   # one-time
+#   Rscript -e 'remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")'  # one-time, see note below
 #   cd repo/app && streamlit run app.py
 #
 # HPC:
 #   mamba env create -f environment.yml -p $SCRATCH/envs/bioportal
 #   mamba activate $SCRATCH/envs/bioportal
 #   python -c "import kaleido; kaleido.get_chrome_sync()"   # one-time
+#   Rscript -e 'remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")'  # one-time, see note below
 #   cd repo/app && streamlit run app.py --server.maxUploadSize=2048
 #
 # Docker: see Dockerfile, which installs from this exact file via micromamba
-# and runs the kaleido Chrome pre-fetch automatically at build time.
+# and runs the kaleido Chrome pre-fetch AND the DoubletFinder GitHub install
+# automatically at build time (same pattern as the old Dockerfile's fastp
+# binary-download step -- see the "NOT included" note near the bottom of
+# this file for why DoubletFinder can't just be a plain dependency line here).
 #
 # REPRODUCIBILITY NOTE
 # ---------------------
@@ -78,6 +122,11 @@
 # declares its compatible r-base bound, so the solver picks a real,
 # compatible version automatically. CLI tools and core language runtimes
 # (which follow ordinary, densely-published semver) remain pinned.
+#
+# DoubletFinder is a special case even within this convention: it isn't
+# distributed via conda/CRAN/Bioconductor AT ALL (GitHub-only), so it
+# cannot be pinned or solved by conda/mamba the way everything else here
+# is -- see the "NOT included" note near the bottom of this file.
 #
 # For full bit-for-bit reproducibility once this file has stabilized,
 # generate and commit a conda-lock.yml alongside it:
@@ -166,15 +215,36 @@ dependencies:
   # Reserved for the specific jobs with no good Python equivalent -- see
   # single_cell/ module docstrings for the full rationale (scanpy handles
   # everything else in the pipeline natively, in-process).
-  - bioconductor-scdblfinder   # doublet detection
-  - r-soupx                    # ambient RNA correction -- DEFAULT choice
+  - bioconductor-dropletutils  # read10xCounts() -- loads STARsolo's
+                              # filtered/raw 10x-format MTX output
+                              # (sc_cellqc_manager.py)
+  - bioconductor-scuttle       # perCellQCMetrics() + isOutlier() -- per-cell
+                              # QC metrics + adaptive MAD-based thresholds
+                              # (sc_cellqc_manager.py's default filtering
+                              # strategy)
+  - bioconductor-scdblfinder   # doublet detection -- DEFAULT method
+  - r-seurat                   # required by DoubletFinder's own internal
+                              # PCA/clustering preprocessing step (NOT the
+                              # same as the future Phase 3 clustering
+                              # workspace -- see sc_cellqc_manager.py's
+                              # "DoubletFinder-specific settings" comment)
+  - r-remotes                  # needed to install DoubletFinder itself from
+                              # GitHub -- see "NOT included" note below;
+                              # DoubletFinder is NOT a plain dependency line
+                              # here because it isn't on conda/CRAN/Bioconductor
+  - bioconductor-celda         # provides DecontX -- ambient RNA correction,
+                              # DEFAULT choice (per-cell contamination
+                              # estimate; works from the filtered matrix
+                              # alone, no raw/unfiltered matrix required) --
+                              # NOT "bioconductor-decontx"; see the naming
+                              # correction note near the top of this file --
+                              # sc_cellqc_manager.py's R script specifically
+                              # calls library(celda), so this is the conda
+                              # spec that actually matches the real code
+  - r-soupx                    # ambient RNA correction -- ALTERNATIVE choice
                               # (2026 benchmarking credits it with minimal
                               # count distortion; confirmed real bioconda
                               # package, not just CRAN-only)
-  - bioconductor-decontx       # ambient RNA correction -- ALTERNATIVE choice
-                              # (per-cell contamination estimate; works from
-                              # the filtered matrix alone, no raw/unfiltered
-                              # matrix required)
 
   # -------------------------------------------------------------------
   # Organism annotation packages (org.*.db), one per PRESET species in
@@ -208,6 +278,16 @@ dependencies:
 # - scvi-tools -- optional, heavier alternative to Harmony for batch
 #   correction; add only once that specific path is actually implemented
 #   in code (see "Single-cell RNA-Seq pipeline additions" note above).
+# - DoubletFinder (R package) -- NOT available via conda-forge, bioconda,
+#   CRAN, or Bioconductor as of this writing (confirmed: GitHub-only,
+#   chris-mcginnis-ucsf/DoubletFinder). r-remotes is included above
+#   specifically so it CAN be installed as a one-time post-environment-
+#   creation step:
+#     Rscript -e 'remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")'
+#   This step is run automatically at Docker build time (see Dockerfile)
+#   and must be run manually, once, on HPC/local installs (see USAGE
+#   above) -- the same "one manual one-time step after env creation"
+#   pattern already used for kaleido's Chrome pre-fetch in this file.
 # - 10x Genomics' `bamtofastq` (NOT the same as sra-tools' own tooling,
 #   and NOT available on conda-forge/bioconda as of this writing --
 #   confirmed 10x distributes it only as standalone prebuilt binaries
