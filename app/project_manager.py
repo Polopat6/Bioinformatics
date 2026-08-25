@@ -13,6 +13,32 @@ This module only manages the project's *identity* and folder structure.
 It doesn't know anything about FASTQ files, QC, trimming, or alignment --
 that logic stays in each workspace module. Those modules ask this one for
 "where do my files live for project X" and "what's already been done".
+
+--- Permission-gated project deletion (2026-08-24, updated for custom
+    roles) ---
+Permanently deleting a project is destructive and irreversible (see
+delete_project()'s own docstring), and this project is now used by a
+small lab rather than a single individual -- so this action requires
+the "delete_projects" permission (see auth_manager.PERMISSION_CATALOG),
+not just the existing two-step "type the project name to confirm" UI
+safeguard. The two protections are complementary, not redundant: the
+type-to-confirm step guards against an ACCIDENTAL click by someone who
+HOLDS this permission; the permission check itself guards against a
+user who does NOT hold it being able to delete a colleague's finished
+run at all, accidentally or otherwise.
+
+Originally this was gated behind a fixed "admin role only" check;
+auth_manager.py was since redesigned to support admin-DEFINED custom
+roles and an explicit, per-action permission catalog, so this module
+now checks auth.has_permission("delete_projects") instead of
+auth.is_admin() directly -- the built-in admin role still implicitly
+passes this check (has_permission()'s own wildcard rule), but an admin
+can now ALSO grant this specific permission to a custom role (e.g. a
+"senior_tech" role) without granting that role every other admin-only
+capability too. _render_delete_confirmation() re-checks this
+permission directly (not just relying on the "Delete this project"
+button being hidden for non-permitted sessions in
+render_project_selector() below) as defense in depth.
 """
 
 import json
@@ -21,6 +47,8 @@ import shutil
 from datetime import datetime
 
 import streamlit as st
+
+import auth_manager as auth
 
 PROJECTS_ROOT = "data/projects"
 
@@ -523,10 +551,16 @@ def delete_project(project_name):
     perhaps from a stale/duplicate session_state reference).
 
     This is a destructive, irreversible operation with no recycle bin/
-    trash step -- callers (see render_project_selector's delete UI
-    below) are expected to have already obtained explicit, unambiguous
-    user confirmation (e.g. requiring the user to type the exact
-    project name) before calling this function.
+    trash step. IMPORTANT: this function itself does NOT enforce the
+    admin-role check -- that gating happens at the UI layer (see
+    render_project_selector()/_render_delete_confirmation() below),
+    exactly mirroring this project's own established convention of
+    keeping manager-module functions as plain, reusable backend logic
+    while access-control and confirmation UI live in the calling
+    workspace/rendering code. A caller invoking delete_project()
+    directly (e.g. a future CLI/admin script) is responsible for its
+    own authorization check; this function only performs the deletion
+    itself once called.
     """
     d = project_dir(project_name)
     if not os.path.isdir(d):
@@ -616,17 +650,37 @@ def render_project_selector(workspace_key="bulk_rnaseq"):
         if completed:
             st.caption(f"✔️ Steps completed so far: {', '.join(completed)}")
 
-        col_switch, col_delete = st.columns(2)
-        with col_switch:
+        # --- Permission-gated delete (2026-08-24) ---
+        # The "Delete this project" button itself is only rendered for
+        # a session whose role holds the "delete_projects" permission
+        # -- a user without it never even sees a button that would only
+        # lead to a dead end, which is cleaner UX than showing a
+        # disabled button with an explanatory tooltip. See this
+        # module's own docstring, "Permission-gated project deletion",
+        # for why this is a real access-control decision (not just a
+        # cosmetic one) and why _render_delete_confirmation() below
+        # ALSO independently re-checks the same permission as defense
+        # in depth.
+        if auth.has_permission("delete_projects"):
+            col_switch, col_delete = st.columns(2)
+            with col_switch:
+                if st.button("🔄 Switch to a different project", key=f"{workspace_key}_switch_project_btn"):
+                    del st.session_state[session_key]
+                    st.rerun()
+            with col_delete:
+                if st.button("🗑️ Delete this project", key=f"{workspace_key}_delete_project_btn"):
+                    st.session_state[f"{workspace_key}_delete_pending"] = True
+                    st.rerun()
+            _render_delete_confirmation(workspace_key, selected_project, session_key)
+        else:
             if st.button("🔄 Switch to a different project", key=f"{workspace_key}_switch_project_btn"):
                 del st.session_state[session_key]
                 st.rerun()
-        with col_delete:
-            if st.button("🗑️ Delete this project", key=f"{workspace_key}_delete_project_btn"):
-                st.session_state[f"{workspace_key}_delete_pending"] = True
-                st.rerun()
-
-        _render_delete_confirmation(workspace_key, selected_project, session_key)
+            st.caption(
+                "ℹ️ Your current role does not include permission to permanently "
+                "delete a project. Contact your lab's admin if this project needs "
+                "to be removed."
+            )
 
     return selected_project
 
@@ -644,7 +698,22 @@ def _render_delete_confirmation(workspace_key, selected_project, session_key):
                  that only becomes enabled once step 2a matches
     A "Cancel" option is always available to back out without deleting
     anything.
+
+    Also independently re-checks auth.has_permission("delete_projects")
+    at the very top (in ADDITION to render_project_selector() only
+    rendering the entry-point "Delete this project" button for
+    permitted sessions in the first place) -- defense in depth against
+    this function ever being reached by an unpermitted session by any
+    path, matching this project's own established pattern of not
+    relying solely on a button being hidden to enforce a genuine
+    access-control decision (see this module's own top-of-file
+    docstring, "Permission-gated project deletion").
     """
+    if not auth.has_permission("delete_projects"):
+        st.error("⚠️ Your current role does not include permission to delete projects.")
+        st.session_state[f"{workspace_key}_delete_pending"] = False
+        return
+
     pending_key = f"{workspace_key}_delete_pending"
     confirm_text_key = f"{workspace_key}_delete_confirm_text"
 

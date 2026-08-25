@@ -1380,3 +1380,306 @@ def summarize_enrichment_result(result_df, padj_threshold=0.05, qvalue_threshold
         f"**{top_row.get('Description', top_row.get('ID', 'unknown'))}** "
         f"(padj = {top_row['p.adjust']:.2e})."
     )
+
+
+# ---------------------------------------------------------------------------
+# eggNOG-derived ORA (enricher())
+# ---------------------------------------------------------------------------
+
+_R_ORA_EGGNOG_SCRIPT_TEMPLATE = r'''
+suppressMessages(library(clusterProfiler))
+
+args <- commandArgs(trailingOnly = TRUE)
+input_path <- args[1]
+output_dir <- args[2]
+go_term2gene_path <- args[3]
+kegg_term2gene_path <- args[4]
+
+df <- read.csv(input_path, stringsAsFactors = FALSE)
+df <- df[!is.na(df$gene_id) & !is.na(df$padj) & !is.na(df$log2FoldChange), ]
+df <- df[!duplicated(df$gene_id), ]
+
+universe <- unique(df$gene_id)
+
+{gene_list_block}
+
+write_result <- function(result_obj, out_name) {{
+  if (is.null(result_obj) || nrow(as.data.frame(result_obj)) == 0) {{
+    cat(paste("No enriched terms found for:", out_name), "\n")
+    return(invisible(NULL))
+  }}
+  res_df <- as.data.frame(result_obj)
+  write.csv(res_df, file.path(output_dir, paste0(out_name, ".csv")), row.names = FALSE)
+  cat(paste("Saved:", out_name, "-", nrow(res_df), "term(s)"), "\n")
+}}
+
+run_eggnog_enricher <- function(gene_ids, term2gene_path, out_name) {{
+  if (length(gene_ids) < 1) {{
+    cat(paste("Skipping", out_name, ": no significant genes in this direction at the chosen threshold.\n"))
+    return(invisible(NULL))
+  }}
+  if (!file.exists(term2gene_path)) {{
+    cat(paste("Skipping", out_name, ": no TERM2GENE table available (this reference's eggNOG run produced no terms for this database).\n"))
+    return(invisible(NULL))
+  }}
+  term2gene <- read.csv(term2gene_path, stringsAsFactors = FALSE)
+  result <- tryCatch({{
+    enricher(
+      gene = gene_ids, universe = universe,
+      pAdjustMethod = "BH", pvalueCutoff = 1, qvalueCutoff = 1,
+      minGSSize = {min_gs_size}, maxGSSize = {max_gs_size},
+      TERM2GENE = term2gene
+    )
+  }}, error = function(e) {{
+    cat(paste("Note: enricher() failed for", out_name, "--", conditionMessage(e)), "\n")
+    NULL
+  }})
+  write_result(result, out_name)
+}}
+
+{run_blocks}
+
+cat("eggNOG-derived ORA analysis completed.\n")
+'''
+
+# Reuses the SAME gene-list-building logic (combined vs. split-by-
+# direction) already established by the existing (org.db-based) ORA
+# script -- just operating directly on df$gene_id instead of a
+# bitr()-converted df$ENTREZID column, since there is no ID conversion
+# step at all in this path.
+_GENE_LIST_BLOCK_COMBINED_EGGNOG = r'''
+sig_genes <- unique(df$gene_id[df$padj < {padj_threshold} & abs(df$log2FoldChange) >= {lfc_threshold}])
+cat(paste("Significant genes (up + down combined):", length(sig_genes)), "\n")
+if (length(sig_genes) < 1) {{
+  stop("No significant genes at the chosen thresholds -- cannot run ORA. Try a less strict threshold.")
+}}
+'''
+
+_GENE_LIST_BLOCK_SPLIT_EGGNOG = r'''
+sig_genes_up <- unique(df$gene_id[df$padj < {padj_threshold} & df$log2FoldChange >= {lfc_threshold}])
+sig_genes_down <- unique(df$gene_id[df$padj < {padj_threshold} & df$log2FoldChange <= -{lfc_threshold}])
+cat(paste("Up-regulated significant genes:", length(sig_genes_up)), "\n")
+cat(paste("Down-regulated significant genes:", length(sig_genes_down)), "\n")
+if (length(sig_genes_up) < 1 && length(sig_genes_down) < 1) {{
+  stop("No significant genes (up OR down) at the chosen thresholds -- cannot run ORA. Try a less strict threshold.")
+}}
+'''
+
+
+def build_ora_r_script_eggnog(padj_threshold, lfc_threshold, run_go, run_kegg,
+                               min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE,
+                               split_by_direction=True):
+    """
+    eggNOG-derived equivalent of build_ora_r_script() -- see this
+    module section's own docstring for the full "why a separate
+    function" rationale. Uses clusterProfiler's generic enricher()
+    with a TERM2GENE table (read from a CSV path passed as a script
+    argument at run time) instead of enrichGO()/enrichKEGG() + OrgDb.
+
+    run_go, run_kegg: which TERM2GENE table(s) to run enricher()
+        against -- corresponds to whichever of GO/KEGG this
+        reference's eggNOG-mapper run actually produced usable terms
+        for (Reactome has no eggNOG-derived equivalent -- eggNOG-mapper
+        does not itself provide Reactome pathway assignments).
+    """
+    if split_by_direction:
+        gene_list_block = _GENE_LIST_BLOCK_SPLIT_EGGNOG.format(padj_threshold=padj_threshold, lfc_threshold=lfc_threshold)
+        direction_specs = [("up", "sig_genes_up"), ("down", "sig_genes_down")]
+    else:
+        gene_list_block = _GENE_LIST_BLOCK_COMBINED_EGGNOG.format(padj_threshold=padj_threshold, lfc_threshold=lfc_threshold)
+        direction_specs = [(None, "sig_genes")]
+
+    run_blocks_parts = []
+    for direction, gene_var in direction_specs:
+        suffix = f"_{direction}" if direction else ""
+        if run_go:
+            run_blocks_parts.append(
+                f'run_eggnog_enricher({gene_var}, go_term2gene_path, "ora_GO{suffix}")'
+            )
+        if run_kegg:
+            run_blocks_parts.append(
+                f'run_eggnog_enricher({gene_var}, kegg_term2gene_path, "ora_KEGG{suffix}")'
+            )
+
+    return _R_ORA_EGGNOG_SCRIPT_TEMPLATE.format(
+        gene_list_block=gene_list_block,
+        min_gs_size=min_gs_size, max_gs_size=max_gs_size,
+        run_blocks="\n".join(run_blocks_parts),
+    )
+
+
+def run_ora_analysis_eggnog(input_csv_path, output_dir, work_dir,
+                             go_term2gene_path, kegg_term2gene_path,
+                             padj_threshold, lfc_threshold, run_go, run_kegg,
+                             min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE,
+                             split_by_direction=True):
+    """
+    eggNOG-derived equivalent of run_ora_analysis() -- see
+    build_ora_r_script_eggnog()'s own docstring.
+
+    go_term2gene_path, kegg_term2gene_path: paths to this reference's
+        own saved TERM2GENE CSVs (see
+        eggnog_manager.build_go_term2gene_from_eggnog()/
+        build_kegg_term2gene_from_eggnog() +
+        eggnog_manager.save_term2gene_csv()) -- passed through as plain
+        script arguments rather than baked into the R script text
+        itself, so the SAME generated script works for any reference's
+        TERM2GENE tables without needing to be rebuilt per-reference.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    script_text = build_ora_r_script_eggnog(
+        padj_threshold, lfc_threshold, run_go, run_kegg,
+        min_gs_size=min_gs_size, max_gs_size=max_gs_size,
+        split_by_direction=split_by_direction,
+    )
+    script_path = os.path.join(work_dir, "run_ora_eggnog.R")
+    return _run_r_script(
+        script_text, script_path,
+        [input_csv_path, output_dir, go_term2gene_path or "", kegg_term2gene_path or ""],
+    )
+
+
+# ---------------------------------------------------------------------------
+# eggNOG-derived GSEA (GSEA())
+# ---------------------------------------------------------------------------
+
+_R_GSEA_EGGNOG_SCRIPT_TEMPLATE = r'''
+suppressMessages(library(clusterProfiler))
+
+args <- commandArgs(trailingOnly = TRUE)
+input_path <- args[1]
+output_dir <- args[2]
+go_term2gene_path <- args[3]
+kegg_term2gene_path <- args[4]
+
+df <- read.csv(input_path, stringsAsFactors = FALSE)
+df <- df[!is.na(df$gene_id) & !is.na(df$log2FoldChange), ]
+df <- df[!duplicated(df$gene_id), ]
+
+gene_list <- df$log2FoldChange
+names(gene_list) <- df$gene_id
+gene_list <- sort(gene_list, decreasing = TRUE)
+
+cat(paste("Ranked gene list size:", length(gene_list)), "\n")
+
+write_gsea_result <- function(result_obj, out_name) {{
+  if (is.null(result_obj) || nrow(as.data.frame(result_obj)) == 0) {{
+    cat(paste("No enriched gene sets found for:", out_name), "\n")
+    return(invisible(NULL))
+  }}
+  res_df <- as.data.frame(result_obj)
+  write.csv(res_df, file.path(output_dir, paste0(out_name, ".csv")), row.names = FALSE)
+  cat(paste("Saved:", out_name, "-", nrow(res_df), "gene set(s)"), "\n")
+
+  tryCatch({{
+    suppressMessages(library(enrichplot))
+    running_score_rows <- list()
+    for (gs_id in res_df$ID) {{
+      gs_info <- enrichplot:::gsInfo(result_obj, geneSetID = gs_id)
+      gs_info$gene_set_id <- gs_id
+      running_score_rows[[gs_id]] <- gs_info
+    }}
+    if (length(running_score_rows) > 0) {{
+      combined <- do.call(rbind, running_score_rows)
+      write.csv(combined, file.path(output_dir, paste0(out_name, "_running_score.csv")), row.names = FALSE)
+    }}
+  }}, error = function(e) {{
+    cat(paste("Note: could not export running-score data for", out_name, "--", conditionMessage(e)), "\n")
+  }})
+}}
+
+run_eggnog_gsea <- function(term2gene_path, out_name) {{
+  if (!file.exists(term2gene_path)) {{
+    cat(paste("Skipping", out_name, ": no TERM2GENE table available (this reference's eggNOG run produced no terms for this database).\n"))
+    return(invisible(NULL))
+  }}
+  term2gene <- read.csv(term2gene_path, stringsAsFactors = FALSE)
+  result <- tryCatch({{
+    GSEA(
+      geneList = gene_list, pAdjustMethod = "BH", pvalueCutoff = 1,
+      minGSSize = {min_gs_size}, maxGSSize = {max_gs_size}, eps = 0,
+      TERM2GENE = term2gene
+    )
+  }}, error = function(e) {{
+    cat(paste("Note: GSEA() failed for", out_name, "--", conditionMessage(e)), "\n")
+    NULL
+  }})
+  write_gsea_result(result, out_name)
+}}
+
+{run_blocks}
+
+cat("eggNOG-derived GSEA analysis completed.\n")
+'''
+
+
+def build_gsea_r_script_eggnog(run_go, run_kegg, min_gs_size=DEFAULT_MIN_GS_SIZE,
+                                max_gs_size=DEFAULT_MAX_GS_SIZE):
+    "eggNOG-derived equivalent of build_gsea_r_script() -- see build_ora_r_script_eggnog()'s own docstring for the full rationale."
+    run_blocks_parts = []
+    if run_go:
+        run_blocks_parts.append('run_eggnog_gsea(go_term2gene_path, "gsea_GO")')
+    if run_kegg:
+        run_blocks_parts.append('run_eggnog_gsea(kegg_term2gene_path, "gsea_KEGG")')
+
+    return _R_GSEA_EGGNOG_SCRIPT_TEMPLATE.format(
+        min_gs_size=min_gs_size, max_gs_size=max_gs_size,
+        run_blocks="\n".join(run_blocks_parts),
+    )
+
+
+def run_gsea_analysis_eggnog(input_csv_path, output_dir, work_dir,
+                              go_term2gene_path, kegg_term2gene_path,
+                              run_go, run_kegg,
+                              min_gs_size=DEFAULT_MIN_GS_SIZE, max_gs_size=DEFAULT_MAX_GS_SIZE):
+    "eggNOG-derived equivalent of run_gsea_analysis()."
+    os.makedirs(output_dir, exist_ok=True)
+    script_text = build_gsea_r_script_eggnog(
+        run_go, run_kegg, min_gs_size=min_gs_size, max_gs_size=max_gs_size,
+    )
+    script_path = os.path.join(work_dir, "run_gsea_eggnog.R")
+    return _run_r_script(
+        script_text, script_path,
+        [input_csv_path, output_dir, go_term2gene_path or "", kegg_term2gene_path or ""],
+    )
+
+
+# ---------------------------------------------------------------------------
+# eggNOG-mode database availability
+# ---------------------------------------------------------------------------
+
+def databases_available_for_eggnog(go_term2gene_path, kegg_term2gene_path):
+    """
+    eggNOG-mode equivalent of databases_available_for_species() -- that
+    function answers availability via STATIC lookup tables
+    (KEGG_ORGANISM_CODES/REACTOME_ORGANISM_NAMES); this answers it via
+    a RUNTIME fact: did this reference's eggNOG-mapper run actually
+    produce a non-empty TERM2GENE table for GO/KEGG? Reactome is always
+    False here -- eggNOG-mapper does not itself provide Reactome
+    pathway assignments at all (no eggNOG-derived Reactome path exists,
+    unlike GO/KEGG).
+
+    go_term2gene_path, kegg_term2gene_path: paths to this reference's
+        saved TERM2GENE CSVs, or None/nonexistent if that database's
+        table was never built (e.g. build_go_term2gene_from_eggnog()
+        returned an empty DataFrame because no genes had any GO
+        annotation at all).
+
+    Returns the same {"GO": bool, "KEGG": bool, "Reactome": bool} shape
+    as databases_available_for_species(), so ontology_workspace.py's
+    existing db-checkbox rendering logic can treat both code paths
+    uniformly without needing its own separate branch just for this.
+    """
+    def _table_has_rows(path):
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            return len(pd.read_csv(path)) > 0
+        except Exception:
+            return False
+
+    return {
+        "GO": _table_has_rows(go_term2gene_path),
+        "KEGG": _table_has_rows(kegg_term2gene_path),
+        "Reactome": False,
+    }

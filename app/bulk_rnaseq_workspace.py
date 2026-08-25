@@ -15,6 +15,37 @@ labels.
 This module is fully self-contained. All Bulk RNA-Seq development should
 happen here — editing this file has zero effect on the Spatial
 Transcriptomics workspace (spatial_workspace.py).
+
+--- BAM -> FASTQ conversion added (2026-08-24) ---
+_render_bam_upload_section() adds a fourth alternative input method in
+Step 1 (alongside manual upload, server-directory linking, and SRA
+download): converting a BAM file the user ALREADY HAS on hand (received
+from a collaborator, a public dataset distributed only as aligned BAM,
+or their own separate prior pipeline run) back into FASTQ, via
+bulk_bam_manager.py's `samtools fastq`-based conversion.
+
+This is DELIBERATELY NOT the same feature as single-cell's own BAM
+recovery path (single_cell/sc_sra_manager.py's bamtofastq-based
+recovery) -- see bulk_bam_manager.py's own module docstring for the
+full explanation of why these are two different tools solving two
+different problems (single-cell needs to preserve barcode/UMI BAM tags
+that only exist in the ORIGINAL BAM; bulk has no such tags to begin
+with, so any ordinary BAM -- aligned or not, from any source -- can be
+converted with a standard tool). bulk_bam_manager.py's own conversion
+pipeline ALSO transparently handles the one real correctness risk
+specific to this conversion (BAM sort order -- `samtools fastq`
+silently mis-pairs R1/R2 if given a coordinate-sorted BAM) without this
+workspace needing to know or care about that detail; this UI layer only
+needs to call run_bulk_bam_conversion_from_uploaded_file() and handle
+its own (success, message, produced_files) result.
+
+Output from a successful conversion is written DIRECTLY into fastq_dir
+using the exact "_1"/"_2" naming convention ingestion_manager.py's own
+validate_sample_pairs() already recognizes -- so a converted sample
+shows up in the normal "What we detected from your file names" table
+immediately after a rerun, with ZERO special-casing needed anywhere
+else in this workspace (the exact same principle already used for
+SRA-downloaded and server-directory-linked files).
 """
 
 import os
@@ -27,6 +58,7 @@ import sra_manager as sra
 import file_browser as fb
 import fastqc_manager as fastqc
 import ingestion_manager as ingest
+import bulk_bam_manager as bbm
 
 # Note: FASTQ_BROWSE_EXTENSIONS now lives in ingestion_manager.py
 # (accessed here as ingest.FASTQ_BROWSE_EXTENSIONS) since it's core
@@ -217,6 +249,146 @@ def _render_server_directory_fastq_section(fastq_dir):
                         )
                     if n_linked:
                         st.rerun()
+
+
+def _render_bam_upload_section(fastq_dir):
+    """
+    Render the "convert a BAM file you already have" section of Step 1
+    -- a fourth alternative input method alongside manual FASTQ upload,
+    server-directory linking, and SRA download.
+
+    This is for a genuinely different situation than any of the other
+    three: the user already possesses a BAM file (received from a
+    collaborator, a public dataset distributed only in aligned-BAM
+    form, or output from a separate prior pipeline run elsewhere) and
+    wants to extract its underlying reads back into FASTQ so they can
+    be run through THIS pipeline's own ingestion/QC/trimming/alignment
+    steps.
+
+    See bulk_bam_manager.py's own module docstring for why this uses a
+    completely different tool/approach than single-cell's own BAM
+    recovery feature (`samtools fastq`, not 10x's `bamtofastq`) -- bulk
+    reads have no barcode/UMI tags to preserve, so this is a standard,
+    general-purpose conversion, not a "recover otherwise-lost data"
+    operation. bulk_bam_manager.py's own conversion pipeline
+    transparently handles BAM sort-order safety (see that module's own
+    docstring) -- this UI layer only needs to call
+    run_bulk_bam_conversion_from_uploaded_file() and handle its result.
+
+    A converted BAM is always ONE sample per BAM (a bulk BAM has no
+    ambiguity about which reads belong to which sample the way a
+    pooled single-cell BAM's cells do -- see bulk_bam_manager.py's own
+    docstring for the contrast) -- so this section asks for exactly one
+    sample name per upload, defaulting to the uploaded file's own name
+    (with ".bam" stripped) as a reasonable starting guess the user can
+    freely edit.
+    """
+    with st.expander("🧬 Or convert from a BAM file you already have"):
+        st.markdown(
+            "If you already have a **BAM file** (aligned or unaligned "
+            "sequencing reads) instead of raw FASTQ -- for example, "
+            "received from a collaborator, downloaded as part of a "
+            "public dataset that only distributes aligned BAM files, or "
+            "produced by a different pipeline you've already run -- you "
+            "can convert it back into FASTQ here so it can be used with "
+            "this pipeline's own steps.\n\n"
+            "This works with an ordinary BAM file (no special barcode/"
+            "index data required, unlike the single-cell pipeline's own "
+            "separate BAM recovery feature). If your BAM happens to be "
+            "sorted by genomic position (the most common way BAMs are "
+            "stored/indexed), it will be automatically, safely "
+            "re-sorted by read name first -- this is required for "
+            "correct paired-end extraction and is handled for you "
+            "automatically."
+        )
+
+        if not bbm.samtools_available():
+            st.error(
+                "⚠️ `samtools` was not found on this system. It needs to be "
+                "installed in your environment before this feature can be "
+                "used (conda-forge/bioconda package: `samtools`)."
+            )
+            return
+
+        uploaded_bam = st.file_uploader(
+            "Upload a BAM file (.bam):",
+            type=["bam"],
+            key="bulk_bam_upload",
+        )
+
+        if uploaded_bam is None:
+            return
+
+        default_sample_name = uploaded_bam.name
+        for suffix in (".bam",):
+            if default_sample_name.lower().endswith(suffix):
+                default_sample_name = default_sample_name[: -len(suffix)]
+                break
+
+        sample_name = st.text_input(
+            "What sample name should this become?",
+            value=default_sample_name,
+            key="bulk_bam_sample_name",
+            help="This will be used to name the resulting FASTQ file(s) -- make sure it matches (or will match) a row in your metadata file in Step 2.",
+        )
+
+        layout_label = st.radio(
+            "Is this paired-end or single-end data?",
+            ["Paired-end (most common for bulk RNA-seq)", "Single-end"],
+            key="bulk_bam_layout_radio",
+            horizontal=True,
+        )
+        paired = layout_label.startswith("Paired-end")
+
+        detected_cores, recommended_threads = pm.get_recommended_thread_count()
+        threads = st.slider(
+            "Threads to use for sorting/conversion:",
+            min_value=1, max_value=detected_cores, value=recommended_threads,
+            key="bulk_bam_threads_slider",
+            help=(
+                f"Detected {detected_cores} CPU core(s) on this machine, so "
+                f"{recommended_threads} is suggested as a starting point. "
+                "Used for both the (possible) re-sort step and the "
+                "conversion step itself."
+            ),
+        )
+
+        if not sample_name.strip():
+            st.warning("⚠️ Please enter a sample name before converting.")
+            return
+
+        if st.button("🔄 Convert BAM to FASTQ", key="bulk_bam_convert_btn", type="primary"):
+            upload_dest_dir = os.path.join(fastq_dir, "_uploaded_bams")
+            saved_bam_path = bbm.save_uploaded_bam(uploaded_bam, upload_dest_dir, sample_name.strip())
+
+            progress_area = st.empty()
+            progress_lines = []
+
+            def _on_progress(message):
+                progress_lines.append(message)
+                progress_area.markdown("\n\n".join(f"- {line}" for line in progress_lines))
+
+            with st.spinner("Converting BAM to FASTQ -- this can take a while for large files..."):
+                success, message, produced_files = bbm.run_bulk_bam_conversion_from_uploaded_file(
+                    saved_bam_path, fastq_dir, sample_name.strip(),
+                    paired=paired, threads=threads, progress_callback=_on_progress,
+                )
+
+            if success:
+                st.success(f"✅ {message}")
+                st.markdown("**Files created:**")
+                st.dataframe(
+                    pd.DataFrame({"File": [os.path.basename(p) for p in produced_files]}),
+                    use_container_width=True, hide_index=True,
+                )
+                st.info(
+                    "This sample will now appear in the \"What we detected "
+                    "from your file names\" table below once the page "
+                    "refreshes."
+                )
+                st.rerun()
+            else:
+                st.error(f"⚠️ {message}")
 
 
 def _render_sra_lookup_section(fastq_dir):
@@ -910,12 +1082,18 @@ def render():
     # --- Fetch from SRA/NCBI (alternative to manual upload) ---
     _render_sra_lookup_section(fastq_dir)
 
+    # --- Convert from a BAM file already on hand (alternative to manual
+    # upload -- see _render_bam_upload_section's own docstring for why
+    # this is a genuinely different feature/tool than single-cell's own
+    # BAM recovery path, not a copy of it) ---
+    _render_bam_upload_section(fastq_dir)
+
     # Build sample_pairs from the union of files already on disk (from
     # this session's upload above, plus anything from previous sessions,
-    # plus anything just downloaded from SRA or symlinked in from a
-    # server-side directory) rather than only from this session's upload
-    # widget. This is what makes reopening a project actually reflect
-    # prior progress.
+    # plus anything just downloaded from SRA, symlinked in from a
+    # server-side directory, or converted from an uploaded BAM) rather
+    # than only from this session's upload widget. This is what makes
+    # reopening a project actually reflect prior progress.
     all_fastq_names = ingest.list_existing_fastq(fastq_dir)
 
     sample_pairs = {}

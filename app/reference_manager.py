@@ -52,10 +52,54 @@ Wired into singlecell_workspace.py's Step 5 preset-reference section
 "re-download this reference" option specifically when mitochondrial
 content can't be verified, rather than only offering a generic
 "force re-download" as a buried advanced/undifferentiated action.
+
+--- Tiered gene-name backfill for the GFF3 fallback path (2026-08-25) ---
+The original gene_name backfill (backfill_gene_names_from_gff3(), still
+present below, unchanged) only recovers a gene_name where the source
+GFF3 actually has a "Name" attribute for that gene. Ensembl's own GFF3
+format is CONFIRMED to also carry a separate "description" attribute on
+the same gene-level line for many genes that have NO "Name" at all
+(certain novel/predicted loci, some non-coding RNAs, and pseudogenes)
+-- e.g. "ID=gene:ENSG...;biotype=lncRNA;description=... [Source:...]"
+with no "Name=" attribute present at all. Previously, such a gene had
+NOTHING backfilled into its GTF gene_name attribute -- it would show up
+downstream (e.g. STARsolo's own features.tsv, and any single-cell plot
+reading gene names from it) with either a blank/missing gene_name, or
+whatever un-helpful fallback a later consumer happened to use.
+
+backfill_gene_names_from_gff3_tiered() below (using the standalone,
+independently-tested single_cell/gff3_gene_name_resolver.py module)
+REPLACES the plain Name-only backfill in _download_ensembl_annotation()'s
+own GFF3-fallback path, applying a three-tier resolution to EVERY gene
+in the GTF that's still missing a gene_name after the fact: real "Name"
+(highest confidence) -> Ensembl's own "description" attribute (a real,
+sourced piece of information, cleaned of its "[Source:...]" provenance
+suffix and percent-decoded) -> the gene's own bare Ensembl ID as a final,
+honest fallback (explicitly NOT the confusing raw "gene:ENSG..." GFF3-ID-
+attribute form). A model-organism-aware, richer symbol-recovery path via
+clusterProfiler::bitr() was explicitly discussed and DEFERRED as an
+Ontology-Analysis-time concern, not something this reference-preparation
+step should also attempt -- see gff3_gene_name_resolver.py's own module
+docstring for the full rationale on both of these design decisions.
+
+A per-reference resolution summary (how many genes landed in each tier)
+is written to gene_name_resolution_summary.json alongside the other
+downloaded reference files, and read back on demand via
+read_gene_name_resolution_summary() -- intended for display in
+singlecell_workspace.py's Step 5, immediately after a GFF3-fallback
+preset reference is confirmed, so a user can see up front what fraction
+of genes have a real curated symbol vs. a description-derived name vs. a
+bare ID, rather than only discovering this piecemeal while looking at
+individual downstream plots/tables. This summary file is ONLY ever
+written when the GFF3 fallback path was actually used (a species whose
+direct Ensembl GTF was available needs no such summary at all, since
+Ensembl's own native GTF already includes gene_name natively for every
+gene it defines).
 """
 
 import fcntl
 import gzip
+import json
 import os
 import re
 import shutil
@@ -366,36 +410,6 @@ def _resource_is_ready(resource_dir):
     """
     return os.path.isdir(resource_dir) and len(os.listdir(resource_dir)) > 0
 
-"""
-PATCH for reference_manager.py -- shared concurrency-safety fix.
-
-WHERE TO INSERT: directly after the existing `_resource_is_ready()`
-function and BEFORE `ensure_shared_resource()` (both currently live in
-the "Concurrency-safe shared resource preparation" section).
-
-WHY: ensure_shared_resource() already protects against two BUILDERS
-racing (via the .lock file + fcntl.flock), but it does nothing to stop
-a READER from seeing a stale result. A force=True rebuild builds into a
-private temp directory and only replaces the OLD resource via a single
-os.rename() at the very end -- so the old (stale) resource stays fully
-present on disk, and reads as "ready" to every existing check
-(_resource_is_ready, qm.star_index_exists, qm.salmon_index_exists), for
-the ENTIRE rebuild duration. This is exactly what let a user navigate
-away mid-rebuild and see a false "already built" status while the real
-build was still running (confirmed via `top` on the HPC host).
-
-The lock file that ensure_shared_resource() already maintains is the
-perfect signal to close this gap -- we just need to let READERS probe
-it non-blockingly, without needing to win the lock themselves.
-
-No other function in this file needs to change. Every CALLER (in both
-alignment_workspace.py and singlecell_workspace.py) needs to switch
-from checking readiness via _resource_is_ready()/qm.*_index_exists()
-ALONE to using is_shared_resource_ready() / resource_build_in_progress()
-below instead -- see the accompanying updated alignment_workspace.py
-and singlecell_workspace.py for exactly where.
-"""
-
 
 def resource_build_in_progress(resource_dir):
     """
@@ -514,10 +528,6 @@ def ensure_shared_resource(resource_dir, build_fn, wait_message_callback=None,
     it) -- useful for the caller to decide whether to show a "built
     successfully" vs. a "was already available" message.
     """
-    # Fast path: already fully built (the common case after the first
-    # project sets up a given species) -- no lock needed at all. Never
-    # taken when force=True, since the whole point of force is to
-    # rebuild even though a ready copy already exists.
     # Fast path: already fully built (the common case after the first
     # project sets up a given species) -- no lock needed at all. Never
     # taken when force=True, since the whole point of force is to
@@ -767,7 +777,7 @@ def get_transcriptome_fasta_for_salmon(species_key, dest_dir, progress_callback=
 
 
 # ---------------------------------------------------------------------------
-# Ensembl GTF -> GFF3 fallback (2026-08-17)
+# Ensembl GTF -> GFF3 fallback (2026-08-17, tiered backfill 2026-08-25)
 # ---------------------------------------------------------------------------
 def backfill_gene_names_from_gff3(gff3_path, gtf_path):
     """
@@ -787,6 +797,15 @@ def backfill_gene_names_from_gff3(gff3_path, gtf_path):
     depending on gffread's own (inconsistently supported, and
     explicitly low-priority per gffread's own maintainer) gene-line/
     full-attribute-preservation flags (--keep-genes / -F).
+
+    NOTE (2026-08-25): this Name-only function is KEPT UNCHANGED for
+    backward compatibility (e.g. any existing direct callers/tests) --
+    _download_ensembl_annotation() below no longer calls this function
+    directly; it now calls backfill_gene_names_from_gff3_tiered()
+    instead, which additionally recovers a description-derived name (or
+    the bare gene ID as a final fallback) for genes that have no "Name"
+    attribute at all. See that function's own docstring for the full
+    rationale.
 
     gff3_path: the original downloaded GFF3 file (still on disk at
         this point in _download_ensembl_annotation()'s flow -- the
@@ -850,25 +869,175 @@ def backfill_gene_names_from_gff3(gff3_path, gtf_path):
     return backfilled_count
 
 
+def backfill_gene_names_from_gff3_tiered(gff3_path, gtf_path):
+    """
+    Three-tier gene_name backfill -- REPLACES the plain Name-only
+    backfill_gene_names_from_gff3() in _download_ensembl_annotation()'s
+    own GFF3-fallback path (2026-08-25). See this module's own docstring,
+    "Tiered gene-name backfill for the GFF3 fallback path", for the full
+    rationale.
+
+    Uses gff3_gene_name_resolver.resolve_gene_names_from_gff3() (a
+    standalone, independently-tested module -- see that module's own
+    docstring for its own detailed design/testing) to resolve, for
+    EVERY gene in gff3_path, a display name using this priority:
+      1. The GFF3's own "Name" attribute (real, curated gene symbol).
+      2. The GFF3's own "description" attribute, if "Name" is absent
+         (cleaned of Ensembl's own "[Source:...]" provenance suffix,
+         percent-decoded).
+      3. The gene's own bare Ensembl ID (its "gene:" GFF3-ID-attribute
+         prefix stripped), as a final, honest fallback.
+
+    Then writes a gene_name "..." attribute into every line of gtf_path
+    whose gene_id matches one of these resolved names AND that doesn't
+    already have a gene_name attribute -- exactly the same idempotent,
+    line-rewriting approach as the original backfill_gene_names_from_gff3()
+    above, just with a richer resolution source feeding it.
+
+    Returns the SAME summary dict shape as
+    gff3_gene_name_resolver.summarize_gene_name_resolution() (total_genes,
+    name_count, description_count, id_only_count, and their respective
+    percentages), or None if gff3_path had no genes at all -- callers
+    should treat None as "nothing to backfill or summarize," not as an
+    error (the GTF conversion itself already succeeded regardless).
+    """
+    import gff3_gene_name_resolver as _resolver
+
+    resolved = _resolver.resolve_gene_names_from_gff3(gff3_path)
+    if not resolved:
+        return None
+
+    gtf_gene_id_pattern = re.compile(r'gene_id "([^"]+)"')
+    output_lines = []
+    with open(gtf_path, "r", errors="replace") as f:
+        for line in f:
+            if not line or line.startswith("#"):
+                output_lines.append(line)
+                continue
+            if 'gene_name "' in line:
+                output_lines.append(line)
+                continue
+            match = gtf_gene_id_pattern.search(line)
+            # resolve_gene_names_from_gff3() always returns its dict
+            # keyed by the CLEAN, "gene:"-prefix-STRIPPED gene ID (see
+            # that function's own docstring) -- but it is NOT verified
+            # here whether gffread's own real -T conversion mode
+            # preserves or strips this same "gene:" prefix in the GTF
+            # it produces (this project's own established convention is
+            # to never assume external tool behavior without directly
+            # checking it). To stay correct regardless of which
+            # convention gffread actually uses, BOTH the raw GTF
+            # gene_id value AND its own prefix-stripped form are
+            # checked against the resolved dict here.
+            resolved_entry = None
+            if match:
+                raw_gtf_gene_id = match.group(1)
+                if raw_gtf_gene_id in resolved:
+                    resolved_entry = resolved[raw_gtf_gene_id]
+                else:
+                    stripped_gtf_gene_id = (
+                        raw_gtf_gene_id[len("gene:"):] if raw_gtf_gene_id.startswith("gene:") else raw_gtf_gene_id
+                    )
+                    if stripped_gtf_gene_id in resolved:
+                        resolved_entry = resolved[stripped_gtf_gene_id]
+            if resolved_entry is not None:
+                gene_name = resolved_entry["name"]
+                # Escape any literal double-quote characters in a
+                # description-derived name before embedding it inside
+                # the GTF attribute's own double-quoted value -- a real
+                # (if rare) possibility for a free-text Ensembl
+                # description, whereas a genuine gene_name/Name value
+                # essentially never contains one.
+                gene_name = gene_name.replace('"', "'")
+                stripped = line.rstrip("\n")
+                if not stripped.endswith(";"):
+                    stripped += ";"
+                stripped += f' gene_name "{gene_name}";'
+                output_lines.append(stripped + "\n")
+            else:
+                output_lines.append(line)
+
+    with open(gtf_path, "w") as f:
+        f.writelines(output_lines)
+
+    return _resolver.summarize_gene_name_resolution(gff3_path)
+
+
+def write_gene_name_resolution_summary(dest_dir, summary):
+    """
+    Persist a gene-name-resolution summary (from
+    backfill_gene_names_from_gff3_tiered()) as
+    gene_name_resolution_summary.json inside dest_dir, so
+    read_gene_name_resolution_summary() below can retrieve it later --
+    e.g. when a user revisits Step 5 for an ALREADY-downloaded reference
+    in a later session, without needing to re-scan the GFF3 from
+    scratch every time.
+
+    Does nothing (no file written) if summary is None -- e.g. this
+    reference didn't go through the GFF3 fallback path at all, or the
+    GFF3 genuinely had zero genes (both treated as "nothing to record"
+    rather than a misleading empty/zero summary file).
+    """
+    if summary is None:
+        return
+    summary_path = os.path.join(dest_dir, "gene_name_resolution_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+
+def read_gene_name_resolution_summary(target_dir):
+    """
+    Read back a previously-written gene_name_resolution_summary.json
+    from target_dir (see write_gene_name_resolution_summary() above) --
+    intended for singlecell_workspace.py's Step 5 to call directly
+    alongside its existing verify_preset_reference_mito_content() check,
+    so a GFF3-fallback reference's gene-name resolution breakdown can be
+    displayed any time this reference is viewed, not just immediately
+    after it was first downloaded.
+
+    Returns the summary dict (see backfill_gene_names_from_gff3_tiered()'s
+    own docstring for its shape), or None if no such file exists for
+    this reference (e.g. this species' direct Ensembl GTF was available
+    and the GFF3 fallback path was never used at all -- Ensembl's own
+    native GTF already includes gene_name for every gene it defines, so
+    there's genuinely nothing to summarize in that case).
+    """
+    summary_path = os.path.join(target_dir, "gene_name_resolution_summary.json")
+    if not os.path.isfile(summary_path):
+        return None
+    try:
+        with open(summary_path, "r") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
     """
     Resolve and download this species' gene annotation from Ensembl,
     preferring GTF but automatically falling back to GFF3 (+ conversion
     to GTF via gffread) if the "current_gtf" directory 404s.
 
-    --- gene_name backfill (2026-08-20) ---
+    --- gene_name backfill (2026-08-20, upgraded to tiered 2026-08-25) ---
     gffread's default `-T` conversion mode discards gene-level records
     (and their Name= attribute) entirely -- so, immediately after a
-    successful GFF3->GTF conversion, backfill_gene_names_from_gff3()
-    is now called to inject each gene's real name back in directly
-    from the original GFF3's own gene-level records, since Ensembl's
-    GFF3 only ever places gene_name there, never on child exon/CDS
-    lines. Without this step, every gene in a reference that hits this
-    fallback path would have no gene_name at all -- discovered via a
-    real debugging session where this silently caused mitochondrial
-    gene-SYMBOL detection ("^MT-" prefix matching) to always find zero
-    matches, even though the mitochondrial genes themselves were
-    present and correctly indexed/aligned the whole time.
+    successful GFF3->GTF conversion,
+    backfill_gene_names_from_gff3_tiered() is now called (REPLACING the
+    original Name-only backfill_gene_names_from_gff3() previously used
+    here) to inject each gene's real name back in, using a three-tier
+    priority (real Name -> Ensembl's own description attribute -> bare
+    Ensembl ID) -- see that function's own docstring, and this module's
+    own docstring section "Tiered gene-name backfill for the GFF3
+    fallback path", for the full rationale and history (including the
+    original real debugging session where a Name-only gap silently
+    caused mitochondrial gene-SYMBOL detection to always find zero
+    matches for an affected reference, even though the mitochondrial
+    genes themselves were present and correctly indexed/aligned the
+    whole time).
+
+    The resulting per-tier resolution summary is persisted via
+    write_gene_name_resolution_summary() so it can be displayed later
+    (see read_gene_name_resolution_summary()'s own docstring).
 
     Returns (success: bool, gtf_path_or_None, message: str).
     """
@@ -893,7 +1062,8 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
         # Direct GTF downloads come straight from Ensembl's own GTF
         # release -- these already include gene_name natively (GTF's
         # own attribute convention repeats gene_name onto every child
-        # line), so no backfill step is needed on this path at all.
+        # line), so no backfill step (and no gene-name-resolution
+        # summary file) is needed on this path at all.
         return True, gtf_path, f"Downloaded annotation (GTF) from {gtf_url}"
 
     # --- GFF3 fallback ---
@@ -946,20 +1116,27 @@ def _download_ensembl_annotation(entry, dest_dir, progress_callback=None):
     except subprocess.TimeoutExpired:
         return False, None, "gffread GFF3->GTF conversion timed out after 30 minutes."
 
-    # --- NEW STEP: backfill gene_name, since gffread -T dropped it ---
-    n_backfilled = backfill_gene_names_from_gff3(gff3_path, gtf_path)
-    if n_backfilled > 0:
+    # --- Tiered gene_name backfill (2026-08-25) -- REPLACES the
+    # original Name-only backfill_gene_names_from_gff3() call that used
+    # to be here. See backfill_gene_names_from_gff3_tiered()'s own
+    # docstring for the full rationale.
+    summary = backfill_gene_names_from_gff3_tiered(gff3_path, gtf_path)
+    write_gene_name_resolution_summary(dest_dir, summary)
+
+    if summary is not None:
         gene_name_note = (
-            f" Backfilled {n_backfilled:,} gene_name attribute(s) from the "
-            "GFF3's own gene-level records (gffread's GTF conversion mode "
-            "does not preserve these by default)."
+            f" Resolved gene names for all {summary['total_genes']:,} gene(s) from the "
+            f"GFF3's own records: {summary['name_count']:,} ({summary['name_pct']}%) have a "
+            f"curated symbol, {summary['description_count']:,} ({summary['description_pct']}%) "
+            f"use an Ensembl-provided description instead, and {summary['id_only_count']:,} "
+            f"({summary['id_only_pct']}%) have neither and will display their bare Ensembl ID "
+            "(gffread's GTF conversion mode does not preserve gene names by default)."
         )
     else:
         gene_name_note = (
-            " Note: no gene_name attributes could be backfilled from this "
-            "GFF3 -- gene symbols may be unavailable for this reference "
-            "(raw gene IDs will be used instead wherever a symbol is "
-            "expected)."
+            " Note: no gene-level records could be found in this GFF3 to resolve gene names "
+            "from -- gene symbols may be unavailable for this reference (raw gene IDs will be "
+            "used instead wherever a symbol is expected)."
         )
 
     return True, gtf_path, (

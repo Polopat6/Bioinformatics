@@ -96,6 +96,52 @@ grep features.tsv to figure out what's wrong.
 STARsolo's Solo.out/Gene/filtered/ directory mirrors Cell Ranger's own
 10x-format MTX output layout, loaded via the standard Bioconductor
 DropletUtils::read10xCounts() function.
+
+--- Ambient-gene table Ensembl-ID -> gene-name resolution (2026-08-25) ---
+A real reported usability gap: the "Top genes contributing to ambient
+RNA signal" table/plot showed bare Ensembl gene IDs (e.g.
+"gene:ENSG00000251562") instead of readable gene symbols, even though
+this project's own reference has real gene names for the vast majority
+of genes. Two things confirmed together:
+
+1. The R script's own top_ambient_genes.csv "symbol" column is sourced
+   directly from the loaded SingleCellExperiment's rowData()$Symbol --
+   which itself comes straight from STARsolo's own features.tsv column
+   2, populated once, at genome-index-build time, from whatever the
+   reference GTF's gene_name attribute said for each gene (or a
+   fallback if that attribute was missing/empty).
+
+2. The literal "gene:" PREFIX visible in the reported IDs is Ensembl's
+   own GFF3 "ID" attribute convention (e.g. "ID=gene:ENSG00000251562"),
+   NOT a normal GTF gene_id or gene_name value -- this is a strong,
+   specific clue that whatever produced this reference's gene_name
+   values fell back to a GFF3 "ID" attribute rather than a genuine
+   "Name" attribute for at least some genes (most likely tied to this
+   project's own GFF3-to-GTF conversion fallback path used when a
+   species' direct GTF download isn't available -- see
+   reference_manager.py's own backfill_gene_names_from_gff3(), which is
+   OUTSIDE this module's own scope to fix directly, since that fallback
+   backfill logic lives in reference_manager.py, not here).
+
+Rather than requiring that separate root cause to be fixed first,
+map_gene_ids_to_symbols() below provides an immediate, self-contained
+remediation: given a list of gene IDs and a reference GTF path, it
+builds a {gene_id: gene_name} lookup by re-parsing the GTF's OWN
+gene_name attribute directly (the same attribute already used
+elsewhere in this module, e.g. get_mito_gene_symbols_from_gtf()) --
+matching an incoming ID against the GTF's own gene_id value BOTH with
+and without a "gene:"-style prefix (so this works correctly regardless
+of which form either side happens to be in), and explicitly REFUSING to
+treat a gene_name value that itself starts with "gene:" as a real,
+usable name (since that would just be re-surfacing the same underlying
+problem this function exists to work around).
+
+read_top_ambient_genes() now accepts an optional gtf_path parameter --
+when given, it overlays any better-resolved gene names it finds onto
+the "symbol" column read from disk, falling back to whatever was
+already in that column for any gene_id this lookup can't improve on
+(e.g. a genuinely unnamed/novel gene, which legitimately has no real
+symbol to show).
 """
 import gzip
 import json
@@ -488,6 +534,111 @@ def get_mito_gene_ids_from_gtf_by_contigs(gtf_path, contigs):
             if match:
                 gene_ids.add(match.group(1).strip())
     return sorted(gene_ids)
+
+
+# ---------------------------------------------------------------------------
+# Ambient-gene table Ensembl-ID -> gene-name resolution (2026-08-25) --
+# see this module's own docstring for the full rationale.
+# ---------------------------------------------------------------------------
+
+def map_gene_ids_to_symbols(gene_ids, gtf_path):
+    """
+    Build a {gene_id: gene_name} lookup dict for exactly the given
+    gene_ids, by re-parsing gtf_path's own gene_name attribute --
+    intended for overlaying real, readable gene symbols onto a table
+    that currently only shows raw Ensembl IDs (see this module's own
+    docstring, "Ambient-gene table Ensembl-ID -> gene-name resolution",
+    for the confirmed real bug this addresses).
+
+    Handles Ensembl GFF3-style "gene:"-prefixed IDs transparently in
+    BOTH directions: an incoming gene_id may or may not have this
+    prefix, and the GTF's own gene_id values may or may not have it
+    either (this can vary depending on exactly how a given reference
+    was produced) -- this function matches an incoming ID against the
+    GTF's own gene_id value with the prefix stripped from EITHER side
+    before comparing, so a real match is found regardless of which
+    form either side happens to be in.
+
+    Deliberately REFUSES to treat a gene_name value that ITSELF starts
+    with "gene:" as a usable real name -- a reference whose gene_name
+    attribute was backfilled from a GFF3 "ID" attribute rather than a
+    genuine "Name" attribute would otherwise just resurface the exact
+    same underlying problem this function exists to work around,
+    silently disguised as if it were a real improvement.
+
+    Returns a dict containing ONLY the gene_ids that had a resolvable,
+    non-empty, non-"gene:"-prefixed gene_name -- callers should fall
+    back to whatever they already have (e.g. the original gene_id, or
+    an existing-but-unhelpful symbol value) for any gene_id NOT present
+    in the returned dict, rather than assuming every requested ID will
+    have an entry (a real, unnamed/novel gene legitimately has no
+    resolvable symbol at all).
+    """
+    if not gtf_path or not os.path.isfile(gtf_path) or not gene_ids:
+        return {}
+
+    target_ids = {str(g) for g in gene_ids}
+
+    def _strip_prefix(gid):
+        return gid[len("gene:"):] if gid.startswith("gene:") else gid
+
+    # Index every target ID by its prefix-STRIPPED form, so a GTF whose
+    # own gene_id values are stored WITHOUT the "gene:" prefix (the
+    # ordinary case) still matches an incoming ID that DOES carry that
+    # prefix, and vice versa -- see this function's own docstring.
+    stripped_to_originals = {}
+    for gid in target_ids:
+        stripped_to_originals.setdefault(_strip_prefix(gid), []).append(gid)
+
+    gene_id_pattern = re.compile(r'gene_id[\s=]+"?([^";]+)"?')
+    gene_name_pattern = re.compile(r'gene_name[\s=]+"?([^";]+)"?')
+
+    resolved = {}
+    remaining_originals = set(target_ids)
+
+    with open(gtf_path, "r", errors="replace") as f:
+        for line in f:
+            if not remaining_originals:
+                break  # every requested ID already resolved -- stop early
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) < 9:
+                continue
+
+            id_match = gene_id_pattern.search(fields[8])
+            if not id_match:
+                continue
+            raw_gene_id = id_match.group(1).strip()
+            stripped_gene_id = _strip_prefix(raw_gene_id)
+
+            matched_originals = []
+            if raw_gene_id in remaining_originals:
+                matched_originals.append(raw_gene_id)
+            if stripped_gene_id in stripped_to_originals:
+                for original in stripped_to_originals[stripped_gene_id]:
+                    if original in remaining_originals and original not in matched_originals:
+                        matched_originals.append(original)
+
+            if not matched_originals:
+                continue
+
+            name_match = gene_name_pattern.search(fields[8])
+            if not name_match:
+                continue
+            name = name_match.group(1).strip()
+            # Refuse a "gene:"-prefixed gene_name value -- see this
+            # function's own docstring for why this would just
+            # resurface the same underlying problem.
+            if not name or name.startswith("gene:"):
+                continue
+
+            for original in matched_originals:
+                resolved[original] = name
+                remaining_originals.discard(original)
+
+    return resolved
+
 
 # ---------------------------------------------------------------------------
 # Stale STAR index diagnostic (2026-08-17) -- see module docstring
@@ -1092,11 +1243,36 @@ def corrected_counts_path(output_dir):
     return os.path.join(output_dir, "corrected_counts.mtx")
 
 
-def read_top_ambient_genes(output_dir):
+def read_top_ambient_genes(output_dir, gtf_path=None):
+    """
+    Read top_ambient_genes.csv, optionally overlaying better-resolved
+    gene names onto its "symbol" column -- see this module's own
+    docstring, "Ambient-gene table Ensembl-ID -> gene-name resolution",
+    for the full rationale.
+
+    gtf_path: if given, map_gene_ids_to_symbols() is used to look up a
+        real gene name directly from this GTF for every gene_id in the
+        table, overriding whatever was already in the "symbol" column
+        wherever a better name is found. Any gene_id this lookup can't
+        improve on (e.g. a genuinely unnamed/novel gene) keeps its
+        original "symbol" value unchanged -- this is a pure, best-
+        effort overlay, never a destructive replacement of the whole
+        column.
+    """
     path = os.path.join(output_dir, "top_ambient_genes.csv")
     if not os.path.exists(path):
         return None
-    return pd.read_csv(path)
+    df = pd.read_csv(path)
+
+    if gtf_path and "gene_id" in df.columns and "symbol" in df.columns:
+        id_to_name = map_gene_ids_to_symbols(df["gene_id"].astype(str).tolist(), gtf_path)
+        if id_to_name:
+            df["symbol"] = [
+                id_to_name.get(str(gid), existing_symbol)
+                for gid, existing_symbol in zip(df["gene_id"], df["symbol"])
+            ]
+
+    return df
 
 
 def read_doubletfinder_pk_sweep(output_dir):

@@ -1,6 +1,5 @@
 """
 app.py
-
 Thin router / entry point for the Multi-Omics Bioinformatics Portal.
 This file should rarely need to change. All workspace-specific logic lives
 in its own module:
@@ -15,74 +14,108 @@ in its own module:
     through STARsolo alignment/cell-calling, plus a Phase 2 Cell-level QC
     page; see that module's own docstring for scope -- droplet-based UMI
     methods only)
+  - single_cell/sc_downstream_workspace.py -> Single-cell RNA-Seq Phase 3
+    (multi-sample downstream analysis: normalization through clustering,
+    embeddings, cell-type annotation, pseudobulk -> DESeq2 bridge, and
+    compositional analysis; see that module's own docstring for scope)
+  - auth_manager.py -> Authentication (login/bootstrap) and admin-managed
+    custom roles/permissions -- see that module's own docstring for the
+    full design (built-in admin/tech roles, admin-definable custom roles,
+    per-action permission catalog).
 
 Keeping workspaces in separate files means work on one pipeline (e.g. Bulk
 RNA-Seq) can never accidentally break another (e.g. Spatial Transcriptomics).
 
-### Sidebar structure
+### Authentication gate (2026-08-24) ---
 
-Rather than one long flat list of radio buttons, workspace steps are grouped
-into collapsible sidebar drawers ("expanders") -- one per pipeline -- via
-render_pipeline_section() below. "Portal Home" and "Setup & Deployment" both
-sit outside any pipeline group as standalone buttons, since neither is a
-pipeline step -- Setup & Deployment is a cross-cutting utility page (see
-setup_workspace.py's own module docstring), exactly like Portal Home.
+Every run of this script now starts by calling auth.render_login_gate()
+BEFORE any sidebar/routing/workspace code executes at all -- if that
+call returns False (no one is logged in yet: either a brand-new
+deployment showing the one-time "create first admin" bootstrap form, or
+an existing deployment showing an ordinary login form), this script
+returns immediately without rendering the sidebar, any workspace, or
+leaking ANY information about what pipelines/projects exist to an
+unauthenticated visitor. Only once render_login_gate() returns True
+(a real, verified session) does the rest of this file's existing
+routing logic run, completely unchanged from before this gate was
+added -- auth_manager.py's own role/permission checks are enforced
+individually, deeper inside each gated action (e.g.
+project_manager.py's delete flow, setup_workspace.py's eggNOG/install/
+HPC sections), not by this top-level gate, which only answers "is
+ANYONE allowed to see the app at all right now."
 
-Because a workspace's step now lives inside a _per-pipeline_ radio widget
-instead of one single radio, routing can no longer be driven directly by a
-single widget's session_state value. Instead, a plain (non-widget) key,
-st.session_state["active_workspace"], is the single source of truth used
-for routing below. It is updated in one of two ways:
-  1. A grouped radio's on_change callback, fired the moment the user
-     picks a step inside an expanded pipeline drawer.
-  2. The pending-nav-request block below, used when another workspace
-     module (e.g. the "Proceed to Trimming" button at the end of
-     bulk_rnaseq_workspace.py, singlecell_workspace.py's own "Proceed to
-     Phase 2: Cell-level QC" button, or project_actions.py's "Begin DE
-     Analysis" hand-off from Auto/Monitor Mode) requests navigation by
-     setting st.session_state["nav_request"] and calling st.rerun().
+auth.render_user_badge() is called once, in the sidebar, immediately
+after the gate passes -- shows the current username/role and a logout
+button on every page for the rest of the session.
 
-Note on cross-page navigation and expander state: Streamlit's st.expander
-has no key parameter (even as of Streamlit 1.52), so it cannot track its
-own open/closed state in session_state, and manually toggling one via the
-UI is not visible to the script until some other rerun occurs -- at which
-point whatever expanded= value the code passes will win. To make this
-work _with_ that constraint rather than fight it, each pipeline's drawer is
-simply expanded whenever it contains the currently active_workspace, and
-collapsed otherwise. In practice this means the drawer for whichever
-pipeline you're currently working in stays open (revealing its steps),
-while other pipelines stay tucked away until you navigate into them.
+A new standalone sidebar entry, "👥 User & Role Management" (mirroring
+"⚙️ Setup & Deployment"'s own existing pattern -- a cross-cutting
+utility page outside any pipeline drawer), routes to
+auth.render_user_management(). That page independently re-enforces its
+own admin-only check the moment it renders (see auth_manager.py's own
+render_user_management() docstring) -- this router file does not
+attempt its own separate admin check before routing to it, matching
+this app's own established "let the destination page re-verify its own
+authorization, don't rely solely on a hidden sidebar entry" convention
+already used for the Setup & Deployment page's own internal admin-gated
+sections.
 
 --- single_cell/ subfolder import note (2026-08-17) ---
 singlecell_workspace.py and its supporting modules (sc_project_manager.py,
 chemistry_manager.py, singlecell_ingestion_manager.py,
-singlecell_trim_manager.py, starsolo_manager.py, sc_cellqc_manager.py)
-live in a single_cell/ subfolder rather than directly alongside this
-file, for cleaner file organization as this pipeline grows. Since
-Streamlit is always launched via `cd repo/app && streamlit run app.py`
-(see DEPLOYMENT.md), app.py's own working directory is repo/app/ --
+singlecell_trim_manager.py, starsolo_manager.py, sc_cellqc_manager.py,
+sc_downstream_manager.py, sc_downstream_workspace.py) live in a
+single_cell/ subfolder rather than directly alongside this file, for
+cleaner file organization as this pipeline grows. Since Streamlit is
+always launched via `cd repo/app && streamlit run app.py` (see
+DEPLOYMENT.md), app.py's own working directory is repo/app/ --
 sys.path.insert below adds single_cell/ onto the import path so `import
-singlecell_workspace` resolves normally, the same as any other
-top-level module in this app, without needing package-relative imports
-or an __init__.py-based package structure.
+singlecell_workspace` (and `import sc_downstream_workspace`) resolve
+normally, the same as any other top-level module in this app, without
+needing package-relative imports or an __init__.py-based package
+structure.
 
---- Single-cell Phase 2 placeholder route added (2026-08-17) ---
-Added "🔬 SC Cell-level QC" as a fourth option in the "single_cell"
-pipeline group below, plus a matching elif branch calling
-singlecell_workspace.render_cell_qc(). This was added specifically so
-Step 6's (STARsolo alignment) "➡️ Proceed to Phase 2: Cell-level QC"
-button has a real, working navigation target -- without a matching
-PIPELINE_GROUPS entry AND elif branch, that button's nav_request would
-set active_workspace to a value matching no branch below, silently
-rendering a blank page. render_cell_qc() itself now runs real Phase 2
-logic (scDblFinder doublet detection, DecontX/SoupX ambient RNA
-correction, adaptive per-cell filtering) via sc_cellqc_manager.py.
+--- Phase 3 sidebar entry renamed (2026-08-25, shortened again same day) ---
+The Single-cell Phase 3 downstream-analysis sidebar entry was renamed
+from the original generic "📊 SC Downstream Analysis" to a more
+informative name -- per direct user request, to make the sidebar itself
+more informative about what this step actually does, rather than
+requiring a user to already know that "downstream analysis" means
+clustering and cell-type annotation. The FIRST more-informative name
+tried ("📊 SC Analysis: Normalization → Clustering → Cell-Type
+Annotation") was itself then shortened, again per direct user feedback
+that it was too long, to the current "📊 SC Analysis: Clustering & Cell
+Annotation". This same exact string is also used by
+singlecell_workspace.py's own "Proceed to SC Analysis..." button -- both
+files reference the identical string value via a shared named constant
+(singlecell_workspace.SC_DOWNSTREAM_ANALYSIS_OPTION, imported and reused
+directly below rather than re-typed as a second, independent string
+literal here) specifically so these two files can never silently drift
+out of sync with each other if this name is ever changed again in the
+future. This is a pure rename -- the underlying route still points at
+the exact same sc_downstream_workspace.render() call as before; no
+change to that workspace's own scope or behavior.
 """
 import os
 import sys
 from functools import partial
 
 import streamlit as st
+
+import auth_manager as auth
+
+# 1. Global Setup Layout -- set_page_config must run before ANY other
+# Streamlit call in the script, including the login gate below, per
+# Streamlit's own requirement that it be the first st.* call made.
+st.set_page_config(layout="wide", page_title="Multi-Omics Bioinformatics Portal")
+
+# ---------------------------------------------------------------------
+# Authentication gate -- must run before any sidebar/routing/workspace
+# code below. See this file's own module docstring, "Authentication
+# gate", for the full rationale.
+# ---------------------------------------------------------------------
+if not auth.render_login_gate():
+    st.stop()
 
 # Make single_cell/'s modules importable as plain top-level modules (see
 # this file's own docstring note above) -- inserted once, at import time,
@@ -100,12 +133,21 @@ import differential_expression_workspace
 import ontology_workspace
 import setup_workspace
 import singlecell_workspace
+import sc_downstream_workspace
 
-# 1. Global Setup Layout
-
-st.set_page_config(layout="wide", page_title="Multi-Omics Bioinformatics Portal")
 HOME_OPTION = "📊 Portal Home"
 SETUP_OPTION = "⚙️ Setup & Deployment"
+USER_MANAGEMENT_OPTION = "👥 User & Role Management"
+
+# --- Phase 3 sidebar entry renamed (2026-08-25) -- see this file's own
+# module docstring, "Phase 3 sidebar entry renamed", for the full
+# rationale. Reused DIRECTLY from singlecell_workspace.py's own shared
+# named constant (rather than re-typed as a second, independent string
+# literal here) so this router's own PIPELINE_GROUPS/routing entry and
+# that module's own "Proceed to SC Analysis..." button can never
+# silently drift out of sync with each other if this name is ever
+# changed again in the future.
+SC_DOWNSTREAM_ANALYSIS_OPTION = singlecell_workspace.SC_DOWNSTREAM_ANALYSIS_OPTION
 
 # Pipeline groups: each becomes one collapsible sidebar drawer titled title,
 # containing a radio button list of that pipeline's sequential workspace
@@ -115,10 +157,11 @@ SETUP_OPTION = "⚙️ Setup & Deployment"
 # --- Drawer order (2026-08-17) ---
 # Reordered to: Portal Home (standalone button, unaffected by this dict's
 # order) -> Bulk RNA-Seq -> Single-cell RNA-Seq -> Spatial Transcriptomics
-# -> Advanced Modes -> Setup & Deployment (standalone button). Python
-# dicts preserve insertion order, and render_pipeline_section() below
-# iterates PIPELINE_GROUPS.items() in that same order, so this dict's
-# literal key order below IS the sidebar's actual top-to-bottom order.
+# -> Advanced Modes -> Setup & Deployment (standalone button) -> User &
+# Role Management (standalone button). Python dicts preserve insertion
+# order, and render_pipeline_section() below iterates
+# PIPELINE_GROUPS.items() in that same order, so this dict's literal key
+# order below IS the sidebar's actual top-to-bottom order.
 PIPELINE_GROUPS = {
     "bulk_rnaseq": {
         "title": "🧬 Bulk RNA-Seq",
@@ -136,28 +179,14 @@ PIPELINE_GROUPS = {
     # meaningfully different step sequence (chemistry detection, R1/R2-
     # aware trimming, STARsolo cell-calling).
     #
-    # --- Multi-option fix (2026-08-17) ---
-    # This drawer previously had only ONE option ("🧫 Single-cell
-    # RNA-Seq" covering the whole pipeline as a single page), which was a
-    # real navigation bug, not just a stylistic difference from Bulk
-    # RNA-Seq: Streamlit only fires a radio widget's on_change callback
-    # when its value actually CHANGES. With only one possible option,
-    # that radio's value could never change, so on_change could never
-    # fire, so clicking it could never navigate there at all. Splitting
-    # into genuinely distinct step options -- mirroring Bulk RNA-Seq's
-    # own Pipeline/Ingestion -> Trimming & Post-Trim QC -> Alignment &
-    # Counts grouping exactly -- fixes that bug as a direct consequence
-    # of giving this drawer the same step-by-step radio flow Bulk
-    # RNA-Seq already has, not as a separate patch on top of it.
-    #
-    # --- Phase 2 route added (2026-08-17) ---
-    # "🔬 SC Cell-level QC" appended as a fourth option -- gives Step 6's
-    # "Proceed to Phase 2" button (singlecell_workspace.py) a real
-    # navigation target; see this file's own module docstring section
-    # "Single-cell Phase 2 placeholder route added" above for why both
-    # this entry AND the matching elif branch below are required
-    # together. Later phases (clustering/annotation, pseudobulk DE) are
-    # planned as additional options appended to this same list.
+    # --- Phase 3 route (2026-08-23, renamed 2026-08-25) ---
+    # SC_DOWNSTREAM_ANALYSIS_OPTION routes to
+    # sc_downstream_workspace.render(), covering ALL of Phase 3 (Steps
+    # 1-10) as a single page -- see that module's own docstring for why
+    # Phase 3 is not split across multiple pages the way Phase 1/2 are.
+    # See this file's own module docstring, "Phase 3 sidebar entry
+    # renamed", for why this is now a shared named constant rather than
+    # a bare string literal.
     "single_cell": {
         "title": "🧫 Single-cell RNA-Seq",
         "options": [
@@ -165,6 +194,7 @@ PIPELINE_GROUPS = {
             "🧪 SC Trimming & Post-Trim QC",
             "🧬 SC Alignment & Cell-Calling",
             "🔬 SC Cell-level QC",
+            SC_DOWNSTREAM_ANALYSIS_OPTION,
         ],
     },
     "spatial": {
@@ -247,6 +277,7 @@ if "active_workspace" not in st.session_state:
 # 2. Main Portal Routing Menu
 
 st.sidebar.title("🧬 Multi-Omics Portal")
+auth.render_user_badge()
 st.sidebar.markdown("---")
 
 if st.sidebar.button(HOME_OPTION, key="home_button", use_container_width=True):
@@ -263,6 +294,19 @@ st.sidebar.markdown("---")
 # does not belong inside any PIPELINE_GROUPS drawer.
 if st.sidebar.button(SETUP_OPTION, key="setup_button", use_container_width=True):
     st.session_state["active_workspace"] = SETUP_OPTION
+
+# Standalone button, same pattern as SETUP_OPTION above -- User & Role
+# Management is likewise a cross-cutting utility page, not a pipeline
+# step. Shown to EVERY logged-in session regardless of role (not just
+# admins) -- auth.render_user_management() itself immediately shows an
+# access-denied message and renders nothing further for a non-admin
+# session (see that function's own docstring) rather than this router
+# file trying to hide the button for non-admins ahead of time. This
+# matches setup_workspace.py's own established convention of gating
+# each admin-only SECTION independently, rather than hiding an entire
+# page's sidebar entry based on role.
+if st.sidebar.button(USER_MANAGEMENT_OPTION, key="user_management_button", use_container_width=True):
+    st.session_state["active_workspace"] = USER_MANAGEMENT_OPTION
 
 st.sidebar.markdown("---")
 
@@ -344,6 +388,13 @@ elif assay_choice == SETUP_OPTION:
     setup_workspace.render()
 
 # =========================================
+# 👥 WORKSPACE: USER & ROLE MANAGEMENT
+# =========================================
+
+elif assay_choice == USER_MANAGEMENT_OPTION:
+    auth.render_user_management()
+
+# =========================================
 # 🧫 WORKSPACE 9: SINGLE-CELL RNA-SEQ
 # =========================================
 
@@ -361,3 +412,13 @@ elif assay_choice == "🧬 SC Alignment & Cell-Calling":
 # singlecell_workspace.render_cell_qc()'s own docstring for context.
 elif assay_choice == "🔬 SC Cell-level QC":
     singlecell_workspace.render_cell_qc()
+
+# Phase 3 route (2026-08-23, renamed 2026-08-25) -- see this file's own
+# module docstring section "Phase 3 sidebar entry renamed" and
+# sc_downstream_workspace.render()'s own docstring for context. Routes
+# to the SAME single page for all of Steps 1-10 (see that module's own
+# docstring for why Phase 3 is not split across multiple pages the way
+# Phase 1/2 are) -- this is a pure rename of the sidebar entry string;
+# the underlying route/behavior is completely unchanged.
+elif assay_choice == SC_DOWNSTREAM_ANALYSIS_OPTION:
+    sc_downstream_workspace.render()

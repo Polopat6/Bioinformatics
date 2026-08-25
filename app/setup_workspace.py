@@ -3,41 +3,59 @@ setup_workspace.py
 
 The "⚙️ Setup & Deployment" page -- a standalone sidebar entry (alongside
 "📊 Portal Home", outside any pipeline drawer) since it's a cross-cutting
-utility page rather than a pipeline step. Three sections:
+utility page rather than a pipeline step. Four sections:
 
 1. Environment & Dependency Check -- live, on-demand checks of whether
    every Python package / CLI tool / R+Bioconductor package this app
    needs (per environment.yml, the project's single source of truth for
    dependencies -- see DEPLOYMENT.md) is actually present on THIS
-   machine, right now. This exists precisely because of the real gap
-   found during HPC deployment testing: code comments claimed FastQC/
-   MultiQC/SRA Toolkit/several R packages were "in the Dockerfile", but
-   requirements.txt only ever tracked 4 Python packages and had no way
-   to express the rest -- so the gap went undiscovered until specific
-   workflow steps failed downstream. This page surfaces that gap
-   immediately and in one place instead.
+   machine, right now.
 
-2. Install Missing Dependencies -- (2026-08-17) once a check finds
-   anything missing, offers a one-click "Install Missing Packages"
-   button that launches a background `mamba install`/`conda install`
-   (via deployment_manager.py) for exactly the conda package specs
-   environment.yml itself declares -- so an install triggered from this
-   page can never drift from what environment.yml says should be
-   installed. Runs as a background process (same subprocess.Popen +
-   JSON status-file polling pattern used elsewhere in this app for
-   long-running work, e.g. advanced_mode_orchestrator's pipeline runs)
-   with a live log tail, since a real dependency-solve + download can
-   take several minutes -- long enough that blocking Streamlit's single-
-   threaded script execution on it would freeze the whole page.
+2. Install Missing Dependencies -- once a check finds anything missing,
+   offers a selectable, per-package "Install Missing Packages" flow that
+   launches a background `mamba install`/`conda install` (via
+   deployment_manager.py) for exactly the conda package specs
+   environment.yml itself declares.
 
-3. HPC Connections -- save, test, and manage SSH connection profiles to
-   remote HPC clusters via hpc_manager.py. Passwords are never persisted
-   (see hpc_manager.py's module docstring for the full security design);
-   SSH-key or ssh-agent auth is the recommended path for any saved
-   connection. This is scoped deliberately to connectivity/environment
-   detection only -- NOT remote job submission/execution, which would be
-   a separate, explicitly-scoped future feature building on top of a
-   working, tested connection profile.
+3. eggNOG-mapper Database Setup -- a large (~49GB), one-time, ADMIN-GATED
+   shared-resource download for eggNOG-mapper's orthology database (see
+   "Admin-gated eggNOG database setup" section below for why this is now
+   role-gated, not just UI-separated).
+
+4. HPC Connections -- save, test, and manage SSH connection profiles to
+   remote HPC clusters via hpc_manager.py.
+
+--- Permission-gated eggNOG database setup (2026-08-24, updated for
+    custom roles) ---
+This ~49GB download is a large, slow, disk-heavy, shared-resource action
+with real potential to disrupt a shared HPC allocation's available
+scratch space for every other user/project if triggered casually or by
+mistake -- gated behind the "manage_eggnog_database" permission (see
+auth_manager.PERMISSION_CATALOG), on top of (not instead of) the
+existing disk-space pre-flight check and confirmation checkbox. This
+mirrors project_manager.py's own identical reasoning for gating
+permanent project deletion behind a specific permission rather than a
+fixed admin-only check: the existing safeguards protect against a
+PERMITTED user accidentally triggering this by mistake; the permission
+check protects against an unpermitted user being ABLE to trigger it at
+all -- while still letting an admin delegate specifically THIS
+capability to a custom role without granting every other admin-only
+action too. As with project_manager.py's own delete flow,
+_render_eggnog_download_controls() independently re-checks
+auth.has_permission("manage_eggnog_database") at its own top as defense
+in depth.
+
+--- Permission-gated Install Dependencies + HPC Connections
+    (2026-08-24) ---
+These two sections were previously completely UNGATED (any logged-in
+session could use them) -- now checked against "install_dependencies"
+and "manage_hpc_connections" respectively. The built-in "tech" role is
+seeded with BOTH of these permissions by default (see auth_manager.py's
+own _DEFAULT_TECH_PERMISSIONS), specifically so introducing this check
+does not silently take away access an ordinary user already had before
+this permission system existed -- an admin can still choose to remove
+either permission from the tech role (or any custom role) afterward if
+tighter control is actually wanted.
 
 --- Single-cell Phase 2 dependency-detection gap fix (2026-08-17) ---
 A real reported bug: the new Cell-level QC packages (DropletUtils,
@@ -54,93 +72,87 @@ root-cause reason, and the stale, deprecated kaleido pin
 ("python-kaleido=0.2.*") was corrected to match environment.yml's own
 already-unpinned entry.
 
---- Batched R-check crash-isolation + timeout bytes/str fixes (2026-08-17,
-    later same day) ---
-Two real reported bugs, both in _check_r_packages_batched(): (1) a hard
-R error loading one heavy package (e.g. Seurat, or celda's rstan/
-stanheaders dependency) could abort the entire batched Rscript call and
-wipe out previously-printed results for OTHER, perfectly-fine packages
-checked earlier in the same run -- fixed by wrapping each
-requireNamespace() call in its own tryCatch(), plus flush(stdout())
-after every line as defense in depth; (2) a genuine timeout on a slow-
-loading package crashed with `TypeError: a bytes-like object is
-required, not 'str'`, because Python's subprocess.TimeoutExpired.stdout
-is raw bytes even when text=True was passed to subprocess.run() -- a
-documented quirk where that decoding only applies to a successful
-CompletedProcess, not the timeout exception. Fixed by making
-_parse_r_check_output() defensively decode bytes input. See that
-function's and _check_r_packages_batched()'s own docstrings for the
-full detail on both fixes.
+--- Per-package isolation redesign (2026-08-23) ---
+A real HPC deployment run surfaced a real bug: the previous single-
+shared-Rscript-call batching design meant a hang on one heavy package
+(e.g. Seurat) exhausted the ENTIRE batch's one shared timeout, and
+every package listed AFTER the stuck one never got checked at all --
+confirmed from a real run where every package from Seurat onward came
+back "could not be checked", a clean cutoff exactly at the first heavy
+package in the list. _check_r_packages_batched() was replaced with
+_check_r_packages_isolated(): each package is checked via its OWN
+subprocess call with its OWN independent timeout, run CONCURRENTLY via
+a small thread pool (max_workers=3), so a hang or crash on ANY one
+package can only ever affect that single package's own result.
 
---- GitHub-only R package: real one-click install, not just a manual
-    command (2026-08-17, later same day) ---
+--- Phase 3.9 compositional analysis dependency added (2026-08-23) ---
+Added "speckle" to _R_PACKAGES -- powers Step 10 (Compositional
+Analysis)'s recommended-default propeller method.
+
+--- Selective/opt-in install for large or narrow-use packages
+    (2026-08-23) ---
+"Install Missing Dependencies" now renders each missing package as its
+own individually-selectable checkbox -- checked by default for
+ordinary, broadly-needed packages, but UNCHECKED by default for large/
+narrow-use packages (eggnog-mapper + all 7 org.*.eg.db packages, see
+_OPTIONAL_INSTALL_INFO) since most installs don't need every one.
+
+--- Checkbox-triggered re-check bug fix (2026-08-23) ---
+_render_environment_check() previously re-ran the ENTIRE (slow) check
+on every Streamlit rerun, including reruns triggered by unrelated
+widgets elsewhere on the page (e.g. an install checkbox). Fixed by
+splitting the actual checking work into _run_environment_check(),
+called ONLY when "Check Environment" is clicked, with results cached
+in session_state; _render_environment_check() now purely renders from
+that cache.
+
+--- GitHub-only R package: real one-click install (2026-08-17) ---
 DoubletFinder has no conda/CRAN/Bioconductor release at all (GitHub-
-only: chris-mcginnis-ucsf/DoubletFinder). Previously, if missing, this
-page only ever showed the manual `remotes::install_github(...)` command
-for the user to copy/run themselves. Now, if r-remotes is CONFIRMED
-installed (checked via the same batched Rscript call as every other R
-package), a real "📥 Install via GitHub" button is offered instead,
-launching the actual install in the background via
-deployment_manager.launch_github_r_install() -- the SAME background-
-thread + JSON-status-file + log-tail polling pattern already used for
-every conda-based install on this page (see that function's own
-docstring). If r-remotes is NOT yet installed (or its own check
-couldn't be confirmed), the manual command is still shown as a fallback,
-along with a nudge that installing r-remotes first (via "Install
-Missing Dependencies" below) will unlock the one-click button on the
-next check. The install command itself is built programmatically (see
-deployment_manager.build_github_r_install_command()) from a plain
-"owner/repo" string rather than a hand-written shell command, so the
-button's actual subprocess call and the displayed fallback command can
-never silently drift apart from each other.
+only). If r-remotes is confirmed installed, a real "📥 Install via
+GitHub" button is offered, launching the install via
+deployment_manager.launch_github_r_install().
+
+--- Single-cell original-format BAM recovery dependency added
+    (2026-08-24) ---
+Added "bamtofastq" to _CLI_TOOLS -- see that entry's own inline comment
+for the full rationale (recovering usable FASTQ, with intact barcode/
+UMI sequences, from an original-format 10x BAM for SRA runs whose
+standard FASTQ extraction lacks that data entirely).
 """
+import concurrent.futures
 import importlib.util
+import os
 import shutil
 import subprocess
 
 import streamlit as st
 
+import auth_manager as auth
 import hpc_manager as hpc
 import deployment_manager as dm
+import eggnog_manager as egm
+import reference_manager as rm
 
 # ---------------------------------------------------------------------------
 # Environment & Dependency Check
 # ---------------------------------------------------------------------------
-# Kept in sync BY HAND with environment.yml's dependency list -- if you add
-# a package there, add its corresponding entry here too (and vice versa), so
-# this page never silently drifts out of sync with the actual single source
-# of truth. Each entry now also carries its OWN conda package spec (name +
-# version pin, copied exactly from environment.yml) so "Install Missing
-# Dependencies" below can install precisely what environment.yml declares --
-# never a guessed or differently-pinned version.
-#
-# There is no automated way to parse environment.yml generically into "how
-# do I check if this is importable/on PATH" + "what conda package installs
-# it", since conda package names, Python import names, R package names, and
-# CLI executable names frequently all differ from one another for the same
-# logical dependency (e.g. conda package "python-kaleido" -> Python import
-# "kaleido"; conda package "star" -> CLI executable "STAR").
-
 _PYTHON_PACKAGES = {
     "streamlit": {"label": "streamlit", "conda_spec": "streamlit=1.37.*"},
     "pandas": {"label": "pandas", "conda_spec": "pandas=2.2.*"},
     "plotly": {"label": "plotly", "conda_spec": "plotly=5.22.*"},
-    # UNPINNED -- corrected 2026-08-17 from the stale, deprecated
-    # "python-kaleido=0.2.*" pin, matching environment.yml's own fix.
     "kaleido": {"label": "python-kaleido (Plotly PDF/image export)", "conda_spec": "python-kaleido"},
     "duckdb": {"label": "duckdb", "conda_spec": "duckdb=1.0.*"},
     "openpyxl": {"label": "openpyxl (.xlsx metadata upload support)", "conda_spec": "openpyxl=3.1.*"},
     "scipy": {"label": "scipy", "conda_spec": "scipy=1.13.*"},
     "paramiko": {"label": "paramiko (SSH connections, this page's own HPC section)", "conda_spec": "paramiko=3.4.*"},
     "requests": {"label": "requests (NCBI/SRA lookups)", "conda_spec": "requests=2.32.*"},
-
-    # --- Single-cell RNA-Seq: Python analysis layer (Phase 3) additions ---
     "scanpy": {"label": "scanpy (single-cell normalization/clustering/UMAP)", "conda_spec": "scanpy"},
     "anndata": {"label": "anndata (scanpy's underlying data structure)", "conda_spec": "anndata"},
     "igraph": {"label": "python-igraph (required by leidenalg for clustering)", "conda_spec": "python-igraph"},
     "leidenalg": {"label": "leidenalg (Leiden clustering algorithm)", "conda_spec": "leidenalg"},
     "harmonypy": {"label": "harmonypy (Harmony batch-correction algorithm)", "conda_spec": "harmonypy"},
     "celltypist": {"label": "celltypist (optional automated cell-type annotation)", "conda_spec": "celltypist"},
+    "sklearn": {"label": "scikit-learn (3D t-SNE fallback, called directly)", "conda_spec": "scikit-learn"},
 }
 
 _CLI_TOOLS = {
@@ -149,33 +161,26 @@ _CLI_TOOLS = {
     "fastp": {"label": "fastp (adapter/quality trimming)", "conda_spec": "fastp=0.23.*"},
     "salmon": {"label": "Salmon (pseudo-alignment/quantification)", "conda_spec": "salmon=1.10.*"},
     "STAR": {"label": "STAR (splice-aware alignment)", "conda_spec": "star=2.7.11b"},
-    # prefetch and fasterq-dump both come from the same sra-tools conda
-    # package -- sharing the identical conda_spec here means the install
-    # list de-duplication in _collect_missing_specs() below correctly
-    # installs sra-tools only ONCE even if both are missing.
     "prefetch": {"label": "SRA Toolkit -- prefetch (NCBI/SRA download)", "conda_spec": "sra-tools=3.1.*"},
     "fasterq-dump": {"label": "SRA Toolkit -- fasterq-dump (NCBI/SRA download)", "conda_spec": "sra-tools=3.1.*"},
-    # --- Single-cell RNA-Seq: alevin-fry (Phase 1 optional alternate) ---
     "alevin-fry": {"label": "alevin-fry (optional faster alternate to STARsolo)", "conda_spec": "alevin-fry"},
+    "emapper.py": {"label": "emapper.py (eggNOG-mapper -- orthology-based annotation)", "conda_spec": "eggnog-mapper"},
+    "download_eggnog_data.py": {"label": "download_eggnog_data.py (eggNOG-mapper's database-download script)", "conda_spec": "eggnog-mapper"},
+    # --- Single-cell RNA-Seq: original-format BAM recovery (2026-08-24) ---
+    # Provides the `bamtofastq` executable, used by
+    # single_cell/sc_sra_manager.py's run_bamtofastq() to recover usable
+    # FASTQ (with intact cell barcode/UMI sequences) from an original-
+    # format 10x BAM, for SRA runs whose standard FASTQ extraction has no
+    # usable barcode/UMI data at all (confirmed real motivating case:
+    # Kang et al. 2018 / GSE96583, a v1-chemistry-era 10x deposition
+    # where only the cDNA read was ever uploaded to SRA as FASTQ). See
+    # that module's own docstring, "Original-format BAM recovery", for
+    # the full rationale, including why this only helps for the subset
+    # of runs that still have a free, direct-HTTP original-format copy
+    # rather than requiring the user's own paid AWS/GCP cloud account.
+    "bamtofastq": {"label": "bamtofastq (10x original-format BAM -> FASTQ recovery)", "conda_spec": "10x_bamtofastq"},
 }
 
-# One combined Rscript call checks every R/Bioconductor package at once,
-# rather than spawning a separate R subprocess per package -- R's own
-# startup overhead (loading the base R environment) is the dominant cost
-# per invocation, so batching avoids paying that cost N times over. See
-# _check_r_packages_batched() for the crash-isolation + timeout-handling
-# fixes (2026-08-17) that make this batching safe even when one package's
-# namespace load hard-errors or takes too long.
-#
-# --- Version-pinning policy correction (2026-08-17) ---
-# These conda_spec values previously included exact "=X.YY.*" patch pins
-# copied from an earlier draft of environment.yml. A real HPC install
-# failed with mamba reporting several of those exact versions as "does
-# not exist" -- Bioconductor packages are only rebuilt on Bioconductor's
-# twice-yearly release cadence and not every package gets a version bump
-# every cycle, so a hand-picked exact version can easily name a release
-# that was simply never published. These specs are now UNPINNED, exactly
-# matching environment.yml's own corrected entries.
 _R_PACKAGES = {
     "DESeq2": {"label": "DESeq2 (differential expression)", "conda_spec": "bioconductor-deseq2"},
     "jsonlite": {"label": "jsonlite (DESeq2/cell-QC job-spec I/O)", "conda_spec": "r-jsonlite"},
@@ -184,8 +189,6 @@ _R_PACKAGES = {
     "ReactomePA": {"label": "ReactomePA (Reactome pathway enrichment)", "conda_spec": "bioconductor-reactompa"},
     "GOSemSim": {"label": "GOSemSim (GO term semantic-similarity simplification)", "conda_spec": "bioconductor-gosemsim"},
     "limma": {"label": "limma (removeBatchEffect() for DESeq2's batch-adjusted PCA view)", "conda_spec": "bioconductor-limma"},
-
-    # --- Single-cell RNA-Seq: R-based cell-level QC (Phase 2) ---
     "DropletUtils": {"label": "DropletUtils (loads STARsolo's 10x-format MTX output)", "conda_spec": "bioconductor-dropletutils"},
     "scuttle": {"label": "scuttle (per-cell QC metrics + adaptive MAD thresholds)", "conda_spec": "bioconductor-scuttle"},
     "scDblFinder": {"label": "scDblFinder (doublet detection -- default method)", "conda_spec": "bioconductor-scdblfinder"},
@@ -193,27 +196,9 @@ _R_PACKAGES = {
     "SoupX": {"label": "SoupX (ambient RNA correction -- alternative method)", "conda_spec": "r-soupx"},
     "celda": {"label": "celda (provides DecontX -- ambient RNA correction, default method)", "conda_spec": "bioconductor-celda"},
     "remotes": {"label": "remotes (needed to install DoubletFinder from GitHub -- see below)", "conda_spec": "r-remotes"},
+    "speckle": {"label": "speckle (Step 10 Compositional Analysis -- propeller method, recommended default)", "conda_spec": "bioconductor-speckle"},
 }
 
-# --- DoubletFinder: special case, NOT installable via conda/mamba ---
-# DoubletFinder is not distributed via conda-forge, bioconda, CRAN, or
-# Bioconductor at all -- confirmed GitHub-only
-# (chris-mcginnis-ucsf/DoubletFinder). Its presence is still CHECKED via
-# the same batched, crash-isolated requireNamespace() call as every other
-# R package, but is rendered and handled separately in
-# _render_environment_check() -- deliberately never added to the
-# "missing" dict that feeds deployment_manager.launch_install(), since
-# that function only knows how to run conda/mamba installs and there is
-# no conda package for this to install.
-#
-# --- One-click GitHub install (2026-08-17) ---
-# github_repo (a plain "owner/repo" string) is used to build the actual
-# install command programmatically via
-# deployment_manager.build_github_r_install_command(), for BOTH the
-# real one-click button (when r-remotes is confirmed present) and the
-# manual-fallback display command (when it isn't) -- see
-# _render_environment_check()'s R-packages section for how this dict is
-# used, and this file's own module docstring for the full rationale.
 _R_GITHUB_PACKAGES = {
     "DoubletFinder": {
         "label": "DoubletFinder (optional alternate doublet-detection method)",
@@ -221,10 +206,6 @@ _R_GITHUB_PACKAGES = {
     },
 }
 
-# One entry per PRESET species in reference_manager.py's REFERENCE_CATALOG
-# -- add a new organism's org.*.db package here the same day it's added to
-# environment.yml AND to REFERENCE_CATALOG, so all three never drift out of
-# sync with each other. Unpinned for the same reason as _R_PACKAGES above.
 _R_ORGANISM_PACKAGES = {
     "org.Hs.eg.db": {"label": "org.Hs.eg.db -- human (Homo sapiens)", "conda_spec": "bioconductor-org.hs.eg.db"},
     "org.Mm.eg.db": {"label": "org.Mm.eg.db -- mouse (Mus musculus)", "conda_spec": "bioconductor-org.mm.eg.db"},
@@ -235,110 +216,76 @@ _R_ORGANISM_PACKAGES = {
     "org.EcK12.eg.db": {"label": "org.EcK12.eg.db -- E. coli strain K-12", "conda_spec": "bioconductor-org.eck12.eg.db"},
 }
 
+_OPTIONAL_INSTALL_INFO = {
+    "eggnog-mapper": (
+        "Pulls in a fairly large bioinformatics toolchain (DIAMOND, HMMER, MMseqs2, "
+        "Prodigal) -- only needed for orthology-based functional annotation on "
+        "non-model organisms. Skip this if you don't work with non-model organisms. "
+        "Note: this only controls the tool/package itself -- the much larger ~49GB "
+        "eggNOG *database* remains its own separate, admin-gated action further "
+        "down this page regardless of this checkbox."
+    ),
+    "bioconductor-org.hs.eg.db": "Human (Homo sapiens) gene annotation package -- only needed if you work with human data.",
+    "bioconductor-org.mm.eg.db": "Mouse (Mus musculus) gene annotation package -- only needed if you work with mouse data.",
+    "bioconductor-org.dm.eg.db": "Fly (Drosophila melanogaster) gene annotation package -- only needed if you work with fly data.",
+    "bioconductor-org.sc.sgd.db": "Yeast (Saccharomyces cerevisiae) gene annotation package -- only needed if you work with yeast data.",
+    "bioconductor-org.ce.eg.db": "Roundworm (Caenorhabditis elegans) gene annotation package -- only needed if you work with roundworm data.",
+    "bioconductor-org.dr.eg.db": "Zebrafish (Danio rerio) gene annotation package -- only needed if you work with zebrafish data.",
+    "bioconductor-org.eck12.eg.db": "E. coli strain K-12 gene annotation package -- only needed if you work with E. coli data.",
+}
+
 
 def _check_python_package(module_name):
-    "True if module_name can be imported in this environment, without actually importing it (avoids side effects / slow imports)."
     return importlib.util.find_spec(module_name) is not None
 
 
 def _check_cli_tool(executable_name):
-    "True if executable_name is found on PATH."
     return shutil.which(executable_name) is not None
 
 
-def _check_r_packages_batched(package_names, timeout=90):
-    """
-    Check every name in package_names in a SINGLE Rscript invocation,
-    returning (statuses: dict or None, unreached: list[str]).
-
-    statuses: {package_name: bool} for every package whose check line
-        actually executed and printed a result -- includes packages
-        confirmed present (True) AND packages confirmed absent/broken
-        (False). Returns None (instead of a dict) if Rscript itself
-        isn't on PATH at all.
-    unreached: list of requested package_names that got NO result line
-        back at all -- meaning the script terminated (crashed/timed out)
-        before that package's check ever ran. Distinguishing "confirmed
-        missing" from "never got checked" lets the UI show an honest
-        "❓ could not be checked" instead of implying a package needs
-        installing when its real status is simply unknown.
-
-    --- Crash-isolation fix (2026-08-17) ---
-    Each requireNamespace() call is wrapped in its OWN tryCatch(...,
-    error = function(e) FALSE) -- requireNamespace() actually LOADS a
-    package's namespace, unlike a simpler "is this installed" check, so
-    a package with a broken/partial install (common for heavy compiled
-    dependency chains, e.g. Seurat, or celda's rstan/stanheaders
-    dependency) can throw a hard, UNCAUGHT R error rather than quietly
-    returning FALSE -- which, unwrapped, would abort the ENTIRE batched
-    script and (since stdout is block-buffered through a pipe) could
-    wipe out ALL previously-printed results, even for packages checked
-    successfully earlier in the same run. flush(stdout()) after every
-    line is defense in depth against an even more catastrophic failure
-    (a true process crash/segfault) a plain tryCatch cannot protect
-    against.
-
-    --- TimeoutExpired bytes/str fix (2026-08-17, later same day) ---
-    A genuinely slow-loading package can legitimately exceed `timeout`.
-    On a real timeout, Python's subprocess.TimeoutExpired.stdout
-    attribute is populated with RAW BYTES, not decoded text, regardless
-    of whether the original subprocess.run() call used text=True -- a
-    documented quirk (the text=True decoding wrapper only applies to a
-    successful CompletedProcess, not the exception raised on timeout).
-    _parse_r_check_output() now defensively decodes bytes input (see
-    its own docstring), so a timeout now correctly falls through to
-    "whatever completed before the timeout is preserved, remaining
-    requested packages are reported as unreached" instead of crashing.
-    """
-    if not shutil.which("Rscript"):
-        return None, []
-    r_lines = "\n".join(
-        f'cat("{name}\\t", tryCatch(requireNamespace("{name}", quietly=TRUE), error = function(e) FALSE), "\\n", sep=""); flush(stdout())'
-        for name in package_names
+def _check_one_r_package(package_name, timeout):
+    script = (
+        f'cat(tryCatch(requireNamespace("{package_name}", quietly = TRUE), '
+        f'error = function(e) FALSE))'
     )
-    script = f"suppressWarnings({{\n{r_lines}\n}})"
     try:
         result = subprocess.run(
             ["Rscript", "-e", script],
             capture_output=True, text=True, timeout=timeout,
         )
-    except subprocess.TimeoutExpired as e:
-        # See this function's own "TimeoutExpired bytes/str fix"
-        # docstring section above for why e.stdout may be bytes here
-        # even though text=True was passed to subprocess.run() above --
-        # _parse_r_check_output() handles either type safely.
-        statuses = _parse_r_check_output(e.stdout)
-        unreached = [name for name in package_names if name not in statuses]
-        return statuses, unreached
+    except subprocess.TimeoutExpired:
+        return package_name, None, "timeout"
+    except Exception as e:
+        return package_name, None, str(e)
 
-    statuses = _parse_r_check_output(result.stdout)
-    unreached = [name for name in package_names if name not in statuses]
-    return statuses, unreached
+    output = (result.stdout or "").strip().upper()
+    return package_name, (output == "TRUE"), None
 
 
-def _parse_r_check_output(stdout_data):
-    """
-    Parse tab-separated 'name\\tTRUE/FALSE' lines from
-    _check_r_packages_batched's R script output into a {name: bool}
-    dict.
+def _check_r_packages_isolated(package_names, per_package_timeout=120, max_workers=3):
+    if not shutil.which("Rscript"):
+        return None, []
 
-    stdout_data may be either str (the normal case, from a completed
-    subprocess.run(..., text=True) call) OR bytes (the case on a
-    subprocess.TimeoutExpired -- see _check_r_packages_batched's own
-    "TimeoutExpired bytes/str fix" docstring section). Decoded
-    defensively here, rather than only at each call site, so this
-    function is safe regardless of which caller/code path passes it
-    which type.
-    """
-    if isinstance(stdout_data, bytes):
-        stdout_data = stdout_data.decode("utf-8", errors="replace")
     statuses = {}
-    for line in (stdout_data or "").strip().splitlines():
-        if "\t" not in line:
-            continue
-        name, status = line.split("\t", 1)
-        statuses[name.strip()] = status.strip().upper() == "TRUE"
-    return statuses
+    unreached = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_check_one_r_package, name, per_package_timeout): name
+            for name in package_names
+        }
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                _, found, error = future.result()
+            except Exception:
+                unreached.append(name)
+                continue
+            if error is not None:
+                unreached.append(name)
+            else:
+                statuses[name] = found
+
+    return statuses, unreached
 
 
 def _render_status_row(label, found, conda_spec):
@@ -352,20 +299,10 @@ def _render_status_row(label, found, conda_spec):
 
 
 def _render_unreached_row(label):
-    "For a package whose check never completed (script crashed/timed out before reaching it) -- distinct from a confirmed-missing ❌, since its real status is genuinely unknown."
-    st.markdown(f"❓ {label} — *could not be checked (see warning above)*")
+    st.markdown(f"❓ {label} — *could not be checked in time (see warning above) -- try again, or check it individually with `Rscript -e 'library(<package>)'`*")
 
 
 def _render_github_package_row(pkg_name, spec, r_statuses, unreached, remotes_available):
-    """
-    Render one _R_GITHUB_PACKAGES entry -- unlike a regular R package row,
-    this offers a REAL one-click install button (not just a manual
-    command) when r-remotes is confirmed available, since
-    remotes::install_github() is what actually performs the install.
-
-    See this file's own module docstring, "GitHub-only R package: real
-    one-click install" section, for the full rationale.
-    """
     if pkg_name in unreached:
         _render_unreached_row(spec["label"])
         return
@@ -402,74 +339,80 @@ def _render_github_package_row(pkg_name, spec, r_statuses, unreached, remotes_av
         st.code(display_command, language="bash")
 
 
+def _run_environment_check():
+    """
+    Perform every ACTUAL dependency check exactly once, returning a
+    plain results dict for _render_environment_check() to render from.
+    This is the ONLY place that does real checking work -- see this
+    file's own module docstring, "Checkbox-triggered re-check bug fix".
+    """
+    python_found = {name: _check_python_package(name) for name in _PYTHON_PACKAGES}
+    cli_found = {name: _check_cli_tool(name) for name in _CLI_TOOLS}
+
+    all_r_specs = {**_R_PACKAGES, **_R_ORGANISM_PACKAGES}
+    all_r_check_names = list(all_r_specs.keys()) + list(_R_GITHUB_PACKAGES.keys())
+    r_statuses, r_unreached = _check_r_packages_isolated(all_r_check_names)
+
+    return {
+        "python_found": python_found,
+        "cli_found": cli_found,
+        "r_statuses": r_statuses,
+        "r_unreached": r_unreached,
+    }
+
+
 def _render_environment_check():
     st.subheader("🔎 Environment & Dependency Check")
     st.markdown(
         "Checks whether every dependency this portal needs -- per "
-        "`environment.yml` sitting alongside this app, this project's "
-        "single source of truth for dependencies -- is actually present "
-        "**on this machine, right now**. Run this after any new install "
-        "(Docker, local, or HPC) to catch a missing dependency "
-        "immediately, rather than discovering it only when a specific "
-        "workflow step fails downstream."
+        "`environment.yml` sitting alongside this app -- is actually "
+        "present **on this machine, right now**."
     )
     if st.button("🔄 Check Environment", key="setup_env_check_btn", type="primary"):
+        with st.spinner(
+            "Checking Python packages, CLI tools, and R packages (each R package is "
+            "checked in its own isolated process -- this may take a little while)..."
+        ):
+            st.session_state["setup_env_results"] = _run_environment_check()
         st.session_state["setup_env_check_ran"] = True
-        st.session_state.pop("setup_missing_specs", None)  # force recompute below
 
     if not st.session_state.get("setup_env_check_ran"):
         st.info("Click \"Check Environment\" above to run the check.")
         return
 
-    # Collected while rendering each row below, then used both to build the
-    # "Install Missing Dependencies" section right after this one, AND
-    # stashed in session_state so that section still has something to work
-    # with across reruns triggered by ITS OWN buttons (e.g. clicking
-    # "Refresh Install Status") without needing to silently re-run the
-    # whole check every time.
-    missing = {}  # conda_spec -> label (first label wins if the same spec covers multiple checks, e.g. sra-tools)
+    results = st.session_state.get("setup_env_results")
+    if results is None:
+        st.info("Click \"Check Environment\" above to run the check.")
+        return
+
+    missing = {}
 
     st.markdown("**🐍 Python packages**")
     for module_name, spec in _PYTHON_PACKAGES.items():
-        found = _check_python_package(module_name)
+        found = results["python_found"].get(module_name, False)
         _render_status_row(spec["label"], found, spec["conda_spec"])
         if not found:
             missing.setdefault(spec["conda_spec"], spec["label"])
 
     st.markdown("**🛠️ External CLI tools**")
     for tool, spec in _CLI_TOOLS.items():
-        found = _check_cli_tool(tool)
+        found = results["cli_found"].get(tool, False)
         _render_status_row(spec["label"], found, spec["conda_spec"])
         if not found:
             missing.setdefault(spec["conda_spec"], spec["label"])
 
     st.markdown("**📊 R / Bioconductor packages**")
-    # DoubletFinder's presence is checked in the SAME batched, crash-
-    # isolated Rscript call as everything else (cheap to add to the same
-    # call, avoids a second R startup) -- but see _R_GITHUB_PACKAGES' own
-    # comment for why it's rendered and handled separately below.
-    all_r_specs = {**_R_PACKAGES, **_R_ORGANISM_PACKAGES}
-    all_r_check_names = list(all_r_specs.keys()) + list(_R_GITHUB_PACKAGES.keys())
-    with st.spinner("Checking R packages (this batches every package into one Rscript call)..."):
-        r_statuses, unreached = _check_r_packages_batched(all_r_check_names)
+    r_statuses = results["r_statuses"]
+    unreached = results["r_unreached"]
     if r_statuses is None:
-        st.error(
-            "❌ `Rscript` was not found on PATH at all -- R itself doesn't "
-            "appear to be installed in this environment. Re-sync against "
-            "environment.yml (see DEPLOYMENT.md) to install r-base along "
-            "with every R/Bioconductor package below."
-        )
+        st.error("❌ `Rscript` was not found on PATH at all.")
         missing.setdefault("r-base=4.3.*", "r-base (R itself)")
     else:
         if unreached:
             st.warning(
-                f"⚠️ {len(unreached)} R package check(s) could not complete -- the R process "
-                "likely crashed, timed out, or errored while loading one of the packages below "
-                "(this can happen with slow/heavy-to-load packages like Seurat or celda on a "
-                "busy or memory-constrained machine, or a broken/partial install). Packages "
-                "below marked ❓ have an UNKNOWN status, not a confirmed-missing one -- try "
-                "running the check again, or check that package individually with "
-                "`Rscript -e 'library(<package>)'` to see the actual error."
+                f"⚠️ {len(unreached)} R package check(s) could not complete in time -- each "
+                "package is checked in its own fully independent process, so this means "
+                "each package listed below with a ❓ genuinely, individually timed out."
             )
 
         for pkg_name, spec in _R_PACKAGES.items():
@@ -481,7 +424,7 @@ def _render_environment_check():
             if not found:
                 missing.setdefault(spec["conda_spec"], spec["label"])
 
-        st.markdown("**🧬 Organism annotation packages** (one per preset species in `reference_manager.py`'s `REFERENCE_CATALOG`)")
+        st.markdown("**🧬 Organism annotation packages**")
         for pkg_name, spec in _R_ORGANISM_PACKAGES.items():
             if pkg_name in unreached:
                 _render_unreached_row(spec["label"])
@@ -491,40 +434,21 @@ def _render_environment_check():
             if not found:
                 missing.setdefault(spec["conda_spec"], spec["label"])
 
-        # --- DoubletFinder: rendered separately, never added to `missing` ---
-        # See _R_GITHUB_PACKAGES' own comment above for why this can't go
-        # through the SAME conda-install path as everything else -- but
-        # DOES now offer its own real one-click install path when
-        # r-remotes is confirmed available (see _render_github_package_row).
         remotes_available = ("remotes" not in unreached) and r_statuses.get("remotes", False)
-        st.markdown("**🔀 GitHub-only R packages** (not installable via conda/mamba)")
+        st.markdown("**🔀 GitHub-only R packages**")
         for pkg_name, spec in _R_GITHUB_PACKAGES.items():
             _render_github_package_row(pkg_name, spec, r_statuses, unreached, remotes_available)
 
     st.session_state["setup_missing_specs"] = missing
-
     st.markdown("---")
-    st.caption(
-        "See **DEPLOYMENT.md** for full Docker / local / HPC setup "
-        "instructions. Anything missing above can be installed directly "
-        "from this page -- see \"Install Missing Dependencies\" below "
-        "(GitHub-only packages have their own install option shown "
-        "inline above, once `r-remotes` is available)."
-    )
+    st.caption("See **DEPLOYMENT.md** for full setup instructions.")
 
 
-# ---------------------------------------------------------------------------
-# Install Missing Dependencies
-# ---------------------------------------------------------------------------
 def _render_install_status_panel():
     status = dm.get_install_status()
     if not status:
         return
     st.markdown("**📡 Install Status**")
-    # Distinguish a GitHub-based R package install from a conda/mamba
-    # install -- same status dict shape otherwise (status/started_at/
-    # finished_at/returncode all mean the same thing for both), just a
-    # different label so it's clear at a glance which kind just ran.
     if status.get("install_type") == "github_r_package":
         st.caption("Install type: 🔀 GitHub R package (via `remotes::install_github()`)")
     if status["status"] == "running":
@@ -533,19 +457,11 @@ def _render_install_status_panel():
         st.success(f"✅ Install completed successfully at {status['finished_at']}.")
     elif status["status"] == "error":
         if status.get("used_fallback"):
-            st.error(
-                "❌ The full batch install failed, so each package was "
-                "retried individually (see below for which ones succeeded)."
-            )
+            st.error("❌ The full batch install failed, so each package was retried individually.")
         else:
             st.error(f"❌ Install failed (exit code {status.get('returncode')}) -- see log below.")
     st.markdown(f"Packages: `{', '.join(status.get('package_specs', []))}`")
 
-    # Once the fallback (one-at-a-time) path has run, show each package's
-    # own individual outcome -- this is what actually tells the user
-    # "paramiko installed fine, only bioconductor-org.ce.eg.db failed"
-    # instead of leaving every package's real status a mystery behind one
-    # opaque batch-level failure message.
     package_results = status.get("package_results")
     if package_results:
         st.markdown("**Per-package results:**")
@@ -560,24 +476,21 @@ def _render_install_status_panel():
         if st.button("🔄 Refresh Install Status", key="setup_install_refresh_btn"):
             st.rerun()
     else:
-        st.caption(
-            "Re-run \"Check Environment\" above to confirm what's now "
-            "installed. If you installed a package this running app itself "
-            "depends on (e.g. streamlit, pandas), **restart the app** for "
-            "that change to take effect in this session."
-        )
+        st.caption("Re-run \"Check Environment\" above to confirm what's now installed.")
 
 
 def _render_install_missing_section():
     st.subheader("📦 Install Missing Dependencies")
 
-    if dm.is_install_in_progress():
-        st.markdown(
-            "An install is currently running (see status below) -- wait "
-            "for it to finish before starting another. This includes any "
-            "GitHub-based R package install started above, since it shares "
-            "the same lock as a conda/mamba install."
+    if not auth.has_permission("install_dependencies"):
+        st.info(
+            "🔒 Your current role does not include permission to install dependencies. "
+            "Contact your lab's admin if a package needs to be installed."
         )
+        return
+
+    if dm.is_install_in_progress():
+        st.markdown("An install is currently running -- wait for it to finish before starting another.")
         _render_install_status_panel()
         return
 
@@ -587,44 +500,52 @@ def _render_install_missing_section():
         return
     if not missing:
         st.success("✅ Nothing missing -- every checked dependency was found.")
-        _render_install_status_panel()  # still show the last install's result, if any, for reference
+        _render_install_status_panel()
         return
 
-    st.warning(
-        f"**{len(missing)} package(s) missing.** Clicking install below will "
-        "run `mamba install` / `conda install` directly in this app's ACTIVE "
-        "environment, live -- this modifies your real environment, can take "
-        "several minutes (dependency solving + download), and if a package "
-        "this running app itself depends on is installed (e.g. streamlit, "
-        "pandas), that change won't take effect until you **restart the app**."
+    st.warning(f"**{len(missing)} package(s) missing.**")
+    st.markdown("**Select which missing packages to install:**")
+    st.caption(
+        "Everything below is checked by default, EXCEPT eggNOG-mapper and "
+        "per-organism annotation packages (org.*.eg.db) -- those are left "
+        "**unchecked** by default since they can be sizable and most "
+        "installs don't need every one of them."
     )
-    st.markdown("**Missing packages that will be installed:**")
+
+    selected_specs = []
     for spec, label in missing.items():
-        st.markdown(f"- {label} — `{spec}`")
+        optional_note = _OPTIONAL_INSTALL_INFO.get(spec)
+        is_optional = optional_note is not None
+        checkbox_key = f"setup_missing_checkbox_{spec}"
+        checkbox_label = f"{label} — `{spec}`" + ("  *(optional)*" if is_optional else "")
+        checked = st.checkbox(checkbox_label, value=not is_optional, key=checkbox_key)
+        if is_optional:
+            st.caption(f"↳ {optional_note}")
+        if checked:
+            selected_specs.append(spec)
+
+    n_skipped = len(missing) - len(selected_specs)
+    if n_skipped:
+        st.caption(f"ℹ️ {n_skipped} package(s) currently unchecked and will be skipped.")
+
+    if not selected_specs:
+        st.info("Nothing selected above -- check at least one package to enable installing.")
+        return
 
     exe = dm.get_conda_or_mamba_executable()
     target = dm.get_active_conda_target()
     if not exe:
-        st.error(
-            "❌ Neither `mamba` nor `conda` was found on PATH in this "
-            "environment -- cannot install automatically here. See "
-            "DEPLOYMENT.md for manual install instructions."
-        )
+        st.error("❌ Neither `mamba` nor `conda` was found on PATH in this environment.")
         return
     if not target:
-        st.error(
-            "❌ This app doesn't appear to be running inside a conda/mamba "
-            "environment (no `CONDA_PREFIX`/`CONDA_DEFAULT_ENV` detected) -- "
-            "cannot determine which environment to install into. See "
-            "DEPLOYMENT.md for manual install instructions."
-        )
+        st.error("❌ This app doesn't appear to be running inside a conda/mamba environment.")
         return
 
     flag, value = target
     st.caption(f"Will install into: `{flag} {value}` (via `{exe}`)")
 
-    if st.button("🚀 Install Missing Packages", key="setup_install_btn", type="primary"):
-        success, message = dm.launch_install(list(missing.keys()))
+    if st.button(f"🚀 Install Selected Packages ({len(selected_specs)})", key="setup_install_btn", type="primary"):
+        success, message = dm.launch_install(selected_specs)
         if success:
             st.session_state["setup_install_just_launched"] = True
             st.rerun()
@@ -632,6 +553,92 @@ def _render_install_missing_section():
             st.error(f"❌ {message}")
 
     _render_install_status_panel()
+
+
+# ---------------------------------------------------------------------------
+# eggNOG-mapper Database Setup (admin-gated shared resource, 2026-08-24)
+# ---------------------------------------------------------------------------
+
+def _render_eggnog_database_setup():
+    st.subheader("🧬 eggNOG-mapper Database Setup (admin action)")
+    st.markdown(
+        "eggNOG-mapper provides orthology-based functional annotation for ANY organism. "
+        "This is a **large (~49GB), one-time, shared** resource -- like a reference genome "
+        "download, but bigger -- so it's restricted to administrator accounts."
+    )
+
+    if not auth.has_permission("manage_eggnog_database"):
+        st.info(
+            "🔒 Your current role does not include permission to set up or modify "
+            "the eggNOG database. If you need this, ask your lab's admin -- it "
+            "only needs to be done once, and every project/user shares the same "
+            "installed database afterward."
+        )
+        return
+
+    if not egm.eggnog_mapper_available() or not egm.download_eggnog_data_script_available():
+        st.error(
+            "❌ The `eggnog-mapper` package isn't installed yet -- install it first "
+            "(see \"Install Missing Dependencies\" above), then return here to set up "
+            "its database."
+        )
+        return
+
+    db_dir = os.path.join("data", "shared_resources", "eggnog_database")
+
+    if egm.eggnog_database_is_installed(db_dir):
+        st.success(f"✅ The eggNOG database is already installed at `{db_dir}`.")
+        with st.expander("🔁 Re-download / repair (advanced)"):
+            st.caption("Only do this if you have a specific reason to believe the existing database is corrupted or incomplete.")
+            _render_eggnog_download_controls(db_dir, force=True)
+        return
+
+    st.warning(
+        "⚠️ The eggNOG database has not been installed on this system yet -- this download "
+        "is approximately 49 GB (45 GB core annotation database + 4 GB DIAMOND search database)."
+    )
+    _render_eggnog_download_controls(db_dir, force=False)
+
+
+def _render_eggnog_download_controls(db_dir, force):
+    """
+    Independently re-checks auth.has_permission("manage_eggnog_database")
+    at its own top, in ADDITION to _render_eggnog_database_setup() above
+    already refusing to call this function at all for an unpermitted
+    session -- defense in depth, exactly mirroring project_manager.py's
+    own identical pattern for its own permission-gated action (see that
+    module's own docstring for the full rationale on why BOTH layers
+    matter).
+    """
+    if not auth.has_permission("manage_eggnog_database"):
+        st.error("⚠️ Your current role does not include this permission.")
+        return
+
+    disk_check = egm.check_disk_space(db_dir)
+    st.markdown(disk_check["message"])
+
+    if not disk_check["sufficient"]:
+        st.error(
+            "❌ Insufficient disk space detected -- proceeding is very likely to fail "
+            "partway through."
+        )
+        confirmed = st.checkbox(
+            "I understand the risk and want to attempt this anyway", key="eggnog_db_force_confirm",
+        )
+        if not confirmed:
+            return
+
+    button_label = "🔄 Re-download eggNOG Database" if force else "📥 Download eggNOG Database (~49 GB, one-time)"
+    if st.button(button_label, key="eggnog_db_download_btn", type="primary"):
+        with st.spinner("Downloading eggNOG database... this can take a long time (large download)."):
+            success, message, built = egm.download_eggnog_database(
+                db_dir, ensure_shared_resource_fn=rm.ensure_shared_resource,
+            )
+        if success:
+            st.success(f"✅ {message}")
+            st.rerun()
+        else:
+            st.error(f"❌ {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -729,15 +736,9 @@ def _render_new_connection_form():
         key_path = st.text_input(
             "Path to private key file (on this machine):",
             key="setup_new_conn_key_path", placeholder="e.g. ~/.ssh/id_ed25519",
-            help="This key must already be authorized (in the remote host's ~/.ssh/authorized_keys) -- this page does not copy or generate keys for you.",
         )
     elif auth_method == "password":
-        st.warning(
-            "⚠️ Password auth is never saved to disk, by design -- you'll need "
-            "to re-enter it every time you test or use this connection. "
-            "SSH-key or agent-based auth is strongly recommended for any "
-            "connection you plan to reuse."
-        )
+        st.warning("⚠️ Password auth is never saved to disk, by design.")
         test_password = st.text_input("Password (only used for this test, never saved):", type="password", key="setup_new_conn_password")
 
     if st.button("🔌 Test Connection", key="setup_new_conn_test_btn"):
@@ -760,16 +761,12 @@ def _render_new_connection_form():
     if profile_name and hpc.connection_exists(profile_name):
         st.error(f"A connection named '{profile_name}' already exists -- choose a different name.")
     if not ready:
-        st.info("Provide a connection name, host, and username above to save (testing first is recommended, but not required).")
+        st.info("Provide a connection name, host, and username above to save.")
         return
     if st.button("💾 Save Connection", key="setup_new_conn_save_btn", type="primary"):
         hpc.save_connection({
-            "profile_name": profile_name,
-            "host": host,
-            "port": int(port),
-            "username": username,
-            "auth_method": auth_method,
-            "key_path": key_path,
+            "profile_name": profile_name, "host": host, "port": int(port),
+            "username": username, "auth_method": auth_method, "key_path": key_path,
         })
         st.session_state["setup_conn_just_saved"] = profile_name
         for key in list(st.session_state.keys()):
@@ -780,21 +777,18 @@ def _render_new_connection_form():
 
 def _render_hpc_connections():
     st.subheader("🖥️ HPC Connections")
-    st.markdown(
-        "Save and test SSH connections to remote HPC clusters. This "
-        "checks connectivity and detects the remote environment (OS, "
-        "job scheduler, conda/mamba availability) -- it does **not** "
-        "submit or run any remote jobs; that would be a separate feature "
-        "built on top of a working, tested connection here."
-    )
-    if not hpc.PARAMIKO_AVAILABLE:
-        st.error(
-            "❌ `paramiko` isn't installed in this environment -- it's "
-            "listed in `environment.yml`, so re-syncing your conda/mamba "
-            "environment against that file (see DEPLOYMENT.md), or using "
-            "\"Install Missing Dependencies\" above, will add it. The rest "
-            "of this section won't work until it's available."
+    st.markdown("Save and test SSH connections to remote HPC clusters.")
+
+    if not auth.has_permission("manage_hpc_connections"):
+        st.info(
+            "🔒 Your current role does not include permission to manage HPC "
+            "connections. Contact your lab's admin if you need a connection "
+            "added, tested, or removed."
         )
+        return
+
+    if not hpc.PARAMIKO_AVAILABLE:
+        st.error("❌ `paramiko` isn't installed in this environment.")
         return
 
     just_saved = st.session_state.pop("setup_conn_just_saved", None)
@@ -810,13 +804,15 @@ def render():
     st.title("⚙️ Setup & Deployment")
     st.markdown(
         "Check whether this environment has everything the portal needs "
-        "installed, install anything missing directly from here, and "
-        "configure SSH connections to HPC clusters for future remote-"
-        "execution features."
+        "installed, install anything missing directly from here, set up "
+        "the (optional, large, admin-only) eggNOG-mapper database, and "
+        "configure SSH connections to HPC clusters."
     )
     st.markdown("---")
     _render_environment_check()
     st.markdown("---")
     _render_install_missing_section()
+    st.markdown("---")
+    _render_eggnog_database_setup()
     st.markdown("---")
     _render_hpc_connections()

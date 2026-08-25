@@ -8,148 +8,140 @@ Phase 2: Cell-level QC (doublet detection, ambient RNA correction,
 per-cell filtering with standard visualizations and a downloadable
 results package).
 
---- Preset-reference mitochondrial verification + redownload (2026-08-17) ---
-A real reported gap: Step 5's preset ("auto") reference section only
-ever checked "does this directory already have files?" to decide
-whether to show "✅ already prepared" -- never what's actually IN those
-files. Combined with the mito-detection bug fixed the same day (see
-sc_cellqc_manager.py's own module docstring), this made it genuinely
-impossible to tell whether an already-downloaded preset reference
-actually includes the mitochondrial genome, without either
-re-downloading blindly or manually inspecting files on disk.
+--- Original-format BAM recovery wired into Step 1 (2026-08-24) ---
+Two additions, both building on sc_sra_manager.py's own BAM-recovery
+functions (find_original_format_bam_url, download_original_bam,
+run_bamtofastq, run_full_bam_recovery_pipeline(_parallel),
+run_bam_recovery_from_uploaded_file, save_uploaded_bam):
 
-Fixed by calling reference_manager.verify_preset_reference_mito_content()
-immediately after an "already prepared" preset reference is found,
-surfacing the result prominently (not buried in an unrelated "advanced"
-expander), and offering a DEDICATED "🔄 Re-download to include
-mitochondrial genome" button specifically when verification fails --
-distinct from (and more discoverable than) the pre-existing generic
-"force re-download" advanced option, which existed but gave no
-indication of WHY someone might want to use it.
+1. _render_sra_source() -- when a downloaded run's classification comes
+   back with a bam_warning, a "🔎 Check for a recoverable original-format
+   BAM" button is offered INLINE. On success, REPLACES that run's entry
+   in st.session_state["sc_sra_download_results"] with the recovered
+   result -- which then flows directly into the EXISTING "Confirm File
+   Roles Before Continuing" section below.
 
---- Custom-reference mitochondrial gene resolution UX (2026-08-17,
-    later same day) ---
-For a CUSTOM (user-uploaded) reference, Step 5 now runs the same direct
-GTF-based mito auto-detection immediately after GTF confirmation. If
-that finds zero genes, three explicit resolution paths are offered
-(rather than silently reporting a misleading 0%):
-  1. "Not applicable for this organism" -- explicit opt-out.
-  2. "Try matching against a preset organism's known mitochondrial gene
-     symbols" -- uses sc_cellqc_manager.get_mito_gene_symbols_from_gtf()
-     on a chosen PRESET species' own already-downloaded GTF, then
-     match_custom_genes_by_mito_symbol() to search the custom GTF for
-     matching gene_name values. Only offered for preset species whose
-     reference has actually already been downloaded on this system
-     (checked via reference_manager). Always shown with an explicit
-     lower-confidence disclaimer, since this assumes shared gene-naming
-     convention between the custom reference and the chosen preset --
-     not a verified identity.
-  3. "Specify manually" -- free-text gene ID/symbol entry, matched
-     directly against the custom GTF.
-Whichever path is used, the resolved gene ID list (and a "mito_source"
-label describing which path was used) is persisted into this project's
-saved reference_choice dict, so Phase 2's Cell-level QC page doesn't
-need to re-resolve it on every run.
+2. A new "🧬 Convert from a BAM file I already have" option is added to
+   Step 1's FASTQ-source radio. See _render_bam_upload_source() below.
 
---- Downloadable QC results package (2026-08-17, later same day) ---
-render_cell_qc() now offers a "📦 Download QC Package (.zip)" button
-after a completed run, bundling the per-cell metrics CSV, QC thresholds,
-mitochondrial-gene diagnostic, top-ambient-genes table, DoubletFinder's
-pK sweep (if used), a self-contained markdown summary (via
-sc_cellqc_manager.build_qc_summary_markdown()), and PNG renders of
-every QC visualization (via Plotly's kaleido-based image export,
-already a project dependency) into a single zip file -- so a completed
-run's full results can be shared or archived without this app open.
+--- lane_map plumbing for automatic v1-chemistry split resolution
+    (2026-08-24) ---
+sc_sra_manager.py's run_full_bam_recovery_pipeline() and
+run_bam_recovery_from_uploaded_file() AUTOMATICALLY detect and resolve
+bamtofastq's own v1-chemistry 4-file-per-lane output split, and both
+return an additional "lane_map" key in their result dict. Both "Confirm
+File Roles Before Continuing" blocks below thread this lane_map
+straight through to finalize_role_assignment()'s own lane_map parameter
+once the user confirms roles.
 
---- Genome-index force-rebuild bug fix + stale-index diagnostic
-    (2026-08-17, later same day) ---
-A real reported bug, discovered after a user re-indexed a preset human
-reference (following the mitochondrial-verification fix above), saw the
-"reindex" complete in ~15 seconds (versus the genuine 10-15 minutes a
-real STAR human-genome index build takes), re-ran Step 6 alignment, and
-STILL saw zero mitochondrial genes in Cell-level QC afterward.
+--- BAM source: server-directory browse added alongside upload
+    (2026-08-24, later same day) ---
+_render_bam_upload_source() offers BOTH a server-side directory browse
+(recommended for large 10-30GB+ original-format BAMs already sitting on
+the same HPC filesystem) and a plain browser upload (for a smaller/
+already-local file) -- mirroring Step 5's own identical upload-vs-browse
+pattern for reference genome files. The server-browse path never copies
+the file anywhere first; it's read directly from its own existing
+location.
 
-Root cause: _render_genome_index_step's "🔄 Re-build Index" (force
-re-index) button set the SAME build_clicked flag used for "build an
-index that doesn't exist yet", and BOTH cases fell through to the
-identical ref.ensure_shared_resource(index_dir, _build_index_impl,
-wait_message_callback=_wait_cb) call -- with NO force=True ever passed.
-ensure_shared_resource()'s own documented behavior is to return
-immediately with "already available" WITHOUT ever invoking build_fn if
-force is not explicitly set AND the resource directory already has
-files in it -- which is exactly the case for a force-reindex click,
-since the whole point of that button is that an index already exists.
-So "Re-build Index" silently did nothing beyond a fast existence check,
-every time it was clicked, for every preset/shared reference in this
-app -- explaining both the suspiciously-fast "reindex" and why
-mitochondrial genes never appeared afterward (the STALE index, built
-before the reference's mitochondrial content was confirmed/fixed, was
-never actually replaced, so STARsolo's own features.tsv -- generated
-once, AT INDEX-BUILD TIME, and never revisited at alignment time --
-still had no mitochondrial gene rows in it, regardless of what the
-CURRENT reference GTF says).
+--- Metadata "add a new column" control (2026-08-25) ---
+A real, confirmed limitation of Streamlit's own st.data_editor() widget:
+it supports adding/removing ROWS dynamically, but has NO built-in way to
+add a brand-new COLUMN. Fixed by _render_add_metadata_column_control()
+below, plus restructuring the metadata section of _render_step1() to
+keep a persistent "working copy" of the metadata dataframe in
+st.session_state (keyed per-project) and to give the data_editor widget
+itself a KEY that changes whenever the column SET changes.
 
-Fixed by tracking build_clicked and force_rebuild as TWO SEPARATE
-flags and passing force=force_rebuild explicitly to
-ref.ensure_shared_resource() -- this now exactly mirrors the Bulk
-RNA-Seq pipeline's own real, original alignment_workspace.py pattern
-(confirmed against that module's actual source), which already tracked
-build_clicked/force_index separately and passed force=force_index
-correctly. The single-cell version had collapsed this into one flag
-during an earlier reconstruction, introducing this regression.
+--- Step 6 "Proceed to Phase 2" button visibility fix (2026-08-25) ---
+_render_step6() now re-checks scpm.has_completed_step(project,
+"alignment") again, in the SAME render, immediately after
+_render_starsolo_run_controls() returns in the `else` branch -- and
+renders the identical "Proceed to Phase 2" button right there if
+completion status just flipped to True during THIS run (i.e. the user
+just clicked "Align & Call Cells" for the first time). Deliberately NOT
+done via st.rerun(), since a rerun would also discard any per-sample
+error-detail expanders still visible from a partial-success alignment
+in this same run.
 
-Also added: sc_cellqc_manager.diagnose_starsolo_matrix_for_mito(), a
-fast, R-independent, PRE-FLIGHT check run automatically the moment a
-sample is selected in render_cell_qc() -- BEFORE the (much slower)
-full R-based Cell-level QC pipeline runs. It reads STARsolo's own
-features.tsv directly to check whether THIS SAMPLE's already-aligned
-count matrix has any mitochondrial gene rows at all, independent of
-what the reference GTF currently says. This distinguishes, immediately
-and without needing a full QC re-run:
-  1. The matrix already has mitochondrial genes -> proceed normally.
-  2. The matrix has genes overall but ZERO are mitochondrial -> a
-     STALE INDEX/alignment (the exact bug above) -- surfaced with a
-     specific, actionable message pointing at Step 5's real rebuild
-     button and Step 6's re-run-alignment action, NOT a suggestion to
-     just re-run Cell-level QC again (which cannot fix this, since QC
-     only re-reads existing STARsolo output and never re-aligns).
+--- Ambient-gene table Ensembl-ID -> gene-name resolution wiring
+    (2026-08-25) ---
+sc_cellqc_manager.py's read_top_ambient_genes() now accepts an optional
+gtf_path parameter, overlaying real, readable gene names (parsed
+directly from the reference GTF) onto the ambient-genes table wherever
+a better name is resolvable. render_cell_qc() already has the
+reference's own GTF path available as mito_gtf_path -- this is threaded
+through to BOTH call sites that read this table
+(_render_cellqc_visualizations() and _build_qc_package_zip()).
 
---- Stale-resource-during-rebuild race fix (2026-08-18) ---
-A real reported bug: a user force-rebuilding a shared STAR genome index
-navigated between radio-button pages while the rebuild was running (on
-an HPC host, confirmed still running via `top`) and, on navigating
-back, saw the index reported as "✅ already built" even though the real
-rebuild was still in progress. Root cause: reference_manager.py's
-ensure_shared_resource() builds a fresh copy into a private temp
-directory and only replaces the OLD index via a single atomic
-os.rename() at the very END of a successful build -- so the old
-(stale) index stays fully present on disk, and any existence-only
-check (qm.star_index_exists) reports "ready" for the ENTIRE rebuild
-duration, with no way to distinguish a finished build from one that's
-actively being replaced.
+--- "Proceed to SC Analysis" button added (2026-08-25) ---
+A real, confirmed gap: Phase 2 (Cell-level QC) had no button to advance
+into Phase 3's downstream analysis workspace at all, even though that
+workspace (sc_downstream_workspace.py) is already fully wired into
+app.py's own routing. Fixed by adding a "➡️ Proceed to SC Analysis:
+Clustering & Cell Annotation" button at the bottom of render_cell_qc(),
+following this app's own established pattern (setting
+st.session_state["nav_request"] to the exact sidebar option string
+app.py's own PIPELINE_GROUPS dict uses, then st.rerun()) already used
+by every other "Proceed to ..." button in this module. The label was
+shortened again on 2026-08-25 (from an earlier, longer "Normalization →
+Clustering → Cell-Type Annotation" wording) per direct user feedback
+that the original name was too long -- see SC_DOWNSTREAM_ANALYSIS_OPTION's
+own current value, and app.py's own module docstring for the
+corresponding change on that side.
 
-Fixed by using reference_manager.resource_build_in_progress() (a
-non-blocking probe on the resource's existing .lock file) as part of
-the authoritative readiness check in _resolve_star_index_dir(), and by
-showing an explicit "🔄 build in progress, please wait" status in
-_render_genome_index_step() that blocks further build actions while
-true. Also, CUSTOM (non-shared, per-project) index builds now route
-through ref.ensure_shared_resource() too -- previously that branch
-called qm.build_star_index() DIRECTLY against index_dir with NO
-temp-dir staging, atomic replacement, or lock-file protection at all,
-so a custom reference's rebuild had the identical stale-appears-ready
-symptom with even less of a safety net than the shared path. Both
-branches now share the same temp-directory + atomic-rename + lock-file
-infrastructure -- there is no longer a separate "shared" vs. "custom"
-code path for the actual build call, only for which directory is
-targeted. Because _render_starsolo_run_controls() in Step 6 also calls
-_resolve_star_index_dir() for its own "is the index ready?" gate, this
-fix automatically blocks alignment too while a rebuild is in progress,
-with no separate Step 6 change needed.
+--- GFF3-fallback gene-name resolution summary surfaced at Step 5
+    (2026-08-25, later same day) ---
+A real, confirmed gap: when a preset reference's annotation came from
+Ensembl's GFF3-fallback path (reference_manager.py's own
+_download_ensembl_annotation(), used when a species' direct GTF isn't
+available), that fallback now runs a THREE-TIER gene-name backfill
+(real Name -> Ensembl description -> bare Ensembl ID -- see
+reference_manager.py's own backfill_gene_names_from_gff3_tiered() and
+its own module docstring section "Tiered gene-name backfill for the
+GFF3 fallback path" for the full rationale) and persists a per-tier
+resolution summary to disk via write_gene_name_resolution_summary().
+That summary was being computed and saved, but NOTHING in this UI ever
+displayed it -- a user preparing a GFF3-fallback preset reference had
+no way to know up front what fraction of genes would show a real
+curated symbol vs. an Ensembl-description-derived name vs. a bare
+Ensembl ID, anywhere in the app (they would only discover this
+piecemeal, gene-by-gene, while looking at individual downstream plots
+like the Cell-level QC ambient-genes table).
+
+Fixed by _render_gene_name_resolution_summary() below, called
+immediately after _render_preset_mito_verification() inside Step 5's
+preset-reference branch (_render_step5()) -- the natural, single,
+low-noise point where a user already reviews this reference's
+mitochondrial-content verification, and where the underlying summary
+file (written once, at download time, alongside the other reference
+files) already lives on disk. Reuses
+gff3_gene_name_resolver.build_gene_name_resolution_summary_message()
+directly (rather than re-implementing message-formatting logic here)
+since ref.read_gene_name_resolution_summary()'s own return shape is
+IDENTICAL to what that function already expects -- both
+reference_manager.py's persisted summary and gff3_gene_name_resolver.py's
+own in-memory summary originate from the exact same
+gff3_gene_name_resolver.summarize_gene_name_resolution() call under the
+hood. Rendered as a plain st.info() (not a warning/error) -- an
+Ensembl-description-derived or bare-ID gene name is an accepted,
+documented trade-off of the GFF3 fallback path, not a failure state in
+its own right; only Cell-level QC's own, separate mitochondrial-gene
+"0% mito" diagnostic escalates to a warning/error, since THAT specific
+failure mode has a real, confirmed history of silently producing
+misleading biological results if left unresolved. Shows nothing at all
+(no empty box, no placeholder text) for a species whose direct Ensembl
+GTF was available and the GFF3 fallback was therefore never used --
+read_gene_name_resolution_summary() correctly returns None for that
+case, since Ensembl's own native GTF already includes gene_name for
+every gene it defines and there is genuinely nothing to summarize.
 
 See sc_project_manager.py and sc_cellqc_manager.py's own module
 docstrings for full detail on all other Phase 1/Phase 2 design
-decisions and fixes made earlier the same day.
+decisions and fixes made earlier the same day (mitochondrial
+verification/redownload, custom-reference mito resolution, downloadable
+QC package, genome-index force-rebuild fix, stale-index diagnostic,
+stale-resource-during-rebuild race fix).
 """
 import io
 import os
@@ -177,6 +169,15 @@ import singlecell_trim_manager as trim
 import starsolo_manager as star
 import sc_sra_manager as scsra
 import sc_cellqc_manager as cellqc
+import gff3_gene_name_resolver as gff3_resolver
+
+# --- Route name used for the Phase 3 downstream-analysis sidebar entry
+# (2026-08-25) -- kept as a single named constant here (rather than a
+# bare string literal at each "Proceed to..." call site) so this
+# module's own button and app.py's own PIPELINE_GROUPS/routing entry
+# can never silently drift apart if this name is ever changed again in
+# the future -- both sides now reference the exact same string value.
+SC_DOWNSTREAM_ANALYSIS_OPTION = "📊 SC Analysis: Clustering & Cell Annotation"
 
 STAGE_LABELS = {
     "ingest": "1. FASTQ ingestion + chemistry + metadata",
@@ -241,6 +242,91 @@ def _render_project_selector():
 
 
 # ---------------------------------------------------------------------------
+# Original-format BAM recovery: shared chemistry-flag picker
+# ---------------------------------------------------------------------------
+def _render_bamtofastq_chemistry_picker(key_prefix):
+    """
+    Render bamtofastq's own chemistry-flag choice as an explicit,
+    user-confirmed radio selection -- shared by BOTH the automatic
+    SRA-based recovery path and the "upload/browse for your own BAM"
+    path.
+
+    Returns the chosen chemistry_key (e.g. "auto", "cr11", "gemcode", "lr20").
+    """
+    options = list(scsra.BAMTOFASTQ_CHEMISTRY_FLAGS.keys())
+    default_index = options.index(scsra.DEFAULT_BAMTOFASTQ_CHEMISTRY_FLAG)
+    chosen = st.radio(
+        "Which chemistry/tooling produced this BAM?",
+        options=options,
+        format_func=lambda k: scsra.BAMTOFASTQ_CHEMISTRY_FLAGS[k]["label"],
+        index=default_index,
+        key=f"{key_prefix}_bamtofastq_chemistry",
+        help="This is bamtofastq's own required flag, not this pipeline's own droplet-chemistry catalog -- see the explanation below for each option.",
+    )
+    st.caption(scsra.BAMTOFASTQ_CHEMISTRY_FLAGS[chosen]["explanation"])
+    return chosen
+
+
+def _render_inline_bam_recovery_option(run, fastq_dir):
+    """
+    Rendered inline, immediately below a downloaded SRA run's
+    bam_warning -- offers to check whether an original-format BAM is
+    freely recoverable for THIS specific run, and if so, perform the
+    full recovery pipeline.
+
+    On success, REPLACES this run's entry in
+    st.session_state["sc_sra_download_results"] with the recovered
+    result (which now includes a "lane_map" key).
+    """
+    check_key = f"sc_bam_check_{run}"
+    if st.button(f"🔎 Check for a recoverable original-format BAM ({run})", key=check_key):
+        with st.spinner(f"Checking whether an original-format BAM exists for {run}..."):
+            url, message = scsra.find_original_format_bam_url(run)
+        st.session_state[f"sc_bam_url_{run}"] = url
+        st.session_state[f"sc_bam_url_message_{run}"] = message
+
+    url = st.session_state.get(f"sc_bam_url_{run}")
+    message = st.session_state.get(f"sc_bam_url_message_{run}")
+    if message is None:
+        return
+
+    if url is None:
+        st.warning(
+            f"⚠️ {message}\n\n"
+            "This pipeline does not automate the AWS/GCP cloud-billing path -- if you "
+            "have your own cloud account and can obtain the BAM that way, you can "
+            "still use the **\"🧬 Convert from a BAM file I already have\"** option "
+            "further down this page once you've downloaded it yourself."
+        )
+        return
+
+    st.success(f"✅ {message} -- this can be downloaded and converted directly, at no cost.")
+    chemistry_key = _render_bamtofastq_chemistry_picker(key_prefix=f"sc_bam_recover_{run}")
+
+    if st.button(f"📥 Recover via Original BAM ({run})", key=f"sc_bam_recover_btn_{run}", type="primary"):
+        progress_area = st.empty()
+        progress_lines = []
+
+        def _on_progress(msg, _area=progress_area, _lines=progress_lines):
+            _lines.append(msg)
+            _area.markdown("\n\n".join(f"- {line}" for line in _lines))
+
+        with st.spinner(f"Downloading and converting original-format BAM for {run} -- this can take a while (large file)..."):
+            result = scsra.run_full_bam_recovery_pipeline(
+                run, fastq_dir, run, chemistry_key=chemistry_key, progress_callback=_on_progress,
+            )
+
+        if result["success"]:
+            download_results = st.session_state.get("sc_sra_download_results") or {}
+            download_results[run] = result
+            st.session_state["sc_sra_download_results"] = download_results
+            st.success(f"✅ {result['message']} Scroll down to confirm file roles.")
+            st.rerun()
+        else:
+            st.error(f"❌ {result['message']}")
+
+
+# ---------------------------------------------------------------------------
 # Step 1 (NCBI/SRA source option)
 # ---------------------------------------------------------------------------
 def _render_sra_source(project, fastq_dir):
@@ -259,9 +345,11 @@ def _render_sra_source(project, fastq_dir):
         "correspond to R1/R2 -- this pipeline classifies each file by "
         "read length after downloading and asks you to confirm the "
         "result below. Some accessions are deposited as 10x-specific "
-        "BAM files rather than plain FASTQ, which this pipeline cannot "
-        "yet reconstruct automatically -- you'll see a clear warning if "
-        "that looks like what happened."
+        "BAM files rather than plain FASTQ, or only include the cDNA "
+        "read without any barcode/UMI data at all -- if that happens, "
+        "you'll see a clear warning below with an option to check "
+        "whether the ORIGINAL BAM (which still has the barcode/UMI "
+        "data) can be recovered directly, at no cost."
     )
 
     single_term = st.text_input("Study or BioProject accession:", placeholder="e.g. PRJNA474047", key="sc_sra_single_term")
@@ -353,6 +441,8 @@ def _render_sra_source(project, fastq_dir):
                 continue
             if result["bam_warning"]:
                 st.warning(result["bam_warning"])
+                _render_inline_bam_recovery_option(run, fastq_dir)
+                st.markdown("---")
             overrides = {}
             for path, info in result["classification"].items():
                 role_options = [scsra.ROLE_R1, scsra.ROLE_R2, scsra.ROLE_I1, scsra.ROLE_UNKNOWN]
@@ -363,7 +453,9 @@ def _render_sra_source(project, fastq_dir):
                 )
                 overrides[path] = chosen_role
             if st.button(f"✅ Confirm & Use These Files ({run})", key=f"sc_sra_confirm_btn_{run}"):
-                destinations = scsra.finalize_role_assignment(overrides, fastq_dir, run)
+                destinations = scsra.finalize_role_assignment(
+                    overrides, fastq_dir, run, lane_map=result.get("lane_map"),
+                )
                 if scsra.ROLE_R1 in destinations and scsra.ROLE_R2 in destinations:
                     st.success(f"✅ {run}: R1/R2 files moved into project -- ready for chemistry detection below.")
                     any_finalized = True
@@ -371,6 +463,181 @@ def _render_sra_source(project, fastq_dir):
                     st.error(f"⚠️ {run}: both an R1 and an R2 role must be assigned before this run can be used.")
     if any_finalized:
         st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (BAM source option, 2026-08-24 -- upload OR server-browse)
+# ---------------------------------------------------------------------------
+def _render_bam_upload_source(project, fastq_dir):
+    """
+    Render the "convert from a BAM file I already have" FASTQ source
+    option -- for a user who already possesses a relevant single-cell
+    BAM.
+    """
+    st.markdown(
+        "If you already have a **BAM file** for single-cell data -- for example, "
+        "received from a collaborator, downloaded as part of a public dataset "
+        "distributed only as BAM, or produced by a different pipeline you've "
+        "already run -- provide it here to recover its underlying FASTQ reads "
+        "(with cell barcode/UMI sequences intact)."
+    )
+
+    if not scsra.bamtofastq_available():
+        st.error(
+            "⚠️ `bamtofastq` was not found on this system. It needs to be "
+            "installed in your environment before this feature can be used "
+            "(bioconda package: `10x_bamtofastq`)."
+        )
+        return
+
+    bam_source = st.radio(
+        "Where is this BAM file located?",
+        [
+            "📂 Browse a directory on this server (HPC) -- recommended for large files",
+            "📤 Upload from my computer",
+        ],
+        key="sc_bam_source_radio", horizontal=True,
+        help=(
+            "Original-format 10x BAM files are often very large (10-30GB or more). "
+            "If this app is running on a shared server/HPC that already has the BAM "
+            "file sitting on its own disk, browsing for it directly avoids "
+            "uploading it through your browser at all -- the same reasoning as the "
+            "FASTQ and reference-genome file inputs elsewhere in this app."
+        ),
+    )
+
+    bam_path = None
+    is_uploaded_file_object = False
+
+    if bam_source.startswith("📂"):
+        bam_path = fb.render_server_file_browser(
+            key_prefix="sc_bam_browse_hpc", file_extensions=[".bam"],
+            label="Browse for the BAM file already on this server/HPC:",
+        )
+    else:
+        uploaded_bam = st.file_uploader("Upload a BAM file (.bam):", type=["bam"], key="sc_bam_upload")
+        if uploaded_bam is not None:
+            bam_path = uploaded_bam
+            is_uploaded_file_object = True
+
+    if bam_path is None:
+        return
+
+    default_sample_name = uploaded_bam.name if is_uploaded_file_object else os.path.basename(bam_path)
+    if default_sample_name.lower().endswith(".bam"):
+        default_sample_name = default_sample_name[: -len(".bam")]
+
+    sample_name = st.text_input(
+        "What sample name should this become?", value=default_sample_name,
+        key="sc_bam_upload_sample_name",
+        help="Used to name this sample throughout the rest of the pipeline.",
+    )
+
+    chemistry_key = _render_bamtofastq_chemistry_picker(key_prefix="sc_bam_upload")
+
+    if not sample_name.strip():
+        st.warning("⚠️ Please enter a sample name before converting.")
+        return
+
+    if st.button("🔄 Convert BAM to FASTQ", key="sc_bam_upload_convert_btn", type="primary"):
+        if is_uploaded_file_object:
+            upload_dest_dir = os.path.join(fastq_dir, "_uploaded_bams")
+            resolved_bam_path = scsra.save_uploaded_bam(bam_path, upload_dest_dir, sample_name.strip())
+        else:
+            resolved_bam_path = bam_path
+
+        progress_area = st.empty()
+        progress_lines = []
+
+        def _on_progress(msg, _area=progress_area, _lines=progress_lines):
+            _lines.append(msg)
+            _area.markdown("\n\n".join(f"- {line}" for line in _lines))
+
+        with st.spinner("Converting BAM to FASTQ -- this can take a while for large files..."):
+            result = scsra.run_bam_recovery_from_uploaded_file(
+                resolved_bam_path, fastq_dir, sample_name.strip(),
+                chemistry_key=chemistry_key, progress_callback=_on_progress,
+            )
+
+        if result["success"]:
+            download_results = st.session_state.get("sc_sra_download_results") or {}
+            download_results[sample_name.strip()] = result
+            st.session_state["sc_sra_download_results"] = download_results
+            st.success(f"✅ {result['message']} Scroll down to confirm file roles.")
+            st.rerun()
+        else:
+            st.error(f"❌ {result['message']}")
+
+    download_results = st.session_state.get("sc_sra_download_results")
+    if not download_results:
+        return
+
+    st.markdown("---")
+    st.markdown("**📋 Confirm File Roles Before Continuing**")
+    st.caption("Each converted/downloaded sample's files were classified by read length. **Please confirm or correct these before continuing** -- an incorrect assignment here will break every downstream step.")
+    any_finalized = False
+    for run, result in download_results.items():
+        with st.expander(f"Sample: {run}", expanded=True):
+            if not result["success"]:
+                st.error(f"❌ {result['message']}")
+                continue
+            if result["bam_warning"]:
+                st.warning(result["bam_warning"])
+            overrides = {}
+            for path, info in result["classification"].items():
+                role_options = [scsra.ROLE_R1, scsra.ROLE_R2, scsra.ROLE_I1, scsra.ROLE_UNKNOWN]
+                default_role = info["role"] if info["role"] in role_options else scsra.ROLE_UNKNOWN
+                chosen_role = st.selectbox(
+                    f"`{os.path.basename(path)}` ({info['length']}bp):", options=role_options,
+                    index=role_options.index(default_role), key=f"sc_bamup_role_{run}_{os.path.basename(path)}",
+                )
+                overrides[path] = chosen_role
+            if st.button(f"✅ Confirm & Use These Files ({run})", key=f"sc_bamup_confirm_btn_{run}"):
+                destinations = scsra.finalize_role_assignment(
+                    overrides, fastq_dir, run, lane_map=result.get("lane_map"),
+                )
+                if scsra.ROLE_R1 in destinations and scsra.ROLE_R2 in destinations:
+                    st.success(f"✅ {run}: R1/R2 files moved into project -- ready for chemistry detection below.")
+                    any_finalized = True
+                else:
+                    st.error(f"⚠️ {run}: both an R1 and an R2 role must be assigned before this run can be used.")
+    if any_finalized:
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Metadata "add a new column" control (2026-08-25)
+# ---------------------------------------------------------------------------
+def _render_add_metadata_column_control(working_key):
+    """
+    Render a small "➕ Add a new column" expander -- the actual fix for
+    the confirmed real gap: st.data_editor() has no built-in way to add
+    a brand-new column.
+    """
+    with st.expander("➕ Add a new column (e.g. 'condition', 'donor', 'batch')"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            new_col_name = st.text_input(
+                "New column name:", key="sc_metadata_new_col_name",
+                placeholder="e.g. condition",
+            )
+        with col2:
+            st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+            add_clicked = st.button("➕ Add Column", key="sc_metadata_add_col_btn")
+
+        if add_clicked:
+            working_df = st.session_state[working_key]
+            clean_name = new_col_name.strip()
+            if not clean_name:
+                st.error("⚠️ Please enter a column name before adding.")
+            elif clean_name in working_df.columns:
+                st.error(f"⚠️ A column named `{clean_name}` already exists.")
+            else:
+                working_df = working_df.copy()
+                working_df[clean_name] = ""
+                st.session_state[working_key] = working_df
+                st.success(f"✅ Added column `{clean_name}` -- fill in values below, then save.")
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +651,12 @@ def _render_step1(project):
     st.markdown("**Provide your FASTQ files:**")
     source = st.radio(
         "How will you provide FASTQ files?",
-        ["📤 Upload from my computer", "📂 Browse a directory on this server", "🔎 Fetch from NCBI/SRA"],
+        [
+            "📤 Upload from my computer",
+            "📂 Browse a directory on this server",
+            "🔎 Fetch from NCBI/SRA",
+            "🧬 Convert from a BAM file I already have",
+        ],
         key="sc_fastq_source_radio", horizontal=True,
     )
     if source.startswith("📤"):
@@ -404,8 +676,11 @@ def _render_step1(project):
             key_prefix="sc_fastq_dir_browse", preview_extensions=[".fastq", ".fastq.gz", ".fq", ".fq.gz"],
             label="Browse for the directory containing your FASTQ files:",
         ) or fastq_dir
-    else:
+    elif source.startswith("🔎"):
         _render_sra_source(project, fastq_dir)
+        active_dir = fastq_dir
+    else:
+        _render_bam_upload_source(project, fastq_dir)
         active_dir = fastq_dir
 
     pairs = ing.find_r1_r2_pairs(active_dir)
@@ -457,18 +732,32 @@ def _render_step1(project):
 
     st.markdown("---")
     st.markdown("**📋 Sample Metadata** (one row per sample -- condition/treatment/donor, NOT per-cell data)")
+
     metadata_path = scpm.metadata_path(project)
     sra_lookup_rows = st.session_state.get("sc_sra_lookup_rows")
     sra_selected_runs = st.session_state.get("sc_sra_selected_runs")
-    if os.path.exists(metadata_path):
-        default_df = pd.read_csv(metadata_path)
-    elif sra_lookup_rows and sra_selected_runs:
-        default_df = pd.DataFrame(sra.build_metadata_dataframe(sra_lookup_rows, selected_runs=sra_selected_runs))
-        if not sra.has_any_descriptive_metadata(sra_lookup_rows, selected_runs=sra_selected_runs):
-            st.caption("ℹ️ NCBI provided no characteristics beyond the run accession for these runs -- add your own columns below.")
-    else:
-        default_df = pd.DataFrame({"sample": list(pairs.keys())})
-    edited_df = st.data_editor(default_df, num_rows="dynamic", use_container_width=True, key="sc_metadata_editor")
+
+    working_key = f"sc_metadata_working_df_{project}"
+    if working_key not in st.session_state:
+        if os.path.exists(metadata_path):
+            st.session_state[working_key] = pd.read_csv(metadata_path)
+        elif sra_lookup_rows and sra_selected_runs:
+            st.session_state[working_key] = pd.DataFrame(sra.build_metadata_dataframe(sra_lookup_rows, selected_runs=sra_selected_runs))
+            if not sra.has_any_descriptive_metadata(sra_lookup_rows, selected_runs=sra_selected_runs):
+                st.caption("ℹ️ NCBI provided no characteristics beyond the run accession for these runs -- add your own columns below.")
+        else:
+            st.session_state[working_key] = pd.DataFrame({"sample": list(pairs.keys())})
+
+    working_df = st.session_state[working_key]
+
+    editor_key = "sc_metadata_editor_" + "_".join(str(c) for c in working_df.columns)
+    edited_df = st.data_editor(working_df, num_rows="dynamic", use_container_width=True, key=editor_key)
+    st.session_state[working_key] = edited_df
+
+    _render_add_metadata_column_control(working_key)
+
+    edited_df = st.session_state[working_key]
+
     if "sample" not in edited_df.columns:
         st.error("⚠️ Metadata must have a column named exactly `sample` matching your FASTQ sample names.")
         return None
@@ -830,41 +1119,7 @@ def _render_aligner_choice(project):
 
 
 def _render_preset_mito_verification(project, species_choice, species_labels, genome_fasta_expected, gtf_expected):
-    """
-    Verify + surface whether a PRESET reference's already-downloaded
-    files actually include the mitochondrial genome -- see this module's
-    own docstring, "Preset-reference mitochondrial verification +
-    redownload", for the full rationale.
-
-    Rendered immediately after Step 5's "✅ Reference files already
-    prepared" message for a preset species -- NOT buried in the
-    unrelated generic "force re-download" advanced expander below it,
-    since this is a concrete, actionable, and fairly likely-to-matter
-    result (as opposed to the generic re-download option, which exists
-    for a vaguer "I suspect corruption" scenario).
-
-    project: this project's name -- needed (new in this patch) so a
-        confirmed contig-picker resolution below can be persisted as
-        THIS project's own mito_gene_ids/mito_source override via
-        scpm.save_reference_choice(), exactly like the existing
-        custom-reference resolution path already does. Threaded through
-        explicitly from the caller (_render_step5) rather than read
-        from st.session_state directly, to stay consistent with every
-        other function in this module and avoid any fragile implicit
-        dependency on a specific session_state key name.
-
-    In addition to the original "re-download" fix, also offers a
-    contig-picker fallback (via the shared _render_mito_contig_picker()
-    helper) for the case where re-downloading won't help at all --
-    e.g. this preset species' reference genuinely has no mitochondrial
-    contig, or its contig name simply isn't one the built-in alias list
-    recognizes. A confirmed contig selection here is persisted as this
-    PROJECT's own mito_gene_ids/mito_source override (mirroring the
-    custom-reference resolution path), since preset references are
-    shared across projects and this module has no general mechanism to
-    permanently reclassify a shared reference's contig for every future
-    project.
-    """
+    """Verify + surface whether a PRESET reference's already-downloaded files actually include the mitochondrial genome."""
     verification = ref.verify_preset_reference_mito_content(genome_fasta_expected, gtf_expected)
 
     if verification["verified"]:
@@ -941,25 +1196,41 @@ def _render_preset_mito_verification(project, species_choice, species_labels, ge
             scpm.save_reference_choice(project, existing_cfg)
             st.success(f"✅ Saved ({len(contig_resolved)} mitochondrial gene(s)) as an override for this project.")
 
+
+# ---------------------------------------------------------------------------
+# Gene-name resolution summary display (2026-08-25) -- see this
+# module's own docstring, "GFF3-fallback gene-name resolution summary
+# surfaced at Step 5", for the full rationale.
+# ---------------------------------------------------------------------------
+def _render_gene_name_resolution_summary(target_dir):
+    """
+    Read back and display (via a plain st.info() -- NOT a warning/error,
+    per this module's own docstring) a GFF3-fallback reference's own
+    persisted gene-name resolution summary, if one exists for this
+    reference at all.
+
+    target_dir: the preset reference's own shared directory (the SAME
+        directory reference_manager.py's own
+        write_gene_name_resolution_summary() writes
+        gene_name_resolution_summary.json into, alongside the genome
+        FASTA and GTF) -- called with the exact same target_dir already
+        used just above by _render_preset_mito_verification().
+
+    Renders NOTHING at all (no empty box, no placeholder) if
+    ref.read_gene_name_resolution_summary() returns None -- correctly
+    the case for any species whose direct Ensembl GTF was available
+    (Ensembl's own native GTF already includes gene_name for every gene
+    it defines, so the GFF3 fallback -- and this summary file -- never
+    existed for that reference at all).
+    """
+    summary = ref.read_gene_name_resolution_summary(target_dir)
+    message = gff3_resolver.build_gene_name_resolution_summary_message(summary)
+    if message is not None:
+        st.info(message)
+
+
 def _render_mito_contig_picker(gtf_path, key_prefix, contigs_to_show=25):
-    """
-    Shared UI for browsing a GTF's full contig inventory and selecting
-    which contig(s) are mitochondrial -- used by BOTH the custom-
-    reference resolution flow (_render_custom_mito_resolution) and the
-    preset-reference verification flow (_render_preset_mito_verification),
-    since both need the identical "let the user point at the right
-    contig" fallback once automatic alias-based detection has failed.
-
-    key_prefix: a short, caller-unique string (e.g. "custom" or
-        "preset") used to namespace this widget's Streamlit session_state
-        keys, so the preset and custom flows (which could both be
-        rendered on the same Step 5 page in principle) never collide.
-
-    Returns a sorted list of resolved gene_id strings once the user has
-    selected contig(s) AND pressed the resolve button, or None if no
-    resolution has happened yet in this render pass (the caller should
-    treat None as "nothing to persist yet", not as "zero genes found").
-    """
+    """Shared UI for browsing a GTF's full contig inventory and selecting which contig(s) are mitochondrial."""
     contig_summary = cellqc.get_gtf_contig_summary(gtf_path)
     if not contig_summary:
         st.warning("⚠️ Could not read any contigs from this GTF -- the file may be empty or malformed.")
@@ -1030,20 +1301,7 @@ _MITO_RESOLUTION_OPTIONS = [
 
 
 def _render_custom_mito_resolution(project, custom_gtf_path):
-    """
-    For a CUSTOM reference whose GTF has zero mitochondrial genes found
-    via direct seqname lookup, offer four explicit resolution paths --
-    see this module's own docstring, "Custom-reference mitochondrial
-    gene resolution UX", for the full rationale. The contig-picker path
-    (added alongside the original three) is the recommended option for
-    most users, since it requires no knowledge of gene IDs/symbols at
-    all -- just recognizing which contig name is the mitochondrial one.
-
-    Persists the resolved gene ID list (plus a "mito_source" label) into
-    this project's saved reference_choice dict via
-    scpm.save_reference_choice(), so Phase 2 doesn't need to re-resolve
-    it on every Cell-level QC run.
-    """
+    """For a CUSTOM reference whose GTF has zero mitochondrial genes found via direct seqname lookup, offer four explicit resolution paths."""
     st.markdown("**🧬 Mitochondrial Gene Resolution**")
     st.warning(
         "⚠️ No mitochondrial genes could be identified directly from this reference's GTF "
@@ -1086,10 +1344,6 @@ def _render_custom_mito_resolution(project, custom_gtf_path):
         )
         species_options = list(ref.REFERENCE_CATALOG.keys())
         species_labels = {k: v["label"] for k, v in ref.REFERENCE_CATALOG.items()}
-        # Only offer species whose reference has actually already been
-        # downloaded on this system -- matching against a species that
-        # hasn't been prepared yet would have nothing real to compare
-        # against.
         available_species = [
             k for k in species_options
             if os.path.isdir(pm.shared_genome_dir(k)) and len(os.listdir(pm.shared_genome_dir(k))) > 0
@@ -1125,14 +1379,6 @@ def _render_custom_mito_resolution(project, custom_gtf_path):
         manual_text = st.text_area("Gene IDs or symbols:", key="sc_custom_mito_manual_entry", height=100)
         if manual_text and st.button("🔍 Match Manual Entry Against Reference", key="sc_custom_mito_manual_match_btn"):
             manual_terms = [t.strip() for t in manual_text.replace(",", "\n").splitlines() if t.strip()]
-            # Match manual entries against BOTH gene symbols (gene_name,
-            # via match_custom_genes_by_mito_symbol) and, separately,
-            # gene IDs across the ENTIRE GTF (via
-            # find_gene_ids_matching_terms -- NOT the contig-restricted
-            # get_mito_gene_ids_from_gtf, which would trivially return
-            # empty here since that's exactly why this manual-entry path
-            # was reached in the first place). A user may reasonably
-            # supply either symbols or IDs.
             symbol_matched = cellqc.match_custom_genes_by_mito_symbol(custom_gtf_path, manual_terms)
             direct_id_matches = cellqc.find_gene_ids_matching_terms(custom_gtf_path, manual_terms)
             combined = sorted(set(symbol_matched) | set(direct_id_matches))
@@ -1199,8 +1445,15 @@ def _render_step5(project, pairs):
             st.success(f"✅ Reference files already prepared (shared, reused across projects): `{os.path.basename(genome_fasta_expected)}` + `{os.path.basename(gtf_expected)}`")
             reference_cfg.update({"custom_genome_fasta": genome_fasta_expected, "custom_gtf": gtf_expected, "annotation_format": "gtf"})
 
-            # --- Mitochondrial genome verification (2026-08-17) ---
             _render_preset_mito_verification(project, species_choice, species_labels, genome_fasta_expected, gtf_expected)
+            # --- Gene-name resolution summary (2026-08-25) -- see this
+            # module's own docstring, "GFF3-fallback gene-name
+            # resolution summary surfaced at Step 5", for the full
+            # rationale. Rendered immediately after the mitochondrial
+            # verification above (same target_dir, same natural
+            # "review this reference" moment) -- shows nothing at all
+            # for a species whose direct Ensembl GTF was available.
+            _render_gene_name_resolution_summary(target_dir)
         else:
             st.info("ℹ️ This reference hasn't been downloaded on this server yet. Downloading can take several minutes -- this only needs to happen ONCE per species.")
             if st.button("⬇️ Download & Prepare Reference", key="sc_ref_download_btn", type="primary"):
@@ -1344,31 +1597,13 @@ def _render_step5(project, pairs):
         if missing:
             st.error(f"⚠️ Missing: {', '.join(missing)} -- provide these above before confirming.")
         else:
-            # Only preserve a prior mito_gene_ids/mito_source resolution
-            # if the underlying reference IDENTITY is unchanged from
-            # what was last saved -- otherwise a stale resolution from a
-            # PREVIOUSLY selected (and possibly never even fully
-            # confirmed) reference can silently leak onto a totally
-            # different reference selected afterward. This is the fix
-            # for a real incident: a killifish custom-reference mito
-            # resolution (saved via _render_custom_mito_resolution's own
-            # independent save button, used only to test the contig-
-            # picker feature) leaked onto a human preset reference after
-            # switching Step 5's source radio back to preset without
-            # ever confirming the killifish reference itself -- the old
-            # code below this comment used to carry over
-            # mito_gene_ids/mito_source unconditionally whenever the new
-            # reference_cfg didn't set them, with no check at all on
-            # whether the reference itself had actually changed.
             prior_cfg = scpm.get_reference_choice(project) or {}
             prior_is_custom = prior_cfg.get("is_custom")
             new_is_custom = reference_cfg.get("is_custom")
             same_reference_identity = (
                 prior_is_custom == new_is_custom
                 and (
-                    # Preset: identity is the species key.
                     (not new_is_custom and prior_cfg.get("species_key") == reference_cfg.get("species_key"))
-                    # Custom: identity is the exact genome FASTA + GTF paths.
                     or (new_is_custom
                         and prior_cfg.get("custom_genome_fasta") == reference_cfg.get("custom_genome_fasta")
                         and prior_cfg.get("custom_gtf") == reference_cfg.get("custom_gtf"))
@@ -1379,10 +1614,6 @@ def _render_step5(project, pairs):
                     if key in prior_cfg and key not in reference_cfg:
                         reference_cfg[key] = prior_cfg[key]
             elif prior_cfg.get("mito_gene_ids") or prior_cfg.get("mito_source"):
-                # The reference actually changed since the last save --
-                # explicitly discard the old resolution rather than
-                # silently keeping it, and tell the user so this isn't
-                # a silent, confusing state change.
                 st.info(
                     "ℹ️ This project's reference changed since a mitochondrial gene "
                     "resolution was last saved -- that prior resolution has been cleared. "
@@ -1403,71 +1634,13 @@ def _resolve_star_index_dir(project, reference_cfg):
     species_key = reference_cfg.get("species_key")
     index_is_shared = not is_custom and bool(species_key)
     index_dir = pm.shared_star_index_dir(species_key) if index_is_shared else scpm.star_index_dir(project)
-    # files_present alone (qm.star_index_exists -- checks for the
-    # "SAindex" marker file) cannot tell a genuinely finished index
-    # apart from an OLD index that's actively being replaced by a
-    # force-rebuild in progress right now -- ensure_shared_resource()
-    # builds into a private temp dir and only swaps it in via a single
-    # atomic os.rename() at the very END of a successful build, so the
-    # old index stays fully present (and looks "ready") for the entire
-    # rebuild duration. See reference_manager.resource_build_in_progress()
-    # for the full rationale (this was a real reported bug: navigating
-    # away mid-rebuild and back showed a false "already built" status
-    # while the real rebuild was still running, confirmed via `top`).
-    #
-    # This check now applies uniformly to BOTH shared (preset) and
-    # custom (per-project) indexes, since _render_genome_index_step
-    # below now routes BOTH build paths through
-    # ref.ensure_shared_resource() -- previously only the shared path
-    # had a lock file to probe at all.
     files_present = qm.star_index_exists(index_dir)
     ready = files_present and not ref.resource_build_in_progress(index_dir)
     return index_dir, ready, index_is_shared
 
 
 def _render_genome_index_step(project, reference_cfg, pairs):
-    """
-    Genome index status + build UI -- shown in Step 5 immediately after
-    genome selection, STARsolo-specific (gated on aligner choice).
-
-    --- Force-rebuild bug fix (2026-08-17) ---
-    build_clicked (no index yet) and force_rebuild (an index already
-    exists, user explicitly wants it replaced) are tracked as TWO
-    SEPARATE flags -- see this module's earlier docstring for the
-    original flag-collapse regression this fixed.
-
-    --- Stale-resource-during-rebuild race fix (2026-08-18) ---
-    A real reported bug: a user force-rebuilding a shared STAR genome
-    index navigated between radio-button pages while the rebuild was
-    running (confirmed still running via `top` on the HPC host) and,
-    on navigating back, saw the index reported as "✅ already built"
-    even though the real rebuild was still in progress. Root cause:
-    reference_manager.ensure_shared_resource() builds into a private
-    temp directory and only replaces the OLD index via a single atomic
-    os.rename() at the very END of a successful build -- so the old
-    (stale) index stays fully present on disk, and any existence-only
-    check (qm.star_index_exists) reports "ready" for the ENTIRE rebuild
-    duration, with no way to distinguish a finished build from one
-    that's actively being replaced.
-
-    Fixed by using ref.resource_build_in_progress() (a non-blocking
-    probe on the resource's existing .lock file) as part of the
-    authoritative readiness check in _resolve_star_index_dir() above,
-    and by showing an explicit "🔄 build in progress, please wait"
-    status here that blocks further build actions while true.
-
-    Also: CUSTOM (non-shared, per-project) index builds now route
-    through ref.ensure_shared_resource() too, exactly like the shared
-    path -- previously the custom branch called qm.build_star_index()
-    DIRECTLY against index_dir with NO temp-dir staging, atomic
-    replacement, or lock-file protection at all, so a custom
-    reference's rebuild had the identical stale-appears-ready symptom
-    with even less of a safety net than the shared path had. Both
-    branches now share the same temp-directory + atomic-rename +
-    lock-file infrastructure -- there is no longer a separate "shared"
-    vs. "custom" code path for the actual build call, only for which
-    directory is targeted.
-    """
+    """Genome index status + build UI -- shown in Step 5 immediately after genome selection, STARsolo-specific (gated on aligner choice)."""
     genome_fasta = reference_cfg.get("custom_genome_fasta")
     gtf_path = reference_cfg.get("custom_gtf")
     if not genome_fasta or not gtf_path or not os.path.isfile(genome_fasta) or not os.path.isfile(gtf_path):
@@ -1511,12 +1684,10 @@ def _render_genome_index_step(project, reference_cfg, pairs):
     else:
         st.info("ℹ️ **No genome index found yet -- build it below before alignment can run.** This is a one-time step per reference and can take a while for larger genomes.")
 
-    # --- THE FIX: two separate flags, not one -- AND both builds now
-    # route through ensure_shared_resource() (see below) ---
     build_clicked = False
     force_rebuild = False
     if build_in_progress:
-        pass  # no build controls shown while a build is already running
+        pass
     elif not index_ready:
         build_clicked = st.button("🔧 Build Genome Index", key="sc_build_star_index_btn", type="primary")
     else:
@@ -1541,12 +1712,6 @@ def _render_genome_index_step(project, reference_cfg, pairs):
         def _build_index_impl(temp_dir):
             return qm.build_star_index(genome_fasta, gtf_path, temp_dir, threads=index_threads, sjdb_overhang=sjdb_overhang)
 
-        # Both shared (preset) AND custom (per-project) index builds
-        # now go through ensure_shared_resource() -- previously only
-        # the shared branch got temp-dir + atomic-rename + lock
-        # protection here; a custom reference's rebuild wrote STAR's
-        # output directly into index_dir with no protection at all.
-        # See this function's docstring for the full rationale.
         status_placeholder = st.empty()
 
         def _wait_cb(elapsed):
@@ -1723,68 +1888,30 @@ def _render_step6(project, pairs):
     else:
         _render_starsolo_run_controls(project, pairs, cell_filter)
 
+        if scpm.has_completed_step(project, "alignment"):
+            st.markdown("---")
+            if st.button("➡️ Proceed to Phase 2: Cell-level QC", key="sc_proceed_to_cellqc_btn", type="primary"):
+                st.session_state["nav_request"] = "🔬 SC Cell-level QC"
+                st.rerun()
+
 
 PLOTLY_THEME_OPTIONS = {
-    "Default": "plotly",
-    "Plotly White": "plotly_white",
-    "Plotly Dark": "plotly_dark",
-    "Seaborn": "seaborn",
-    "Simple White": "simple_white",
-    "ggplot2-style": "ggplot2",
-    "Presentation": "presentation",
+    "Default": "plotly", "Plotly White": "plotly_white", "Plotly Dark": "plotly_dark",
+    "Seaborn": "seaborn", "Simple White": "simple_white", "ggplot2-style": "ggplot2", "Presentation": "presentation",
 }
-
-FONT_FAMILY_OPTIONS = [
-    "Arial", "Helvetica", "Times New Roman", "Courier New", "Georgia", "Verdana",
-]
-
-_DEFAULT_COLOR_PALETTE = [
-    "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A",
-    "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52",
-]
-
-# Built-in Plotly colorscale names appropriate for a SEQUENTIAL
-# (one-directional -- e.g. "low mito%" through "high mito%") continuous
-# color axis -- offered for the counts-vs-genes scatter plot below,
-# since mitochondrial % is fundamentally one-directional (never
-# meaningfully negative), matching this workspace's own existing
-# default of "Inferno_r".
-SEQUENTIAL_COLORSCALE_OPTIONS = [
-    "Inferno", "Viridis", "Cividis", "Plasma", "Magma", "Turbo",
-    "Blues", "Greens", "Greys", "Oranges", "Purples", "Reds",
-    "YlOrRd", "YlGnBu",
-]
-
+FONT_FAMILY_OPTIONS = ["Arial", "Helvetica", "Times New Roman", "Courier New", "Georgia", "Verdana"]
+_DEFAULT_COLOR_PALETTE = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"]
+SEQUENTIAL_COLORSCALE_OPTIONS = ["Inferno", "Viridis", "Cividis", "Plasma", "Magma", "Turbo", "Blues", "Greens", "Greys", "Oranges", "Purples", "Reds", "YlOrRd", "YlGnBu"]
 PDF_SIZE_PRESETS = {
-    "Small (600 x 450 px)": (600, 450),
-    "Medium (900 x 675 px)": (900, 675),
-    "Large (1200 x 900 px)": (1200, 900),
-    "Presentation Widescreen (1920 x 1080 px)": (1920, 1080),
-    "US Letter Portrait, print quality (2550 x 3300 px)": (2550, 3300),
-    "US Letter Landscape, print quality (3300 x 2550 px)": (3300, 2550),
-    "A4 Portrait, print quality (2480 x 3508 px)": (2480, 3508),
+    "Small (600 x 450 px)": (600, 450), "Medium (900 x 675 px)": (900, 675), "Large (1200 x 900 px)": (1200, 900),
+    "Presentation Widescreen (1920 x 1080 px)": (1920, 1080), "US Letter Portrait, print quality (2550 x 3300 px)": (2550, 3300),
+    "US Letter Landscape, print quality (3300 x 2550 px)": (3300, 2550), "A4 Portrait, print quality (2480 x 3508 px)": (2480, 3508),
     "Custom size": None,
 }
-
-# Plotly.js "edits" config enabling click-and-drag legend/title
-# repositioning directly on the rendered chart -- see
-# differential_expression_workspace.py's own _PLOTLY_CHART_CONFIG
-# docstring for the full rationale on each flag. Gene-label-specific
-# "annotationTail" behavior isn't relevant here (no volcano-style gene
-# labels among these 6 plots), but is harmless to leave enabled.
-_PLOTLY_CHART_CONFIG = {
-    "displaylogo": False,
-    "edits": {
-        "legendPosition": True,
-        "annotationPosition": True,
-        "annotationTail": True,
-        "titleText": True,
-    },
-}
+_PLOTLY_CHART_CONFIG = {"displaylogo": False, "edits": {"legendPosition": True, "annotationPosition": True, "annotationTail": True, "titleText": True}}
 
 
 def _pdf_export_available():
-    "Check whether the `kaleido` package (Plotly's static image export backend) is installed."
     try:
         import kaleido  # noqa: F401
         return True
@@ -1793,73 +1920,27 @@ def _pdf_export_available():
 
 
 def _render_plotly_chart(fig):
-    "Render a Plotly figure with click-and-drag legend/title repositioning enabled."
     st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CHART_CONFIG)
 
 
-def _render_plot_style_controls(key_prefix, group_values=None, default_colors=None,
-                                 show_legend_controls=True, single_color_default=None):
-    """
-    Render a reusable "customize this plot's appearance" panel -- same
-    controls as differential_expression_workspace.py's identical
-    helper: custom title, axis label overrides, font family/size, a
-    theme picker, a starting legend-position preset, and either:
-      - one color picker per group/category (if group_values is given
-        -- e.g. ["Singlet", "Doublet"]), or
-      - a single color picker (if single_color_default is given instead
-        -- for a plot with just one series/trace, like a violin or
-        histogram, where a per-group palette doesn't apply).
-    Passing NEITHER group_values NOR single_color_default skips the
-    color-picker section entirely.
-
-    Returns a style options dict consumed by _apply_plot_style() below.
-    For a single-color plot, the chosen color is returned under
-    style["color_map"][trace_name] where trace_name is whatever single
-    trace "name" the caller used when building that figure -- callers
-    should pass single_color_default as a dict {trace_name: hex_color}
-    (NOT a bare hex string), matching the same {name: color} shape
-    _apply_plot_style already expects for the multi-group case.
-    """
+def _render_plot_style_controls(key_prefix, group_values=None, default_colors=None, show_legend_controls=True, single_color_default=None):
     default_colors = default_colors or {}
-
     with st.expander("🎨 Customize this plot's appearance"):
         col1, col2 = st.columns(2)
         with col1:
-            custom_title = st.text_input(
-                "Custom title (optional):", value="", key=f"{key_prefix}_title",
-                help="Leave blank to use the default title.",
-            )
-            font_family = st.selectbox(
-                "Font style:", options=FONT_FAMILY_OPTIONS, key=f"{key_prefix}_font_family",
-            )
-            font_size = st.slider(
-                "Font size:", min_value=8, max_value=28, value=13, key=f"{key_prefix}_font_size",
-            )
+            custom_title = st.text_input("Custom title (optional):", value="", key=f"{key_prefix}_title", help="Leave blank to use the default title.")
+            font_family = st.selectbox("Font style:", options=FONT_FAMILY_OPTIONS, key=f"{key_prefix}_font_family")
+            font_size = st.slider("Font size:", min_value=8, max_value=28, value=13, key=f"{key_prefix}_font_size")
         with col2:
-            x_axis_label = st.text_input(
-                "Custom X-axis label (optional):", value="", key=f"{key_prefix}_xlabel",
-                help="Leave blank to use the default axis label.",
-            )
-            y_axis_label = st.text_input(
-                "Custom Y-axis label (optional):", value="", key=f"{key_prefix}_ylabel",
-                help="Leave blank to use the default axis label.",
-            )
-            theme_choice = st.selectbox(
-                "Theme:", options=list(PLOTLY_THEME_OPTIONS.keys()), key=f"{key_prefix}_theme",
-            )
+            x_axis_label = st.text_input("Custom X-axis label (optional):", value="", key=f"{key_prefix}_xlabel", help="Leave blank to use the default axis label.")
+            y_axis_label = st.text_input("Custom Y-axis label (optional):", value="", key=f"{key_prefix}_ylabel", help="Leave blank to use the default axis label.")
+            theme_choice = st.selectbox("Theme:", options=list(PLOTLY_THEME_OPTIONS.keys()), key=f"{key_prefix}_theme")
 
         legend_position = "Right (default)"
         if show_legend_controls:
             st.markdown("**Legend placement**")
-            legend_position = st.selectbox(
-                "Starting legend position:",
-                options=["Right (default)", "Top", "Bottom", "Left", "Bottom-right (inside plot)"],
-                key=f"{key_prefix}_legend_pos",
-            )
-            st.caption(
-                "💡 Tip: you can also click and drag the legend directly "
-                "on the chart itself to fine-tune its position."
-            )
+            legend_position = st.selectbox("Starting legend position:", options=["Right (default)", "Top", "Bottom", "Left", "Bottom-right (inside plot)"], key=f"{key_prefix}_legend_pos")
+            st.caption("💡 Tip: you can also click and drag the legend directly on the chart itself to fine-tune its position.")
 
         color_map = {}
         if group_values:
@@ -1870,40 +1951,21 @@ def _render_plot_style_controls(key_prefix, group_values=None, default_colors=No
                 fallback_color = _DEFAULT_COLOR_PALETTE[i % len(_DEFAULT_COLOR_PALETTE)]
                 default_color = default_colors.get(str(group_val), fallback_color)
                 with color_cols[i % n_cols]:
-                    color_map[str(group_val)] = st.color_picker(
-                        str(group_val), value=default_color, key=f"{key_prefix}_color_{group_val}",
-                    )
+                    color_map[str(group_val)] = st.color_picker(str(group_val), value=default_color, key=f"{key_prefix}_color_{group_val}")
         elif single_color_default:
             st.markdown("**Color**")
             for trace_name, default_color in single_color_default.items():
-                color_map[trace_name] = st.color_picker(
-                    "Plot color:", value=default_color, key=f"{key_prefix}_color_single",
-                )
+                color_map[trace_name] = st.color_picker("Plot color:", value=default_color, key=f"{key_prefix}_color_single")
 
     return {
-        "title": custom_title,
-        "font_family": font_family,
-        "font_size": font_size,
-        "x_axis_label": x_axis_label,
-        "y_axis_label": y_axis_label,
-        "theme": PLOTLY_THEME_OPTIONS[theme_choice],
-        "legend_position": legend_position,
-        "color_map": color_map,
+        "title": custom_title, "font_family": font_family, "font_size": font_size,
+        "x_axis_label": x_axis_label, "y_axis_label": y_axis_label,
+        "theme": PLOTLY_THEME_OPTIONS[theme_choice], "legend_position": legend_position, "color_map": color_map,
     }
 
 
-def _apply_plot_style(fig, style, default_title="", default_x_label=None,
-                       default_y_label=None):
-    """
-    Apply a style dict (from _render_plot_style_controls) to an
-    existing Plotly figure -- IDENTICAL logic to
-    differential_expression_workspace.py's own _apply_plot_style; see
-    that module for the full rationale on why the title is rendered as
-    a draggable annotation rather than Plotly's native layout.title,
-    and why per-trace recoloring is matched by trace NAME.
-    """
+def _apply_plot_style(fig, style, default_title="", default_x_label=None, default_y_label=None):
     title_text = (style.get("title") or "").strip() or default_title
-
     x_label = (style.get("x_axis_label") or "").strip() or default_x_label
     y_label = (style.get("y_axis_label") or "").strip() or default_y_label
 
@@ -1916,19 +1978,11 @@ def _apply_plot_style(fig, style, default_title="", default_x_label=None,
     elif pos == "Left":
         legend_layout = dict(yanchor="middle", y=0.5, xanchor="right", x=-0.25)
     elif pos == "Bottom-right (inside plot)":
-        legend_layout = dict(
-            yanchor="bottom", y=0.01, xanchor="right", x=0.99,
-            bgcolor="rgba(255,255,255,0.7)", bordercolor="rgba(0,0,0,0.2)", borderwidth=1,
-        )
+        legend_layout = dict(yanchor="bottom", y=0.01, xanchor="right", x=0.99, bgcolor="rgba(255,255,255,0.7)", bordercolor="rgba(0,0,0,0.2)", borderwidth=1)
 
     font_family = style.get("font_family", "Arial")
     font_size = style.get("font_size", 13)
-
-    layout_kwargs = dict(
-        template=style.get("theme", "plotly"),
-        font=dict(family=font_family, size=font_size),
-        title="",
-    )
+    layout_kwargs = dict(template=style.get("theme", "plotly"), font=dict(family=font_family, size=font_size), title="")
     if title_text:
         layout_kwargs["margin"] = dict(t=max(70, int(font_size * 3.2)))
     if legend_layout:
@@ -1936,16 +1990,8 @@ def _apply_plot_style(fig, style, default_title="", default_x_label=None,
     fig.update_layout(**layout_kwargs)
 
     if title_text:
-        fig.add_annotation(
-            text=title_text,
-            xref="paper", yref="paper",
-            x=0.5, y=1.10,
-            xanchor="center", yanchor="bottom",
-            showarrow=False,
-            font=dict(family=font_family, size=font_size + 5),
-            name="plot_title",
-        )
-
+        fig.add_annotation(text=title_text, xref="paper", yref="paper", x=0.5, y=1.10, xanchor="center", yanchor="bottom",
+                            showarrow=False, font=dict(family=font_family, size=font_size + 5), name="plot_title")
     if x_label:
         fig.update_xaxes(title_text=x_label)
     if y_label:
@@ -1960,60 +2006,24 @@ def _apply_plot_style(fig, style, default_title="", default_x_label=None,
                     trace.marker.color = color_map[trace_name]
                 if hasattr(trace, "line") and trace.line is not None and trace.line.color is not None:
                     trace.line.color = color_map[trace_name]
-                # Violin traces (used by this workspace's 3 metric-
-                # distribution plots and the doublet-split plot) also
-                # have their own separate "fillcolor" attribute, set
-                # independently of line.color when originally built --
-                # confirmed via direct testing that this attribute
-                # exists and is settable on a go.Violin trace. Without
-                # this, a user's custom color pick would only recolor
-                # the violin's OUTLINE, leaving its fill stuck at the
-                # original default color -- a real, confirmed visual
-                # mismatch bug this ported function didn't originally
-                # need to handle, since none of the Bulk RNA-Seq
-                # pipeline's own plots (PCA, volcano, MA, dispersion)
-                # use a violin trace with a separate fill color.
                 if hasattr(trace, "fillcolor") and trace.fillcolor is not None:
                     trace.fillcolor = color_map[trace_name]
-
     return fig
 
 
-def _render_group_label_renaming_controls(key_prefix, group_values,
-                                           label="Rename group labels (optional)"):
-    """
-    Render an optional "rename these labels for display" expander --
-    IDENTICAL pattern to differential_expression_workspace.py's own
-    helper of the same name. Used here only for the doublet-split
-    violin's Singlet/Doublet category labels (the one plot among
-    these 6 with a meaningful discrete group axis worth renaming).
-
-    Returns a dict {raw_value: display_label}.
-    """
+def _render_group_label_renaming_controls(key_prefix, group_values, label="Rename group labels (optional)"):
     display_map = {}
     with st.expander(f"✏️ {label}"):
-        st.caption(
-            "Customize how each value below is displayed -- this only "
-            "changes the DISPLAY text in this plot's legend/labels; "
-            "your underlying data is never modified."
-        )
+        st.caption("Customize how each value below is displayed -- this only changes the DISPLAY text in this plot's legend/labels; your underlying data is never modified.")
         n_cols = min(3, max(1, len(group_values)))
         cols = st.columns(n_cols)
         for i, val in enumerate(group_values):
             with cols[i % n_cols]:
-                display_map[str(val)] = st.text_input(
-                    f"Label for `{val}`:", value=str(val),
-                    key=f"{key_prefix}_group_label_{val}",
-                )
+                display_map[str(val)] = st.text_input(f"Label for `{val}`:", value=str(val), key=f"{key_prefix}_group_label_{val}")
     return display_map
 
 
 def _apply_group_label_renaming(fig, group_label_map):
-    """
-    Rename each trace's legend display name -- IDENTICAL logic to
-    differential_expression_workspace.py's own helper. MUST be applied
-    AFTER _apply_plot_style (see that module's docstring for why).
-    """
     if not group_label_map:
         return fig
     for trace in fig.data:
@@ -2024,46 +2034,15 @@ def _apply_group_label_renaming(fig, group_label_map):
 
 
 def _render_colorscale_controls(key_prefix, options, default, default_reverse=False):
-    """
-    Render a continuous-color-axis picker pair (colorscale name +
-    "Reverse" checkbox) for a plot using a CONTINUOUS color mapping
-    (e.g. this workspace's counts-vs-genes scatter plot, colored by
-    mitochondrial %) -- as opposed to _render_plot_style_controls'
-    discrete per-GROUP color pickers, which only make sense for a
-    plot with distinct categorical traces.
-
-    default, default_reverse: the colorscale name/reverse-flag that
-        reproduce this workspace's ORIGINAL hardcoded appearance (e.g.
-        default="Inferno", default_reverse=True reproduces the
-        existing "Inferno_r"), so a user who never touches these
-        controls sees no visual change.
-
-    Returns (colorscale_name: str, reverse: bool).
-    """
     col1, col2 = st.columns([2, 1])
     with col1:
-        colorscale = st.selectbox(
-            "Color scale:", options=options,
-            index=options.index(default) if default in options else 0,
-            key=f"{key_prefix}_colorscale_select",
-        )
+        colorscale = st.selectbox("Color scale:", options=options, index=options.index(default) if default in options else 0, key=f"{key_prefix}_colorscale_select")
     with col2:
-        reverse = st.checkbox(
-            "Reverse", value=default_reverse, key=f"{key_prefix}_colorscale_reverse",
-            help="Flips the color scale's direction (e.g. which end is dark vs. light).",
-        )
+        reverse = st.checkbox("Reverse", value=default_reverse, key=f"{key_prefix}_colorscale_reverse", help="Flips the color scale's direction (e.g. which end is dark vs. light).")
     return colorscale, reverse
 
 
 def _sanitize_filename(custom_name, fallback, extension):
-    """
-    Sanitize a user-provided file name for use in a download_button --
-    IDENTICAL logic to differential_expression_workspace.py's own
-    helper (strips path separators, whitespace, and a redundant
-    trailing extension the user may have typed themselves).
-
-    Returns the sanitized name, WITHOUT the extension.
-    """
     safe = (custom_name or fallback).strip()
     safe = re.sub(r"[\\/]+", "_", safe)
     safe = re.sub(rf"\.{re.escape(extension)}$", "", safe, flags=re.IGNORECASE).strip()
@@ -2072,71 +2051,30 @@ def _sanitize_filename(custom_name, fallback, extension):
     return safe
 
 
-def _render_csv_download(df, default_filename, key_prefix, expander_label,
-                          help_text=None, button_label="⬇️ Download CSV"):
-    """
-    Render a "download this table as CSV" panel -- IDENTICAL pattern to
-    differential_expression_workspace.py's own helper: an editable file
-    name (pre-filled with a sensible default) plus a download button.
-    """
+def _render_csv_download(df, default_filename, key_prefix, expander_label, help_text=None, button_label="⬇️ Download CSV"):
     with st.expander(expander_label):
-        custom_name = st.text_input(
-            "File name:", value=default_filename, key=f"{key_prefix}_csv_filename_input",
-            help="The .csv extension is added automatically -- no need to type it.",
-        )
+        custom_name = st.text_input("File name:", value=default_filename, key=f"{key_prefix}_csv_filename_input", help="The .csv extension is added automatically -- no need to type it.")
         safe_name = _sanitize_filename(custom_name, default_filename, "csv")
         csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            button_label,
-            data=csv_bytes,
-            file_name=f"{safe_name}.csv",
-            mime="text/csv",
-            key=f"{key_prefix}_csv_download_btn",
-            help=help_text,
-        )
+        st.download_button(button_label, data=csv_bytes, file_name=f"{safe_name}.csv", mime="text/csv", key=f"{key_prefix}_csv_download_btn", help=help_text)
 
 
 def _render_pdf_export(fig, key_prefix, filename_base):
-    """
-    Render a "save this plot as a PDF" panel -- IDENTICAL pattern to
-    differential_expression_workspace.py's own helper. Requires the
-    `kaleido` package -- already a dependency of this app (used
-    elsewhere in this same module by _build_qc_package_zip's PNG
-    export), so this should already be available wherever the existing
-    QC package download works.
-    """
     with st.expander("📄 Save this plot as a PDF"):
         if not _pdf_export_available():
-            st.warning(
-                "⚠️ PDF export requires the `kaleido` package, which "
-                "isn't installed in this environment."
-            )
+            st.warning("⚠️ PDF export requires the `kaleido` package, which isn't installed in this environment.")
             return
-
-        size_choice = st.selectbox(
-            "PDF size:", options=list(PDF_SIZE_PRESETS.keys()), key=f"{key_prefix}_pdf_size",
-        )
+        size_choice = st.selectbox("PDF size:", options=list(PDF_SIZE_PRESETS.keys()), key=f"{key_prefix}_pdf_size")
         if size_choice == "Custom size":
             c1, c2 = st.columns(2)
             with c1:
-                width_px = st.number_input(
-                    "Width (pixels):", min_value=200, max_value=6000, value=1000, step=50,
-                    key=f"{key_prefix}_pdf_width",
-                )
+                width_px = st.number_input("Width (pixels):", min_value=200, max_value=6000, value=1000, step=50, key=f"{key_prefix}_pdf_width")
             with c2:
-                height_px = st.number_input(
-                    "Height (pixels):", min_value=200, max_value=6000, value=700, step=50,
-                    key=f"{key_prefix}_pdf_height",
-                )
+                height_px = st.number_input("Height (pixels):", min_value=200, max_value=6000, value=700, step=50, key=f"{key_prefix}_pdf_height")
         else:
             width_px, height_px = PDF_SIZE_PRESETS[size_choice]
             st.caption(f"Output size: {width_px} x {height_px} pixels.")
-
-        custom_filename = st.text_input(
-            "File name:", value=filename_base, key=f"{key_prefix}_pdf_filename_input",
-            help="The .pdf extension is added automatically -- no need to type it.",
-        )
-
+        custom_filename = st.text_input("File name:", value=filename_base, key=f"{key_prefix}_pdf_filename_input", help="The .pdf extension is added automatically -- no need to type it.")
         if st.button("Generate PDF", key=f"{key_prefix}_pdf_generate_btn"):
             try:
                 pdf_bytes = fig.to_image(format="pdf", width=width_px, height=height_px)
@@ -2144,37 +2082,17 @@ def _render_pdf_export(fig, key_prefix, filename_base):
             except Exception as e:
                 st.session_state.pop(f"{key_prefix}_pdf_bytes", None)
                 st.error(f"⚠️ Could not generate the PDF. Details: {e}")
-
         pdf_bytes = st.session_state.get(f"{key_prefix}_pdf_bytes")
         if pdf_bytes:
             safe_filename = _sanitize_filename(custom_filename, filename_base, "pdf")
-            st.download_button(
-                "⬇️ Download PDF",
-                data=pdf_bytes,
-                file_name=f"{safe_filename}.pdf",
-                mime="application/pdf",
-                key=f"{key_prefix}_pdf_download_btn",
-            )
+            st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=f"{safe_filename}.pdf", mime="application/pdf", key=f"{key_prefix}_pdf_download_btn")
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: Cell-level QC visualizations
-# ---------------------------------------------------------------------------
 def _render_stale_index_diagnostic(diagnostic, sample_name):
-    """
-    Render sc_cellqc_manager.diagnose_starsolo_matrix_for_mito()'s result
-    -- a fast, pre-flight check of THIS sample's already-aligned matrix,
-    run BEFORE the (much slower) full Cell-level QC pipeline, so a
-    stale-index situation is caught and explained immediately rather than
-    only discovered after re-running the whole R pipeline again. See this
-    module's own docstring, "Genome-index force-rebuild bug fix +
-    stale-index diagnostic", for the full rationale.
-    """
     if diagnostic is None:
-        return  # no features.tsv found -- _render_step6/filtered_dir check already covers this
+        return
     if not diagnostic["likely_stale_index"]:
-        return  # matrix has mito genes -- nothing to warn about here
-
+        return
     st.error(
         f"🔴 **This sample's (`{sample_name}`) already-aligned matrix has "
         f"{diagnostic['total_genes']:,} genes total, but ZERO of them are mitochondrial.** "
@@ -2196,17 +2114,12 @@ def _render_stale_index_diagnostic(diagnostic, sample_name):
 
 def _render_mito_diagnostic(diagnostic):
     if diagnostic is None:
-        st.caption(
-            "ℹ️ This project's cell-level QC run predates the mitochondrial-gene detection "
-            "diagnostic -- re-run to see this breakdown."
-        )
+        st.caption("ℹ️ This project's cell-level QC run predates the mitochondrial-gene detection diagnostic -- re-run to see this breakdown.")
         return
-
     symbol_count = diagnostic.get("symbol_match_count", 0)
     gtf_count = diagnostic.get("gtf_derived_count", 0)
     union_count = diagnostic.get("union_count", 0)
     mito_source = diagnostic.get("mito_source", "gtf_auto_detect")
-
     if diagnostic.get("warning") == "no_mito_genes_found" or union_count == 0:
         st.error(
             "🔴 **Zero mitochondrial genes were identified in this reference, by either detection "
@@ -2224,20 +2137,11 @@ def _render_mito_diagnostic(diagnostic):
     else:
         sample_ids = diagnostic.get("sample_gene_ids") or []
         sample_note = f" (e.g. `{'`, `'.join(sample_ids[:3])}`)" if sample_ids else ""
-        source_note = {
-            "gtf_auto_detect": "direct GTF chromosome lookup",
-        }.get(mito_source, mito_source.replace("_", " "))
-        st.success(
-            f"🟢 **{union_count} mitochondrial gene(s)** identified in this reference{sample_note} "
-            f"-- {symbol_count} via gene-symbol matching, {gtf_count} via {source_note}."
-        )
+        source_note = {"gtf_auto_detect": "direct GTF chromosome lookup"}.get(mito_source, mito_source.replace("_", " "))
+        st.success(f"🟢 **{union_count} mitochondrial gene(s)** identified in this reference{sample_note} -- {symbol_count} via gene-symbol matching, {gtf_count} via {source_note}.")
+
 
 def _render_doubletfinder_diagnostic(diagnostic_result):
-    """
-    Render diagnose_doubletfinder_result()'s output -- one st.error/
-    st.warning per issue found, or nothing at all if no issues were
-    detected (or DoubletFinder wasn't the method used for this run).
-    """
     if not diagnostic_result["flagged"]:
         return
     for message in diagnostic_result["messages"]:
@@ -2247,14 +2151,11 @@ def _render_doubletfinder_diagnostic(diagnostic_result):
             st.warning(message)
 
 
-def _render_cellqc_visualizations(qc_df, output_dir, doublet_method_used):
+def _render_cellqc_visualizations(qc_df, output_dir, doublet_method_used, gtf_path=None):
+    """gtf_path: threaded through to cellqc.read_top_ambient_genes() for real gene names."""
     st.markdown("### 📊 QC Visualizations")
-
     figures = {}
 
-    # -----------------------------------------------------------------
-    # 1-3. Per-cell QC metric distributions (3 violin plots)
-    # -----------------------------------------------------------------
     st.markdown("**Per-cell QC metric distributions**")
     violin_cols = st.columns(3)
     metric_specs = [
@@ -2267,584 +2168,124 @@ def _render_cellqc_visualizations(qc_df, output_dir, doublet_method_used):
             continue
         with col:
             fig = go.Figure()
-            fig.add_trace(go.Violin(
-                y=qc_df[col_name], box_visible=True, points="outliers",
-                name=label, meanline_visible=True,
-                line_color=default_color, fillcolor=default_color, opacity=0.6,
-            ))
+            fig.add_trace(go.Violin(y=qc_df[col_name], box_visible=True, points="outliers", name=label, meanline_visible=True, line_color=default_color, fillcolor=default_color, opacity=0.6))
             fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
-
-            style = _render_plot_style_controls(
-                f"qc_violin_{col_name}", single_color_default={label: default_color},
-                show_legend_controls=False,
-            )
+            style = _render_plot_style_controls(f"qc_violin_{col_name}", single_color_default={label: default_color}, show_legend_controls=False)
             _apply_plot_style(fig, style, default_title=label, default_y_label=label)
             st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CHART_CONFIG)
             _render_pdf_export(fig, f"qc_violin_{col_name}", f"qc_{col_name}_violin")
-            _render_csv_download(
-                qc_df[["barcode", col_name]].rename(columns={col_name: label}),
-                f"qc_{col_name}_values", f"qc_violin_{col_name}",
-                expander_label="⬇️ Download this metric's per-cell values (.csv)",
-            )
+            _render_csv_download(qc_df[["barcode", col_name]].rename(columns={col_name: label}), f"qc_{col_name}_values", f"qc_violin_{col_name}", expander_label="⬇️ Download this metric's per-cell values (.csv)")
         figures[f"qc_violin_{col_name}"] = fig
 
-    st.caption(
-        "Standard first-look QC plots: too-low counts/genes suggest empty droplets or "
-        "low-quality cells; unusually high counts/genes can indicate doublets; elevated "
-        "mitochondrial % suggests stressed or dying cells."
-    )
+    st.caption("Standard first-look QC plots: too-low counts/genes suggest empty droplets or low-quality cells; unusually high counts/genes can indicate doublets; elevated mitochondrial % suggests stressed or dying cells.")
 
-    # -----------------------------------------------------------------
-    # 4. Total counts vs. genes detected (scatter, colored by mito%)
-    # -----------------------------------------------------------------
     if all(c in qc_df.columns for c in ("sum", "detected", "subsets_Mito_percent")):
         st.markdown("**Total counts vs. genes detected** (colored by mitochondrial %)")
-
-        # Continuous color-scale picker -- replaces the previously
-        # hardcoded "Inferno_r" (colorscale="Inferno", reverse=True
-        # reproduces that exact original default).
-        scatter_colorscale, scatter_reverse = _render_colorscale_controls(
-            "qc_scatter", SEQUENTIAL_COLORSCALE_OPTIONS, default="Inferno", default_reverse=True,
-        )
-
-        scatter_fig = px.scatter(
-            qc_df, x="sum", y="detected", color="subsets_Mito_percent",
-            color_continuous_scale=scatter_colorscale + ("_r" if scatter_reverse else ""),
-            labels={"sum": "Total UMI counts", "detected": "Genes detected", "subsets_Mito_percent": "Mito %"},
-            opacity=0.6,
-        )
+        scatter_colorscale, scatter_reverse = _render_colorscale_controls("qc_scatter", SEQUENTIAL_COLORSCALE_OPTIONS, default="Inferno", default_reverse=True)
+        scatter_fig = px.scatter(qc_df, x="sum", y="detected", color="subsets_Mito_percent", color_continuous_scale=scatter_colorscale + ("_r" if scatter_reverse else ""),
+                                  labels={"sum": "Total UMI counts", "detected": "Genes detected", "subsets_Mito_percent": "Mito %"}, opacity=0.6)
         scatter_fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-
         scatter_style = _render_plot_style_controls("qc_scatter", show_legend_controls=False)
-        _apply_plot_style(
-            scatter_fig, scatter_style,
-            default_title="Total counts vs. genes detected (colored by mitochondrial %)",
-            default_x_label="Total UMI counts", default_y_label="Genes detected",
-        )
+        _apply_plot_style(scatter_fig, scatter_style, default_title="Total counts vs. genes detected (colored by mitochondrial %)", default_x_label="Total UMI counts", default_y_label="Genes detected")
         _render_plotly_chart(scatter_fig)
         _render_pdf_export(scatter_fig, "qc_scatter", "qc_counts_vs_genes_scatter")
-        _render_csv_download(
-            qc_df[["barcode", "sum", "detected", "subsets_Mito_percent"]],
-            "qc_counts_vs_genes_data", "qc_scatter",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
+        _render_csv_download(qc_df[["barcode", "sum", "detected", "subsets_Mito_percent"]], "qc_counts_vs_genes_data", "qc_scatter", expander_label="⬇️ Download this plot's underlying data (.csv)")
         figures["qc_scatter_counts_vs_genes"] = scatter_fig
-        st.caption(
-            "Cells that are both low-count AND high-mito (bright points in the lower-left) are "
-            "the strongest candidates for exclusion -- low complexity alone can still be "
-            "biologically real for some cell types."
-        )
+        st.caption("Cells that are both low-count AND high-mito (bright points in the lower-left) are the strongest candidates for exclusion -- low complexity alone can still be biologically real for some cell types.")
 
-    # -----------------------------------------------------------------
-    # 5. Doublet score distribution (histogram)
-    # -----------------------------------------------------------------
     if "doublet_score" in qc_df.columns:
         st.markdown(f"**Doublet score distribution** ({doublet_method_used})")
-
         has_prediction = "predicted_doublet" in qc_df.columns
         doublet_default_colors = {"True": "#d62728", "False": "#1f77b4"}
-        hist_fig = px.histogram(
-            qc_df, x="doublet_score", color="predicted_doublet" if has_prediction else None,
-            nbins=50, labels={"doublet_score": "Doublet score", "predicted_doublet": "Predicted doublet"},
-            color_discrete_map={True: doublet_default_colors["True"], False: doublet_default_colors["False"]} if has_prediction else None,
-        )
+        hist_fig = px.histogram(qc_df, x="doublet_score", color="predicted_doublet" if has_prediction else None, nbins=50,
+                                 labels={"doublet_score": "Doublet score", "predicted_doublet": "Predicted doublet"},
+                                 color_discrete_map={True: doublet_default_colors["True"], False: doublet_default_colors["False"]} if has_prediction else None)
         if not has_prediction:
-            # Same fix as the ambient-contamination histogram/bar chart
-            # below -- confirmed via direct testing that px.histogram's
-            # single (ungrouped) trace defaults to name="" rather than
-            # the x-column name. Only needed in this branch: when
-            # has_prediction is True, px's own boolean-column grouping
-            # already produces the exact trace names "True"/"False" this
-            # function's group_values/default_colors already expect (also
-            # confirmed via direct testing), so no rename is needed there.
             hist_fig.update_traces(name="doublet_score")
         hist_fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
-
         hist_group_values = ["True", "False"] if has_prediction else None
-        hist_style = _render_plot_style_controls(
-            "qc_doublet_hist",
-            group_values=hist_group_values,
-            default_colors=doublet_default_colors if has_prediction else None,
-            single_color_default=None if has_prediction else {"doublet_score": "#636EFA"},
-            show_legend_controls=has_prediction,
-        )
-        _apply_plot_style(
-            hist_fig, hist_style,
-            default_title=f"Doublet score distribution ({doublet_method_used})",
-            default_x_label="Doublet score", default_y_label="Number of cells",
-        )
+        hist_style = _render_plot_style_controls("qc_doublet_hist", group_values=hist_group_values, default_colors=doublet_default_colors if has_prediction else None,
+                                                  single_color_default=None if has_prediction else {"doublet_score": "#636EFA"}, show_legend_controls=has_prediction)
+        _apply_plot_style(hist_fig, hist_style, default_title=f"Doublet score distribution ({doublet_method_used})", default_x_label="Doublet score", default_y_label="Number of cells")
         _render_plotly_chart(hist_fig)
         _render_pdf_export(hist_fig, "qc_doublet_hist", "doublet_score_histogram")
-        _render_csv_download(
-            qc_df[["barcode", "doublet_score"] + (["predicted_doublet"] if has_prediction else [])],
-            "doublet_scores", "qc_doublet_hist",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
+        _render_csv_download(qc_df[["barcode", "doublet_score"] + (["predicted_doublet"] if has_prediction else [])], "doublet_scores", "qc_doublet_hist", expander_label="⬇️ Download this plot's underlying data (.csv)")
         figures["doublet_score_histogram"] = hist_fig
-        st.caption(
-            "A healthy doublet score distribution is typically **bimodal** -- most cells scored "
-            "near 0 (singlets), with a distinct, separated group scored near 1 (real doublets)."
-        )
+        st.caption("A healthy doublet score distribution is typically **bimodal** -- most cells scored near 0 (singlets), with a distinct, separated group scored near 1 (real doublets).")
 
-        # -------------------------------------------------------------
-        # 6. Total UMI counts, split by doublet call (violin)
-        # -------------------------------------------------------------
         if "sum" in qc_df.columns and "predicted_doublet" in qc_df.columns:
             st.markdown("**Total UMI counts, split by doublet call**")
-
             split_default_colors = {"Singlet": "#1f77b4", "Doublet": "#d62728"}
-            split_label_map = _render_group_label_renaming_controls(
-                "qc_doublet_split", ["Singlet", "Doublet"],
-                label="Rename Singlet/Doublet labels (optional)",
-            )
-
+            split_label_map = _render_group_label_renaming_controls("qc_doublet_split", ["Singlet", "Doublet"], label="Rename Singlet/Doublet labels (optional)")
             split_fig = go.Figure()
             for is_doublet, label, default_color in [(False, "Singlet", split_default_colors["Singlet"]), (True, "Doublet", split_default_colors["Doublet"])]:
                 subset = qc_df[qc_df["predicted_doublet"] == is_doublet]
                 if not subset.empty:
-                    split_fig.add_trace(go.Violin(
-                        y=subset["sum"], name=label, box_visible=True, meanline_visible=True,
-                        line_color=default_color,
-                    ))
+                    split_fig.add_trace(go.Violin(y=subset["sum"], name=label, box_visible=True, meanline_visible=True, line_color=default_color))
             split_fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
-
-            split_style = _render_plot_style_controls(
-                "qc_doublet_split", group_values=["Singlet", "Doublet"],
-                default_colors=split_default_colors,
-            )
-            _apply_plot_style(
-                split_fig, split_style,
-                default_title="Total UMI counts, split by doublet call",
-                default_y_label="Total UMI counts",
-            )
+            split_style = _render_plot_style_controls("qc_doublet_split", group_values=["Singlet", "Doublet"], default_colors=split_default_colors)
+            _apply_plot_style(split_fig, split_style, default_title="Total UMI counts, split by doublet call", default_y_label="Total UMI counts")
             _apply_group_label_renaming(split_fig, split_label_map)
             _render_plotly_chart(split_fig)
             _render_pdf_export(split_fig, "qc_doublet_split", "doublet_split_violin")
-            _render_csv_download(
-                qc_df[["barcode", "sum", "predicted_doublet"]],
-                "doublet_split_counts", "qc_doublet_split",
-                expander_label="⬇️ Download this plot's underlying data (.csv)",
-            )
-
+            _render_csv_download(qc_df[["barcode", "sum", "predicted_doublet"]], "doublet_split_counts", "qc_doublet_split", expander_label="⬇️ Download this plot's underlying data (.csv)")
             figures["doublet_split_violin"] = split_fig
-            st.caption(
-                "Predicted doublets should generally show HIGHER total UMI counts than singlets."
-            )
+            st.caption("Predicted doublets should generally show HIGHER total UMI counts than singlets.")
 
-    # -----------------------------------------------------------------
-    # 7. Ambient RNA contamination fraction distribution (histogram)
-    # -----------------------------------------------------------------
     if "ambient_contamination" in qc_df.columns and qc_df["ambient_contamination"].notna().any():
         st.markdown("**Ambient RNA contamination fraction distribution**")
-
         contam_default_color = "#636EFA"
-        contam_fig = px.histogram(
-            qc_df, x="ambient_contamination", nbins=40,
-            labels={"ambient_contamination": "Contamination fraction"},
-            color_discrete_sequence=[contam_default_color],
-        )
-        # px.histogram with no color-grouping column names its single
-        # trace "" (empty string) by default -- explicitly renamed here
-        # so _apply_plot_style's color_map (matched by trace NAME) can
-        # actually find and recolor it (confirmed via direct testing:
-        # the trace's default name does NOT automatically become the
-        # x-column name "ambient_contamination").
+        contam_fig = px.histogram(qc_df, x="ambient_contamination", nbins=40, labels={"ambient_contamination": "Contamination fraction"}, color_discrete_sequence=[contam_default_color])
         contam_fig.update_traces(name="ambient_contamination")
         contam_fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10))
-
-        contam_style = _render_plot_style_controls(
-            "qc_ambient_hist", single_color_default={"ambient_contamination": contam_default_color},
-            show_legend_controls=False,
-        )
-        _apply_plot_style(
-            contam_fig, contam_style,
-            default_title="Ambient RNA contamination fraction distribution",
-            default_x_label="Contamination fraction", default_y_label="Number of cells",
-        )
+        contam_style = _render_plot_style_controls("qc_ambient_hist", single_color_default={"ambient_contamination": contam_default_color}, show_legend_controls=False)
+        _apply_plot_style(contam_fig, contam_style, default_title="Ambient RNA contamination fraction distribution", default_x_label="Contamination fraction", default_y_label="Number of cells")
         _render_plotly_chart(contam_fig)
         _render_pdf_export(contam_fig, "qc_ambient_hist", "ambient_contamination_histogram")
-        _render_csv_download(
-            qc_df[["barcode", "ambient_contamination"]],
-            "ambient_contamination_values", "qc_ambient_hist",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
+        _render_csv_download(qc_df[["barcode", "ambient_contamination"]], "ambient_contamination_values", "qc_ambient_hist", expander_label="⬇️ Download this plot's underlying data (.csv)")
         figures["ambient_contamination_histogram"] = contam_fig
-        st.caption(
-            "DecontX reports a genuine per-cell distribution here; SoupX applies one global "
-            "estimate to every cell, so this histogram will show a single spike instead."
-        )
+        st.caption("DecontX reports a genuine per-cell distribution here; SoupX applies one global estimate to every cell, so this histogram will show a single spike instead.")
 
-    # -----------------------------------------------------------------
-    # 8. Top genes contributing to ambient RNA signal (horizontal bar)
-    # -----------------------------------------------------------------
-    top_ambient_df = cellqc.read_top_ambient_genes(output_dir)
+    top_ambient_df = cellqc.read_top_ambient_genes(output_dir, gtf_path=gtf_path)
     if top_ambient_df is not None and not top_ambient_df.empty:
         st.markdown("**Top genes contributing to ambient RNA signal**")
-
-        n_top_ambient = st.slider(
-            "Number of top genes to show:", min_value=5, max_value=min(50, len(top_ambient_df)),
-            value=min(15, len(top_ambient_df)), key="qc_ambient_bar_n_top",
-        )
+        n_top_ambient = st.slider("Number of top genes to show:", min_value=5, max_value=min(50, len(top_ambient_df)), value=min(15, len(top_ambient_df)), key="qc_ambient_bar_n_top")
         bar_default_color = "#636EFA"
         bar_data = top_ambient_df.head(n_top_ambient).sort_values("counts_removed")
-        bar_fig = px.bar(
-            bar_data, x="counts_removed", y="symbol", orientation="h",
-            labels={"counts_removed": "Total UMI counts removed", "symbol": "Gene"},
-            color_discrete_sequence=[bar_default_color],
-        )
-        # Same fix as the ambient-contamination histogram above -- px.bar
-        # with no color-grouping column also defaults its single trace's
-        # name to "" (empty string), which would silently fail to match
-        # single_color_default's key without this explicit rename.
+        bar_fig = px.bar(bar_data, x="counts_removed", y="symbol", orientation="h", labels={"counts_removed": "Total UMI counts removed", "symbol": "Gene"}, color_discrete_sequence=[bar_default_color])
         bar_fig.update_traces(name="counts_removed")
         bar_fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-
-        bar_style = _render_plot_style_controls(
-            "qc_ambient_bar", single_color_default={"counts_removed": bar_default_color},
-            show_legend_controls=False,
-        )
-        _apply_plot_style(
-            bar_fig, bar_style,
-            default_title="Top genes contributing to ambient RNA signal",
-            default_x_label="Total UMI counts removed", default_y_label="Gene",
-        )
+        bar_style = _render_plot_style_controls("qc_ambient_bar", single_color_default={"counts_removed": bar_default_color}, show_legend_controls=False)
+        _apply_plot_style(bar_fig, bar_style, default_title="Top genes contributing to ambient RNA signal", default_x_label="Total UMI counts removed", default_y_label="Gene")
         _render_plotly_chart(bar_fig)
         _render_pdf_export(bar_fig, "qc_ambient_bar", "top_ambient_genes_bar")
-        _render_csv_download(
-            bar_data, "top_ambient_genes", "qc_ambient_bar",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
+        _render_csv_download(bar_data, "top_ambient_genes", "qc_ambient_bar", expander_label="⬇️ Download this plot's underlying data (.csv)")
         figures["top_ambient_genes_bar"] = bar_fig
-        st.caption(
-            "These are typically a small number of highly-expressed marker genes from the most "
-            "abundant cell type(s) in the sample, leaking into every droplet as background 'soup'."
-        )
+        st.caption("These are typically a small number of highly-expressed marker genes from the most abundant cell type(s) in the sample, leaking into every droplet as background 'soup'.")
 
     return figures
 
 
-    # -----------------------------------------------------------------
-    # 1-3. Per-cell QC metric distributions (3 violin plots)
-    # -----------------------------------------------------------------
-    st.markdown("**Per-cell QC metric distributions**")
-    violin_cols = st.columns(3)
-    metric_specs = [
-        ("sum", "Total UMI counts", violin_cols[0], "#636EFA"),
-        ("detected", "Genes detected", violin_cols[1], "#00CC96"),
-        ("subsets_Mito_percent", "Mitochondrial %", violin_cols[2], "#EF553B"),
-    ]
-    for col_name, label, col, default_color in metric_specs:
-        if col_name not in qc_df.columns:
-            continue
-        with col:
-            fig = go.Figure()
-            fig.add_trace(go.Violin(
-                y=qc_df[col_name], box_visible=True, points="outliers",
-                name=label, meanline_visible=True,
-                line_color=default_color, fillcolor=default_color, opacity=0.6,
-            ))
-            fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), showlegend=False)
-
-            style = _render_plot_style_controls(
-                f"qc_violin_{col_name}", single_color_default={label: default_color},
-                show_legend_controls=False,
-            )
-            _apply_plot_style(fig, style, default_title=label, default_y_label=label)
-            st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CHART_CONFIG)
-            _render_pdf_export(fig, f"qc_violin_{col_name}", f"qc_{col_name}_violin")
-            _render_csv_download(
-                qc_df[["barcode", col_name]].rename(columns={col_name: label}),
-                f"qc_{col_name}_values", f"qc_violin_{col_name}",
-                expander_label="⬇️ Download this metric's per-cell values (.csv)",
-            )
-        figures[f"qc_violin_{col_name}"] = fig
-
-    st.caption(
-        "Standard first-look QC plots: too-low counts/genes suggest empty droplets or "
-        "low-quality cells; unusually high counts/genes can indicate doublets; elevated "
-        "mitochondrial % suggests stressed or dying cells."
-    )
-
-    # -----------------------------------------------------------------
-    # 4. Total counts vs. genes detected (scatter, colored by mito%)
-    # -----------------------------------------------------------------
-    if all(c in qc_df.columns for c in ("sum", "detected", "subsets_Mito_percent")):
-        st.markdown("**Total counts vs. genes detected** (colored by mitochondrial %)")
-
-        # Continuous color-scale picker -- replaces the previously
-        # hardcoded "Inferno_r" (colorscale="Inferno", reverse=True
-        # reproduces that exact original default).
-        scatter_colorscale, scatter_reverse = _render_colorscale_controls(
-            "qc_scatter", SEQUENTIAL_COLORSCALE_OPTIONS, default="Inferno", default_reverse=True,
-        )
-
-        scatter_fig = px.scatter(
-            qc_df, x="sum", y="detected", color="subsets_Mito_percent",
-            color_continuous_scale=scatter_colorscale + ("_r" if scatter_reverse else ""),
-            labels={"sum": "Total UMI counts", "detected": "Genes detected", "subsets_Mito_percent": "Mito %"},
-            opacity=0.6,
-        )
-        scatter_fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-
-        scatter_style = _render_plot_style_controls("qc_scatter", show_legend_controls=False)
-        _apply_plot_style(
-            scatter_fig, scatter_style,
-            default_title="Total counts vs. genes detected (colored by mitochondrial %)",
-            default_x_label="Total UMI counts", default_y_label="Genes detected",
-        )
-        _render_plotly_chart(scatter_fig)
-        _render_pdf_export(scatter_fig, "qc_scatter", "qc_counts_vs_genes_scatter")
-        _render_csv_download(
-            qc_df[["barcode", "sum", "detected", "subsets_Mito_percent"]],
-            "qc_counts_vs_genes_data", "qc_scatter",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
-        figures["qc_scatter_counts_vs_genes"] = scatter_fig
-        st.caption(
-            "Cells that are both low-count AND high-mito (bright points in the lower-left) are "
-            "the strongest candidates for exclusion -- low complexity alone can still be "
-            "biologically real for some cell types."
-        )
-
-    # -----------------------------------------------------------------
-    # 5. Doublet score distribution (histogram)
-    # -----------------------------------------------------------------
-    if "doublet_score" in qc_df.columns:
-        st.markdown(f"**Doublet score distribution** ({doublet_method_used})")
-
-        has_prediction = "predicted_doublet" in qc_df.columns
-        doublet_default_colors = {"True": "#d62728", "False": "#1f77b4"}
-        hist_fig = px.histogram(
-            qc_df, x="doublet_score", color="predicted_doublet" if has_prediction else None,
-            nbins=50, labels={"doublet_score": "Doublet score", "predicted_doublet": "Predicted doublet"},
-            color_discrete_map={True: doublet_default_colors["True"], False: doublet_default_colors["False"]} if has_prediction else None,
-        )
-        if not has_prediction:
-            # Same fix as the ambient-contamination histogram/bar chart
-            # below -- confirmed via direct testing that px.histogram's
-            # single (ungrouped) trace defaults to name="" rather than
-            # the x-column name. Only needed in this branch: when
-            # has_prediction is True, px's own boolean-column grouping
-            # already produces the exact trace names "True"/"False" this
-            # function's group_values/default_colors already expect (also
-            # confirmed via direct testing), so no rename is needed there.
-            hist_fig.update_traces(name="doublet_score")
-        hist_fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
-
-        hist_group_values = ["True", "False"] if has_prediction else None
-        hist_style = _render_plot_style_controls(
-            "qc_doublet_hist",
-            group_values=hist_group_values,
-            default_colors=doublet_default_colors if has_prediction else None,
-            single_color_default=None if has_prediction else {"doublet_score": "#636EFA"},
-            show_legend_controls=has_prediction,
-        )
-        _apply_plot_style(
-            hist_fig, hist_style,
-            default_title=f"Doublet score distribution ({doublet_method_used})",
-            default_x_label="Doublet score", default_y_label="Number of cells",
-        )
-        _render_plotly_chart(hist_fig)
-        _render_pdf_export(hist_fig, "qc_doublet_hist", "doublet_score_histogram")
-        _render_csv_download(
-            qc_df[["barcode", "doublet_score"] + (["predicted_doublet"] if has_prediction else [])],
-            "doublet_scores", "qc_doublet_hist",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
-        figures["doublet_score_histogram"] = hist_fig
-        st.caption(
-            "A healthy doublet score distribution is typically **bimodal** -- most cells scored "
-            "near 0 (singlets), with a distinct, separated group scored near 1 (real doublets)."
-        )
-
-        # -------------------------------------------------------------
-        # 6. Total UMI counts, split by doublet call (violin)
-        # -------------------------------------------------------------
-        if "sum" in qc_df.columns and "predicted_doublet" in qc_df.columns:
-            st.markdown("**Total UMI counts, split by doublet call**")
-
-            split_default_colors = {"Singlet": "#1f77b4", "Doublet": "#d62728"}
-            split_label_map = _render_group_label_renaming_controls(
-                "qc_doublet_split", ["Singlet", "Doublet"],
-                label="Rename Singlet/Doublet labels (optional)",
-            )
-
-            split_fig = go.Figure()
-            for is_doublet, label, default_color in [(False, "Singlet", split_default_colors["Singlet"]), (True, "Doublet", split_default_colors["Doublet"])]:
-                subset = qc_df[qc_df["predicted_doublet"] == is_doublet]
-                if not subset.empty:
-                    split_fig.add_trace(go.Violin(
-                        y=subset["sum"], name=label, box_visible=True, meanline_visible=True,
-                        line_color=default_color,
-                    ))
-            split_fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
-
-            split_style = _render_plot_style_controls(
-                "qc_doublet_split", group_values=["Singlet", "Doublet"],
-                default_colors=split_default_colors,
-            )
-            _apply_plot_style(
-                split_fig, split_style,
-                default_title="Total UMI counts, split by doublet call",
-                default_y_label="Total UMI counts",
-            )
-            _apply_group_label_renaming(split_fig, split_label_map)
-            _render_plotly_chart(split_fig)
-            _render_pdf_export(split_fig, "qc_doublet_split", "doublet_split_violin")
-            _render_csv_download(
-                qc_df[["barcode", "sum", "predicted_doublet"]],
-                "doublet_split_counts", "qc_doublet_split",
-                expander_label="⬇️ Download this plot's underlying data (.csv)",
-            )
-
-            figures["doublet_split_violin"] = split_fig
-            st.caption(
-                "Predicted doublets should generally show HIGHER total UMI counts than singlets."
-            )
-
-    # -----------------------------------------------------------------
-    # 7. Ambient RNA contamination fraction distribution (histogram)
-    # -----------------------------------------------------------------
-    if "ambient_contamination" in qc_df.columns and qc_df["ambient_contamination"].notna().any():
-        st.markdown("**Ambient RNA contamination fraction distribution**")
-
-        contam_default_color = "#636EFA"
-        contam_fig = px.histogram(
-            qc_df, x="ambient_contamination", nbins=40,
-            labels={"ambient_contamination": "Contamination fraction"},
-            color_discrete_sequence=[contam_default_color],
-        )
-        # px.histogram with no color-grouping column names its single
-        # trace "" (empty string) by default -- explicitly renamed here
-        # so _apply_plot_style's color_map (matched by trace NAME) can
-        # actually find and recolor it (confirmed via direct testing:
-        # the trace's default name does NOT automatically become the
-        # x-column name "ambient_contamination").
-        contam_fig.update_traces(name="ambient_contamination")
-        contam_fig.update_layout(height=350, margin=dict(l=10, r=10, t=30, b=10))
-
-        contam_style = _render_plot_style_controls(
-            "qc_ambient_hist", single_color_default={"ambient_contamination": contam_default_color},
-            show_legend_controls=False,
-        )
-        _apply_plot_style(
-            contam_fig, contam_style,
-            default_title="Ambient RNA contamination fraction distribution",
-            default_x_label="Contamination fraction", default_y_label="Number of cells",
-        )
-        _render_plotly_chart(contam_fig)
-        _render_pdf_export(contam_fig, "qc_ambient_hist", "ambient_contamination_histogram")
-        _render_csv_download(
-            qc_df[["barcode", "ambient_contamination"]],
-            "ambient_contamination_values", "qc_ambient_hist",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
-        figures["ambient_contamination_histogram"] = contam_fig
-        st.caption(
-            "DecontX reports a genuine per-cell distribution here; SoupX applies one global "
-            "estimate to every cell, so this histogram will show a single spike instead."
-        )
-
-    # -----------------------------------------------------------------
-    # 8. Top genes contributing to ambient RNA signal (horizontal bar)
-    # -----------------------------------------------------------------
-    top_ambient_df = cellqc.read_top_ambient_genes(output_dir)
-    if top_ambient_df is not None and not top_ambient_df.empty:
-        st.markdown("**Top genes contributing to ambient RNA signal**")
-
-        n_top_ambient = st.slider(
-            "Number of top genes to show:", min_value=5, max_value=min(50, len(top_ambient_df)),
-            value=min(15, len(top_ambient_df)), key="qc_ambient_bar_n_top",
-        )
-        bar_default_color = "#636EFA"
-        bar_data = top_ambient_df.head(n_top_ambient).sort_values("counts_removed")
-        bar_fig = px.bar(
-            bar_data, x="counts_removed", y="symbol", orientation="h",
-            labels={"counts_removed": "Total UMI counts removed", "symbol": "Gene"},
-            color_discrete_sequence=[bar_default_color],
-        )
-        # Same fix as the ambient-contamination histogram above -- px.bar
-        # with no color-grouping column also defaults its single trace's
-        # name to "" (empty string), which would silently fail to match
-        # single_color_default's key without this explicit rename.
-        bar_fig.update_traces(name="counts_removed")
-        bar_fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
-
-        bar_style = _render_plot_style_controls(
-            "qc_ambient_bar", single_color_default={"counts_removed": bar_default_color},
-            show_legend_controls=False,
-        )
-        _apply_plot_style(
-            bar_fig, bar_style,
-            default_title="Top genes contributing to ambient RNA signal",
-            default_x_label="Total UMI counts removed", default_y_label="Gene",
-        )
-        _render_plotly_chart(bar_fig)
-        _render_pdf_export(bar_fig, "qc_ambient_bar", "top_ambient_genes_bar")
-        _render_csv_download(
-            bar_data, "top_ambient_genes", "qc_ambient_bar",
-            expander_label="⬇️ Download this plot's underlying data (.csv)",
-        )
-
-        figures["top_ambient_genes_bar"] = bar_fig
-        st.caption(
-            "These are typically a small number of highly-expressed marker genes from the most "
-            "abundant cell type(s) in the sample, leaking into every droplet as background 'soup'."
-        )
-
-    return figures
-
-
-def _build_qc_package_zip(sample_name, qc_df, output_dir, mito_diagnostic, thresholds,
-                           doublet_method, ambient_method, figures):
-    """
-    Bundle a completed Cell-level QC run's full results into a single
-    in-memory zip file -- see this module's own docstring, "Downloadable
-    QC results package", for the full rationale.
-
-    Includes: the raw per-cell metrics CSV, QC thresholds JSON, mito
-    diagnostic JSON, top-ambient-genes CSV, DoubletFinder's pK sweep CSV
-    (if this run used it), a self-contained markdown summary, and a PNG
-    render of every QC visualization figure passed in (via Plotly's
-    kaleido-based image export). Image export failures (e.g. kaleido
-    unavailable for some reason) are caught individually and noted in
-    the summary rather than failing the whole package.
-
-    Returns the zip file's raw bytes, ready for st.download_button.
-    """
+def _build_qc_package_zip(sample_name, qc_df, output_dir, mito_diagnostic, thresholds, doublet_method, ambient_method, figures, gtf_path=None):
+    """gtf_path: threaded through to cellqc.read_top_ambient_genes() for real gene names."""
     buffer = io.BytesIO()
     summary = cellqc.summarize_cellqc_results(qc_df)
-
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("cell_qc_metrics.csv", qc_df.to_csv(index=False))
-
         if thresholds:
             import json as _json
             zf.writestr("qc_thresholds.json", _json.dumps(thresholds, indent=2))
         if mito_diagnostic:
             import json as _json
             zf.writestr("mito_gene_diagnostic.json", _json.dumps(mito_diagnostic, indent=2))
-
-        top_ambient_df = cellqc.read_top_ambient_genes(output_dir)
+        top_ambient_df = cellqc.read_top_ambient_genes(output_dir, gtf_path=gtf_path)
         if top_ambient_df is not None:
             zf.writestr("top_ambient_genes.csv", top_ambient_df.to_csv(index=False))
-
         pk_sweep_df = cellqc.read_doubletfinder_pk_sweep(output_dir)
         if pk_sweep_df is not None:
             zf.writestr("doubletfinder_pk_sweep.csv", pk_sweep_df.to_csv(index=False))
-
-        summary_md = cellqc.build_qc_summary_markdown(
-            sample_name, summary, mito_diagnostic, thresholds, doublet_method, ambient_method,
-        )
+        summary_md = cellqc.build_qc_summary_markdown(sample_name, summary, mito_diagnostic, thresholds, doublet_method, ambient_method)
         zf.writestr("SUMMARY.md", summary_md)
-
         image_errors = []
         for fig_name, fig in (figures or {}).items():
             try:
@@ -2853,28 +2294,15 @@ def _build_qc_package_zip(sample_name, qc_df, output_dir, mito_diagnostic, thres
             except Exception as e:
                 image_errors.append(f"{fig_name}: {e}")
         if image_errors:
-            zf.writestr(
-                "plots/_export_errors.txt",
-                "Some plots could not be exported as images (kaleido issue?):\n" + "\n".join(image_errors),
-            )
-
+            zf.writestr("plots/_export_errors.txt", "Some plots could not be exported as images (kaleido issue?):\n" + "\n".join(image_errors))
     buffer.seek(0)
     return buffer.getvalue()
 
 
 def render_cell_qc():
-    """
-    Phase 2 entry point -- Cell-level QC (scDblFinder/DoubletFinder
-    doublet detection, DecontX/SoupX ambient RNA correction, adaptive
-    per-cell filtering with standard visualizations and a
-    downloadable results package).
-    """
+    """Phase 2 entry point -- Cell-level QC."""
     st.title("🔬 Single-cell Cell-level QC")
-    st.markdown(
-        "Doublet detection, ambient RNA correction, and adaptive per-cell "
-        "filtering -- applied to STARsolo's filtered cell x gene matrix "
-        "from Step 6."
-    )
+    st.markdown("Doublet detection, ambient RNA correction, and adaptive per-cell filtering -- applied to STARsolo's filtered cell x gene matrix from Step 6.")
     st.markdown("---")
     project, pairs = _require_project_with_source_dir()
     if not pairs:
@@ -2884,11 +2312,7 @@ def render_cell_qc():
         return
 
     if not cellqc.cellqc_tools_available():
-        st.error(
-            "⚠️ Rscript was not found on this system. R with the DropletUtils, scuttle, "
-            "scDblFinder, and celda (DecontX) [and, if selected, SoupX] packages needs to be "
-            "installed in your environment before this step can run."
-        )
+        st.error("⚠️ Rscript was not found on this system. R with the DropletUtils, scuttle, scDblFinder, and celda (DecontX) [and, if selected, SoupX] packages needs to be installed in your environment before this step can run.")
         return
 
     align_dir = scpm.starsolo_output_dir(project)
@@ -2912,12 +2336,6 @@ def render_cell_qc():
     mito_gene_ids_override = reference_cfg.get("mito_gene_ids") or None
     mito_source = reference_cfg.get("mito_source", "gtf_auto_detect")
 
-    # --- Stale-index pre-flight diagnostic (2026-08-17, fixed 2026-08-20) ---
-    # NOW checks by resolved gene ID as well as by gene SYMBOL -- see
-    # sc_cellqc_manager.py's diagnose_starsolo_matrix_for_mito() docstring
-    # for the false-positive bug this fixes (this warning previously
-    # persisted forever for any reference with no gene symbols at all,
-    # regardless of whether the index/alignment was actually stale).
     resolved_mito_gene_ids = cellqc.resolve_mito_gene_ids(mito_gtf_path, mito_gene_ids_override)
     stale_diagnostic = cellqc.diagnose_starsolo_matrix_for_mito(filtered_dir, mito_gene_ids=resolved_mito_gene_ids)
     _render_stale_index_diagnostic(stale_diagnostic, sample_name)
@@ -2925,11 +2343,8 @@ def render_cell_qc():
     st.markdown("---")
     st.markdown("**🧬 Doublet Detection**")
     doublet_method_keys = list(cellqc.DOUBLET_METHOD_OPTIONS.keys())
-    doublet_method = st.radio(
-        "Doublet detection method:", doublet_method_keys,
-        format_func=lambda k: cellqc.DOUBLET_METHOD_OPTIONS[k]["label"],
-        index=doublet_method_keys.index(cellqc.DEFAULT_DOUBLET_METHOD), key="sc_doublet_method_choice",
-    )
+    doublet_method = st.radio("Doublet detection method:", doublet_method_keys, format_func=lambda k: cellqc.DOUBLET_METHOD_OPTIONS[k]["label"],
+                               index=doublet_method_keys.index(cellqc.DEFAULT_DOUBLET_METHOD), key="sc_doublet_method_choice")
     st.caption(cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["explanation"])
     if not cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["implemented"]:
         st.warning("⚠️ This method isn't implemented yet -- select scDblFinder to continue.")
@@ -2941,18 +2356,11 @@ def render_cell_qc():
 
     if doublet_method == "scDblFinder":
         sim_mode_keys = list(cellqc.DOUBLET_SIMULATION_MODES.keys())
-        simulation_mode = st.radio(
-            "Doublet simulation mode:", sim_mode_keys,
-            format_func=lambda k: cellqc.DOUBLET_SIMULATION_MODES[k]["label"],
-            index=sim_mode_keys.index(cellqc.DEFAULT_SIMULATION_MODE), key="sc_doublet_sim_mode_choice",
-        )
+        simulation_mode = st.radio("Doublet simulation mode:", sim_mode_keys, format_func=lambda k: cellqc.DOUBLET_SIMULATION_MODES[k]["label"],
+                                    index=sim_mode_keys.index(cellqc.DEFAULT_SIMULATION_MODE), key="sc_doublet_sim_mode_choice")
         st.caption(cellqc.DOUBLET_SIMULATION_MODES[simulation_mode]["explanation"])
     else:
-        st.info(
-            "⏱️ **DoubletFinder runs noticeably slower than scDblFinder** -- it computes its own "
-            "internal PCA/clustering, then sweeps many candidate 'pK' parameter values to find the "
-            "best one automatically. Expect this to take several minutes."
-        )
+        st.info("⏱️ **DoubletFinder runs noticeably slower than scDblFinder** -- it computes its own internal PCA/clustering, then sweeps many candidate 'pK' parameter values to find the best one automatically. Expect this to take several minutes.")
         with st.expander("ℹ️ How does DoubletFinder actually work? (click to learn more)"):
             st.markdown(
                 "DoubletFinder works by **simulating fake doublets** (combining pairs of your "
@@ -2977,67 +2385,23 @@ def render_cell_qc():
                 "correct for this blind spot -- see its own explanation for exactly how."
             )
         with st.expander("⚙️ DoubletFinder internal preprocessing settings (advanced)"):
-            st.caption(
-                "These control DoubletFinder's own required internal PCA/clustering step -- "
-                "**not** the pipeline's future Phase 3 clustering feature."
-            )
-            doubletfinder_n_pcs = st.slider(
-                "Number of principal components:", min_value=5, max_value=50,
-                value=cellqc.DEFAULT_DOUBLETFINDER_N_PCS, key="sc_doubletfinder_n_pcs",
-                help=(
-                    "How many principal components to use when DoubletFinder measures each "
-                    "cell's 'neighborhood' -- this directly affects detection quality, not just "
-                    "preprocessing. **Too few** PCs can merge genuinely distinct cell types "
-                    "together, making real doublets harder to distinguish from single cells. "
-                    "**Too many** PCs start incorporating noise-dominated components that carry "
-                    "little real biological signal, which can dilute the signal DoubletFinder "
-                    "relies on. 30 (the default) is a reasonable starting point for most "
-                    "datasets; if you already know a better PC count for this specific dataset "
-                    "(e.g. from an elbow plot), use that instead."
-                ),
-            )
-            doubletfinder_cluster_resolution = st.slider(
-                "Clustering resolution:", min_value=0.1, max_value=2.0,
-                value=cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION, step=0.1, key="sc_doubletfinder_cluster_res",
-                help=(
-                    "⚠️ This does NOT change which individual cells get flagged as doublets -- "
-                    "it's used ONLY to estimate what fraction of expected doublets are "
-                    "'homotypic' (two cells of the SAME type combined, which DoubletFinder "
-                    "cannot actually detect -- see the explanation above). **Higher resolution** "
-                    "produces more, smaller clusters, which tends to LOWER the estimated "
-                    "homotypic fraction (cell types are split more finely, so two cells landing "
-                    "in the same fine-grained cluster is less likely) -- this keeps the final "
-                    "number of predicted doublets closer to your raw expected-doublet-rate "
-                    "estimate. **Lower resolution** produces fewer, broader clusters, which "
-                    "tends to RAISE the estimated homotypic fraction -- and correspondingly "
-                    "REDUCE the final number of doublets DoubletFinder will actually predict, "
-                    "since more of the expected doublets are assumed to be the undetectable "
-                    "homotypic kind. If you're not sure, the default is a reasonable middle "
-                    "ground for typical datasets with a moderate number of distinct cell types."
-                ),
-            )
+            st.caption("These control DoubletFinder's own required internal PCA/clustering step -- **not** the pipeline's future Phase 3 clustering feature.")
+            doubletfinder_n_pcs = st.slider("Number of principal components:", min_value=5, max_value=50, value=cellqc.DEFAULT_DOUBLETFINDER_N_PCS, key="sc_doubletfinder_n_pcs",
+                help="How many principal components to use when DoubletFinder measures each cell's 'neighborhood' -- this directly affects detection quality, not just preprocessing.")
+            doubletfinder_cluster_resolution = st.slider("Clustering resolution:", min_value=0.1, max_value=2.0, value=cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION, step=0.1, key="sc_doubletfinder_cluster_res",
+                help="⚠️ This does NOT change which individual cells get flagged as doublets -- it's used ONLY to estimate the homotypic doublet fraction.")
 
     persisted_results = scpm.get_alignment_results(project) or []
     cells_detected = next((r.get("Cells Detected") for r in persisted_results if r.get("Sample") == sample_name), None)
     default_dbr = cellqc.compute_expected_doublet_rate(cells_detected) if isinstance(cells_detected, (int, float)) else 0.008
-    expected_doublet_rate = st.slider(
-        "Expected doublet rate:", min_value=0.0, max_value=0.30, value=float(default_dbr), step=0.001,
-        format="%.3f", key="sc_expected_doublet_rate",
-        help=(
-            f"Auto-computed as ~0.8% per 1,000 cells loaded" +
-            (f" ({cells_detected:,} cells detected in Step 6 -> {default_dbr:.3f})" if cells_detected else "") +
-            "."
-        ),
-    )
+    expected_doublet_rate = st.slider("Expected doublet rate:", min_value=0.0, max_value=0.30, value=float(default_dbr), step=0.001, format="%.3f", key="sc_expected_doublet_rate",
+        help=f"Auto-computed as ~0.8% per 1,000 cells loaded" + (f" ({cells_detected:,} cells detected in Step 6 -> {default_dbr:.3f})" if cells_detected else "") + ".")
 
     st.markdown("---")
     st.markdown("**🧪 Ambient RNA Correction**")
     ambient_method_keys = list(cellqc.AMBIENT_METHOD_OPTIONS.keys())
-    ambient_method = st.radio(
-        "Ambient RNA correction method:", ambient_method_keys,
-        format_func=lambda k: cellqc.AMBIENT_METHOD_OPTIONS[k]["label"],
-        index=ambient_method_keys.index(cellqc.DEFAULT_AMBIENT_METHOD), key="sc_ambient_method_choice",
-    )
+    ambient_method = st.radio("Ambient RNA correction method:", ambient_method_keys, format_func=lambda k: cellqc.AMBIENT_METHOD_OPTIONS[k]["label"],
+                               index=ambient_method_keys.index(cellqc.DEFAULT_AMBIENT_METHOD), key="sc_ambient_method_choice")
     st.caption(cellqc.AMBIENT_METHOD_OPTIONS[ambient_method]["explanation"])
     if ambient_method == "soupx" and not os.path.isdir(raw_dir):
         st.error(f"⚠️ SoupX requires STARsolo's raw (unfiltered) matrix, which wasn't found at `{raw_dir}`.")
@@ -3045,25 +2409,16 @@ def render_cell_qc():
 
     st.markdown("---")
     st.markdown("**🎚️ Per-cell Filtering Thresholds**")
-    st.caption(
-        "Adaptive thresholds (3 median-absolute-deviations from the median) are computed "
-        "automatically per-sample for total counts, genes detected, and mitochondrial %."
-    )
-    nmads = st.slider(
-        "MAD sensitivity (lower = stricter):", min_value=1.0, max_value=5.0, value=float(cellqc.DEFAULT_MAD_NMADS), step=0.5,
-        key="sc_cellqc_nmads",
-    )
+    st.caption("Adaptive thresholds (3 median-absolute-deviations from the median) are computed automatically per-sample for total counts, genes detected, and mitochondrial %.")
+    nmads = st.slider("MAD sensitivity (lower = stricter):", min_value=1.0, max_value=5.0, value=float(cellqc.DEFAULT_MAD_NMADS), step=0.5, key="sc_cellqc_nmads")
     if reference_cfg.get("is_custom") and mito_gene_ids_override is not None:
         st.caption(f"ℹ️ Using {len(mito_gene_ids_override)} previously-resolved mitochondrial gene(s) for this custom reference (source: {mito_source}).")
 
     output_dir = os.path.join(sample_out_dir, "cellqc")
     work_dir = os.path.join(sample_out_dir, "cellqc_work")
 
-    spinner_text = (
-        "Running DoubletFinder (PCA + clustering + pK sweep) and ambient RNA correction... "
-        "this can take several minutes." if doublet_method == "doublet_finder" else
-        "Running doublet detection + ambient RNA correction... this may take a few minutes."
-    )
+    spinner_text = ("Running DoubletFinder (PCA + clustering + pK sweep) and ambient RNA correction... this can take several minutes."
+                     if doublet_method == "doublet_finder" else "Running doublet detection + ambient RNA correction... this may take a few minutes.")
     if st.button("▶️ Run Cell-level QC", key="sc_run_cellqc_btn", type="primary"):
         with st.spinner(spinner_text):
             success, log = cellqc.run_cellqc_analysis(
@@ -3071,10 +2426,8 @@ def render_cell_qc():
                 doublet_method=doublet_method, simulation_mode=simulation_mode,
                 expected_doublet_rate=expected_doublet_rate, ambient_method=ambient_method,
                 raw_matrix_dir=raw_dir if ambient_method == "soupx" else None, nmads=nmads,
-                mito_gtf_path=mito_gtf_path, mito_gene_ids_override=mito_gene_ids_override,
-                mito_source=mito_source,
-                doubletfinder_n_pcs=doubletfinder_n_pcs,
-                doubletfinder_cluster_resolution=doubletfinder_cluster_resolution,
+                mito_gtf_path=mito_gtf_path, mito_gene_ids_override=mito_gene_ids_override, mito_source=mito_source,
+                doubletfinder_n_pcs=doubletfinder_n_pcs, doubletfinder_cluster_resolution=doubletfinder_cluster_resolution,
             )
         if not success:
             st.error("Cell-level QC failed. Details below:")
@@ -3088,12 +2441,10 @@ def render_cell_qc():
     if qc_df is not None:
         st.markdown("---")
         st.markdown("**📊 Results**")
-
         mito_diagnostic = cellqc.read_mito_gene_diagnostic(output_dir)
         _render_mito_diagnostic(mito_diagnostic)
         doubletfinder_diagnostic = cellqc.read_doubletfinder_diagnostic(output_dir)
         _render_doubletfinder_diagnostic(cellqc.diagnose_doubletfinder_result(doubletfinder_diagnostic))
-
 
         summary = cellqc.summarize_cellqc_results(qc_df)
         if summary:
@@ -3102,20 +2453,12 @@ def render_cell_qc():
             st.markdown(summary["messages"]["ambient"])
         thresholds = cellqc.read_qc_thresholds(output_dir)
         if thresholds:
-            st.caption(
-                f"Adaptive thresholds used: total counts > {thresholds.get('sum_lower', 0):.0f}, "
-                f"genes detected > {thresholds.get('detected_lower', 0):.0f}, "
-                f"mitochondrial % < {thresholds.get('mito_upper', 0):.1f}%"
-            )
+            st.caption(f"Adaptive thresholds used: total counts > {thresholds.get('sum_lower', 0):.0f}, genes detected > {thresholds.get('detected_lower', 0):.0f}, mitochondrial % < {thresholds.get('mito_upper', 0):.1f}%")
 
         pk_sweep_df = cellqc.read_doubletfinder_pk_sweep(output_dir)
         if pk_sweep_df is not None and not pk_sweep_df.empty:
             with st.expander("🔍 DoubletFinder pK parameter sweep details"):
-                st.caption(
-                    "Each row is a candidate 'pK' value DoubletFinder tested; the one with the "
-                    "highest **BCmetric** was automatically selected and used for the final "
-                    "classification above."
-                )
+                st.caption("Each row is a candidate 'pK' value DoubletFinder tested; the one with the highest **BCmetric** was automatically selected and used for the final classification above.")
                 if "doubletfinder_pK_used" in qc_df.columns and not qc_df["doubletfinder_pK_used"].empty:
                     st.caption(f"✅ Selected pK: **{qc_df['doubletfinder_pK_used'].iloc[0]}**")
                 chart_df = pk_sweep_df.copy()
@@ -3127,31 +2470,31 @@ def render_cell_qc():
                 st.dataframe(pk_sweep_df, use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        figures = _render_cellqc_visualizations(qc_df, output_dir, doublet_method)
+        figures = _render_cellqc_visualizations(qc_df, output_dir, doublet_method, gtf_path=mito_gtf_path)
 
         st.markdown("---")
         st.markdown("**📦 Download Full QC Package**")
-        st.caption(
-            "Bundles the per-cell metrics table, QC thresholds, mitochondrial-gene diagnostic, "
-            "top-ambient-genes table, DoubletFinder's pK sweep (if used), a plain-text summary, "
-            "and PNG copies of every plot above into a single .zip file."
-        )
+        st.caption("Bundles the per-cell metrics table, QC thresholds, mitochondrial-gene diagnostic, top-ambient-genes table, DoubletFinder's pK sweep (if used), a plain-text summary, and PNG copies of every plot above into a single .zip file.")
         try:
             zip_bytes = _build_qc_package_zip(
-                sample_name, qc_df, output_dir, mito_diagnostic, thresholds,
-                doublet_method, ambient_method, figures,
+                sample_name, qc_df, output_dir, mito_diagnostic, thresholds, doublet_method, ambient_method, figures,
+                gtf_path=mito_gtf_path,
             )
-            st.download_button(
-                "📦 Download QC Package (.zip)", data=zip_bytes,
-                file_name=f"{sample_name}_cellqc_package.zip", mime="application/zip",
-                key="sc_cellqc_download_package_btn",
-            )
+            st.download_button("📦 Download QC Package (.zip)", data=zip_bytes, file_name=f"{sample_name}_cellqc_package.zip", mime="application/zip", key="sc_cellqc_download_package_btn")
         except Exception as e:
             st.error(f"⚠️ Could not build the QC package: {e}")
 
         st.markdown("---")
         with st.expander("📋 Full per-cell QC table"):
             st.dataframe(qc_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        if st.button(
+            "➡️ Proceed to SC Analysis: Clustering & Cell Annotation",
+            key="sc_proceed_to_downstream_btn", type="primary",
+        ):
+            st.session_state["nav_request"] = SC_DOWNSTREAM_ANALYSIS_OPTION
+            st.rerun()
 
 
 def _require_project_with_source_dir():

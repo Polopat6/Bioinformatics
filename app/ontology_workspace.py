@@ -25,6 +25,7 @@ import reference_manager as rm
 import gene_id_mapper as gim
 import ontology_manager as om
 import differential_expression_workspace as dew
+import eggnog_manager as egm
 
 WORKSPACE_KEY = "bulk_rnaseq"
 
@@ -765,6 +766,200 @@ def _species_and_orgdb_for_project(project):
     orgdb_package = gim.ORGDB_PACKAGES.get(species_key)
     species_label = rm.REFERENCE_CATALOG.get(species_key, {}).get("label", species_key)
     return species_key, orgdb_package, species_label
+
+
+def _eggnog_reference_key_for_project(genome_fasta_path):
+    """
+    A stable identifier for a given custom reference, used to locate
+    where its eggNOG-mapper run outputs/TERM2GENE tables live on disk
+    -- keyed on the genome FASTA's own path (not the project name), so
+    two DIFFERENT projects pointing at the exact same uploaded FASTA
+    correctly share the same one-time eggNOG annotation run rather
+    than each re-running it independently.
+    """
+    import hashlib
+    return hashlib.sha1(genome_fasta_path.encode()).hexdigest()[:16]
+
+
+def _eggnog_output_paths(genome_fasta_path):
+    """
+    Returns a dict of this reference's eggNOG file paths:
+    {"annotations", "go_term2gene", "kegg_term2gene", "base_dir"} --
+    all rooted under a shared, project-independent location keyed by
+    _eggnog_reference_key_for_project(genome_fasta_path).
+
+    Note: this does NOT include "gene_symbol_map" -- that output is
+    written directly to THIS project's own pm.gene_symbol_map_path(project)
+    (see _render_eggnog_run_controls below), since gene_symbol_map.csv is
+    already a per-project, reference_dir()-scoped file by convention
+    (confirmed: pm.gene_symbol_map_path() ==
+    os.path.join(pm.reference_dir(project), "gene_symbol_map.csv")) --
+    only the GO/KEGG TERM2GENE tables and the raw eggNOG annotation
+    output are treated as the shared, reference-keyed resource here.
+    """
+    ref_key = _eggnog_reference_key_for_project(genome_fasta_path)
+    base_dir = os.path.join("data", "shared_resources", "eggnog_annotations", ref_key)
+    return {
+        "annotations": os.path.join(base_dir, "annotations.emapper.annotations"),
+        "go_term2gene": os.path.join(base_dir, "go_term2gene.csv"),
+        "kegg_term2gene": os.path.join(base_dir, "kegg_term2gene.csv"),
+        "coverage_target_taxid": os.path.join(base_dir, "coverage_target_taxid.txt"),
+        "base_dir": base_dir,
+    }
+
+
+def _eggnog_annotation_already_run(genome_fasta_path):
+    paths = _eggnog_output_paths(genome_fasta_path)
+    return os.path.isfile(paths["annotations"])
+
+
+def _render_eggnog_ontology_setup(project):
+    """
+    Renders the eggNOG-mapper setup/run UI for a non-model-organism
+    project -- confirming the reference genome/GTF paths, the
+    tax_scope picker (Automatic / Closely-related / Human, with
+    tradeoff explanations), the run trigger (if not already run for
+    this reference), and the coverage summary once results exist.
+
+    Returns True once this reference's eggNOG annotation has actually
+    been run and its TERM2GENE/gene-symbol-map outputs exist on disk
+    (i.e. the caller can safely proceed to Step 1) -- False otherwise.
+    """
+    if not egm.eggnog_mapper_available():
+        st.error(
+            "⚠️ `emapper.py` was not found on this system -- the `eggnog-mapper` package "
+            "needs to be installed (see the ⚙️ Setup & Deployment page) before this path "
+            "can be used."
+        )
+        return False
+
+    st.markdown("**Confirm this project's reference files:**")
+    st.caption(
+        "This app doesn't currently have a way to auto-detect a custom reference's exact "
+        "file names -- please confirm (or paste) the paths below. This is a one-time step "
+        "per reference, the same as the eggNOG annotation run itself."
+    )
+    default_dir = pm.reference_dir(project)
+    genome_fasta = st.text_input(
+        "Path to this reference's genome FASTA:", value="",
+        key="ontology_eggnog_genome_fasta_path",
+        help=f"Typically somewhere under {default_dir}/ -- check alignment_workspace.py's own upload step if you're unsure of the exact filename.",
+    )
+    gtf_path = st.text_input(
+        "Path to this reference's GTF annotation:", value="",
+        key="ontology_eggnog_gtf_path",
+    )
+    if not (genome_fasta and gtf_path and os.path.isfile(genome_fasta) and os.path.isfile(gtf_path)):
+        st.info("Enter valid paths to both files above to continue.")
+        return False
+
+    paths = _eggnog_output_paths(genome_fasta)
+
+    if _eggnog_annotation_already_run(genome_fasta):
+        st.success("✅ eggNOG annotation has already been run for this reference.")
+        annotations_df = egm.parse_eggnog_annotations(paths["annotations"])
+        target_taxid = None
+        if os.path.isfile(paths["coverage_target_taxid"]):
+            with open(paths["coverage_target_taxid"]) as f:
+                target_taxid = f.read().strip() or None
+        coverage = egm.build_annotation_coverage_summary(annotations_df, target_taxid=target_taxid)
+        if coverage:
+            with st.expander("📊 Annotation coverage summary", expanded=True):
+                st.markdown(coverage["message"])
+        with st.expander("🔁 Re-run eggNOG annotation with different settings"):
+            _render_eggnog_run_controls(project, genome_fasta, gtf_path, paths)
+        return True
+
+    st.warning(
+        "⚠️ This reference has not been annotated via eggNOG-mapper yet -- this is a "
+        "one-time, per-reference step (like building a genome index) that must complete "
+        "before Ontology Analysis can run in this mode."
+    )
+    _render_eggnog_run_controls(project, genome_fasta, gtf_path, paths)
+    return False
+
+
+def _render_eggnog_run_controls(project, genome_fasta, gtf_path, paths):
+    st.markdown("**Which organism's annotation evidence should be used?**")
+    scope_keys = list(egm.TARGET_TAXA_SCOPE_OPTIONS.keys())
+    scope_labels = {k: v["label"] for k, v in egm.TARGET_TAXA_SCOPE_OPTIONS.items()}
+    chosen_scope = st.radio(
+        "Scope:", options=scope_keys, format_func=lambda k: scope_labels[k],
+        key="ontology_eggnog_scope_radio",
+    )
+    st.info(egm.TARGET_TAXA_SCOPE_OPTIONS[chosen_scope]["explanation"])
+
+    custom_taxid = None
+    if chosen_scope == "closely_related":
+        custom_taxid = st.text_input(
+            "NCBI taxonomy ID of the closely-related organism (e.g. 7955 for zebrafish):",
+            key="ontology_eggnog_custom_taxid",
+            help="Look up the correct ID at https://www.ncbi.nlm.nih.gov/taxonomy -- this app does not maintain its own picker for this, since the right choice depends entirely on your specific organism.",
+        )
+        if not custom_taxid.strip().isdigit():
+            st.warning("⚠️ Enter a valid numeric NCBI taxonomy ID to continue.")
+            return
+
+    disk_check = egm.check_disk_space(paths["base_dir"])
+    st.markdown(disk_check["message"])
+
+    if st.button("🚀 Run eggNOG-mapper Annotation", key="ontology_run_eggnog_btn", type="primary"):
+        os.makedirs(paths["base_dir"], exist_ok=True)
+        with st.spinner("Extracting protein sequences (gffread)..."):
+            protein_fasta = os.path.join(paths["base_dir"], "proteins.fa")
+            success, message = egm.extract_protein_fasta_for_eggnog(genome_fasta, gtf_path, protein_fasta)
+        if not success:
+            st.error(f"⚠️ {message}")
+            return
+
+        target_taxa_args = egm.build_emapper_target_taxa_args(
+            chosen_scope, custom_taxid=custom_taxid if chosen_scope == "closely_related" else None,
+        )
+        eggnog_db_dir = os.path.join("data", "shared_resources", "eggnog_database")
+        if not egm.eggnog_database_is_installed(eggnog_db_dir):
+            st.error(
+                "⚠️ The eggNOG database has not been installed on this system yet -- "
+                "an admin needs to run the one-time database setup (see the "
+                "⚙️ Setup & Deployment page) first."
+            )
+            return
+
+        with st.spinner("Running eggNOG-mapper... this can take a while for a full genome."):
+            success, annotations_path, message = egm.run_eggnog_mapper(
+                protein_fasta, paths["base_dir"], "annotations", eggnog_db_dir,
+            )
+        if not success:
+            st.error(f"⚠️ {message}")
+            return
+
+        annotations_df = egm.parse_eggnog_annotations(annotations_path)
+        # extract_tx2gene_from_gtf() (reference_manager.py) parses
+        # transcript_id -> gene_id from the SAME gtf_path eggNOG's
+        # protein extraction used above -- exactly the mapping needed to
+        # collapse eggNOG's transcript-keyed "query" column to the
+        # gene-level IDs this project's DESeq2 export uses.
+        tx2gene_map = rm.extract_tx2gene_from_gtf(gtf_path)
+
+        gene_symbol_map = egm.build_gene_symbol_map_from_eggnog(annotations_df, tx2gene_map=tx2gene_map)
+        # pm.gene_symbol_map_path(project) is exactly where this
+        # project's gene_id -> gene_symbol mapping belongs
+        # (differential_expression_workspace.py already reads from this
+        # same path) -- the eggNOG-derived map is saved directly here,
+        # per-project, rather than under the shared reference-keyed
+        # eggNOG output directory.
+        rm.save_gene_symbol_map_csv(gene_symbol_map, pm.gene_symbol_map_path(project))
+
+        go_t2g = egm.build_go_term2gene_from_eggnog(annotations_df, tx2gene_map=tx2gene_map)
+        egm.save_term2gene_csv(go_t2g, paths["go_term2gene"])
+        kegg_t2g = egm.build_kegg_term2gene_from_eggnog(annotations_df, tx2gene_map=tx2gene_map)
+        egm.save_term2gene_csv(kegg_t2g, paths["kegg_term2gene"])
+
+        target_taxid_arg = target_taxa_args[1] if len(target_taxa_args) == 2 else ""
+        with open(paths["coverage_target_taxid"], "w") as f:
+            f.write(target_taxid_arg)
+
+        st.success("✅ eggNOG annotation completed and saved for this reference.")
+        st.rerun()
 
 
 def _render_species_override_picker(project):
@@ -1553,16 +1748,59 @@ def render():
         return
 
     species_key, orgdb_package, species_label = _species_and_orgdb_for_project(project)
+    use_eggnog_mode = False
+    eggnog_genome_fasta = None
+
     if not orgdb_package:
-        species_key, orgdb_package, species_label = _render_species_override_picker(project)
-        if not orgdb_package:
-            return
+        st.markdown("**How should this organism be handled for Ontology Analysis?**")
+        organism_mode = st.radio(
+            "Choose one:",
+            [
+                "This is one of this app's preset organisms (select it below)",
+                "This is a non-model organism with NO curated annotation package -- use eggNOG-mapper instead",
+            ],
+            key="ontology_organism_mode_radio",
+            help=(
+                "The first option requires your data to genuinely be one of this app's "
+                "supported preset species (human, mouse, fly, yeast, roundworm, zebrafish, "
+                "E. coli) -- Ontology Analysis only needs to know the correct SPECIES, not "
+                "the actual reference files. The second option is for a real non-model "
+                "organism (e.g. a non-preset fish/insect/etc.) with no such package -- this "
+                "uses eggNOG-mapper's own orthology-based functional annotation instead, "
+                "which works for essentially any organism but has real coverage/depth "
+                "tradeoffs explained below once selected."
+            ),
+        )
+        if organism_mode.startswith("This is one"):
+            species_key, orgdb_package, species_label = _render_species_override_picker(project)
+            if not orgdb_package:
+                return
+        else:
+            use_eggnog_mode = True
+            proceed = _render_eggnog_ontology_setup(project)
+            if not proceed:
+                return
+            # _render_eggnog_ontology_setup() confirms/saves these two
+            # widget keys once valid paths are entered -- read back here
+            # so later steps (Step 2/Step 3 below) can build this same
+            # reference's _eggnog_output_paths() without needing the
+            # confirmed genome FASTA path threaded through every
+            # function signature individually.
+            eggnog_genome_fasta = st.session_state.get("ontology_eggnog_genome_fasta_path")
+            species_label = "Non-model organism (eggNOG-mapper mode)"
+            orgdb_package = "N/A (eggNOG-mapper)"
 
     st.session_state["_ontology_orgdb_package_for_gosemsim_check"] = orgdb_package
 
-    db_availability = om.databases_available_for_species(species_key)
-    kegg_organism = om.get_kegg_organism_code(species_key)
-    reactome_organism = om.get_reactome_organism_name(species_key)
+    if use_eggnog_mode:
+        eggnog_paths = _eggnog_output_paths(eggnog_genome_fasta)
+        db_availability = om.databases_available_for_eggnog(eggnog_paths["go_term2gene"], eggnog_paths["kegg_term2gene"])
+        kegg_organism = None
+        reactome_organism = None
+    else:
+        db_availability = om.databases_available_for_species(species_key)
+        kegg_organism = om.get_kegg_organism_code(species_key)
+        reactome_organism = om.get_reactome_organism_name(species_key)
 
     st.success(f"✅ Organism: **{species_label}** (annotation package: `{orgdb_package}`).")
     unavailable = [db for db, ok in db_availability.items() if not ok]
@@ -1600,6 +1838,10 @@ def render():
         key="ontology_analysis_approach_radio",
     )
 
+    if use_eggnog_mode and analysis_approach.startswith("compareCluster"):
+        st.warning("⚠️ compareCluster is not yet supported in eggNOG mode -- choose ORA or GSEA instead.")
+        return
+
     st.markdown("---")
 
     st.header("Step 2: Choose Your Contrast(s) and Databases")
@@ -1625,43 +1867,50 @@ def render():
     run_kegg = db_col2.checkbox("KEGG pathways", value=db_availability["KEGG"], key="ontology_run_kegg", disabled=not db_availability["KEGG"])
     run_reactome = db_col3.checkbox("Reactome pathways", value=db_availability["Reactome"], key="ontology_run_reactome", disabled=not db_availability["Reactome"])
 
-    go_ontology = "BP"
+    go_ontology = "ALL"
     simplify_go = False
     simplify_measure = om.DEFAULT_SIMPLIFY_MEASURE
     simplify_cutoff = om.DEFAULT_SIMPLIFY_CUTOFF
     if run_go:
-        with st.expander("ℹ️ What's the difference between Biological Process, Molecular Function, and Cellular Component? (click for a detailed explanation)"):
-            st.markdown(
-                "Gene Ontology organizes its terms into three "
-                "completely separate, complementary sub-ontologies:\n\n"
-                "**🔬 Biological Process (BP)** -- describes a larger "
-                "biological GOAL or PROGRAM a gene contributes to. "
-                "Examples: *\"inflammatory response\"*, *\"DNA "
-                "replication\"*, *\"apoptotic process\"*. **This is the "
-                "most commonly used sub-ontology for RNA-seq "
-                "enrichment**, since it most directly answers \"what "
-                "biological programs changed in my experiment?\"\n\n"
-                "**⚙️ Molecular Function (MF)** -- describes the "
-                "specific BIOCHEMICAL ACTIVITY a gene's protein product "
-                "performs. Examples: *\"ATP binding\"*, *\"kinase "
-                "activity\"*, *\"DNA-binding transcription factor "
-                "activity\"*.\n\n"
-                "**📍 Cellular Component (CC)** -- describes WHERE in "
-                "the cell a gene's protein product is located. "
-                "Examples: *\"mitochondrion\"*, *\"nucleus\"*, *\"plasma "
-                "membrane\"*.\n\n"
-                "**\"All three (BP + MF + CC)\"** combines all three -- "
-                "the most complete picture, but GO term "
-                "\"simplification\" isn't available when combining all "
-                "three, since it requires a similarity measure specific "
-                "to one sub-ontology."
+        if not use_eggnog_mode:
+            with st.expander("ℹ️ What's the difference between Biological Process, Molecular Function, and Cellular Component? (click for a detailed explanation)"):
+                st.markdown(
+                    "Gene Ontology organizes its terms into three "
+                    "completely separate, complementary sub-ontologies:\n\n"
+                    "**🔬 Biological Process (BP)** -- describes a larger "
+                    "biological GOAL or PROGRAM a gene contributes to. "
+                    "Examples: *\"inflammatory response\"*, *\"DNA "
+                    "replication\"*, *\"apoptotic process\"*. **This is the "
+                    "most commonly used sub-ontology for RNA-seq "
+                    "enrichment**, since it most directly answers \"what "
+                    "biological programs changed in my experiment?\"\n\n"
+                    "**⚙️ Molecular Function (MF)** -- describes the "
+                    "specific BIOCHEMICAL ACTIVITY a gene's protein product "
+                    "performs. Examples: *\"ATP binding\"*, *\"kinase "
+                    "activity\"*, *\"DNA-binding transcription factor "
+                    "activity\"*.\n\n"
+                    "**📍 Cellular Component (CC)** -- describes WHERE in "
+                    "the cell a gene's protein product is located. "
+                    "Examples: *\"mitochondrion\"*, *\"nucleus\"*, *\"plasma "
+                    "membrane\"*.\n\n"
+                    "**\"All three (BP + MF + CC)\"** combines all three -- "
+                    "the most complete picture, but GO term "
+                    "\"simplification\" isn't available when combining all "
+                    "three, since it requires a similarity measure specific "
+                    "to one sub-ontology."
+                )
+            go_ontology_label = st.selectbox(
+                "GO sub-ontology:", options=list(om.GO_ONTOLOGY_OPTIONS.keys()), key="ontology_go_subontology_select",
             )
-        go_ontology_label = st.selectbox(
-            "GO sub-ontology:", options=list(om.GO_ONTOLOGY_OPTIONS.keys()), key="ontology_go_subontology_select",
-        )
-        go_ontology = om.GO_ONTOLOGY_OPTIONS[go_ontology_label]
+            go_ontology = om.GO_ONTOLOGY_OPTIONS[go_ontology_label]
 
-        if not analysis_approach.startswith("compareCluster"):
+        if use_eggnog_mode:
+            st.caption(
+                "ℹ️ GO term simplification (GOSemSim) requires a curated organism annotation "
+                "package, which doesn't exist in eggNOG mode -- results below will show the "
+                "full, un-simplified GO term set."
+            )
+        elif not analysis_approach.startswith("compareCluster"):
             simplify_go, simplify_measure, simplify_cutoff = _render_simplify_control("ontology_step2", go_ontology)
 
     if not (run_go or run_kegg or run_reactome):
@@ -1737,7 +1986,28 @@ def render():
         st.session_state[f"_ontology_run_clicked_{contrast_key_for_state}"] = True
 
         with st.spinner(f"Running {analysis_type.upper()}... this may take a few minutes."):
-            if analysis_type == "ora":
+            if use_eggnog_mode:
+                eggnog_paths = _eggnog_output_paths(eggnog_genome_fasta)
+                export_df = dm.build_clusterprofiler_export(deseq2_out_dir, selected_contrasts[0])
+                input_path = os.path.join(work_dir, "input_gene_list.csv")
+                os.makedirs(work_dir, exist_ok=True)
+                export_df.to_csv(input_path, index=False)
+                if analysis_type == "ora":
+                    success, log = om.run_ora_analysis_eggnog(
+                        input_path, output_dir, work_dir,
+                        eggnog_paths["go_term2gene"], eggnog_paths["kegg_term2gene"],
+                        padj_threshold, lfc_threshold, run_go, run_kegg,
+                        min_gs_size=min_gs_size, max_gs_size=max_gs_size,
+                        split_by_direction=split_by_direction,
+                    )
+                else:  # gsea
+                    success, log = om.run_gsea_analysis_eggnog(
+                        input_path, output_dir, work_dir,
+                        eggnog_paths["go_term2gene"], eggnog_paths["kegg_term2gene"],
+                        run_go, run_kegg,
+                        min_gs_size=min_gs_size, max_gs_size=max_gs_size,
+                    )
+            elif analysis_type == "ora":
                 export_df = dm.build_clusterprofiler_export(deseq2_out_dir, selected_contrasts[0])
                 input_path = os.path.join(work_dir, "input_gene_list.csv")
                 os.makedirs(work_dir, exist_ok=True)
