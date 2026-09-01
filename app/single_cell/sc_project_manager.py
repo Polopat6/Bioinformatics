@@ -485,7 +485,22 @@ def downstream_compositional_output_dir(project_name):
 def downstream_compositional_work_dir(project_name):
     "Where the propeller R job-spec JSON and staged R script are written -- passed directly as dsm.run_propeller_analysis()'s own work_dir argument. Kept separate from output_dir so a user Browse of results isn't cluttered with intermediate job-staging files."
     return os.path.join(downstream_compositional_dir(project_name), "work")
-
+# --- bitr() gene-name-conversion work directory ---
+#
+# Scratch location for the bitr()-based gene-name fallback's own R
+# job-spec JSON + staged R script + output CSV (see
+# gene_id_mapper.run_bitr_conversion()'s own dest_dir/work_dir
+# parameter) -- mirrors downstream_compositional_work_dir()'s own
+# "kept separate from any results directory, since these are pure
+# intermediate staging files" rationale. No corresponding "output_dir"
+# is needed here (unlike Step 10's own output/work split) since a
+# bitr() conversion's real, meaningful result is applied directly onto
+# adata.var["gene_symbol"] in memory (then persisted via the project's
+# own single current_state.h5ad cache) rather than written out as a
+# separate standalone results file a user would browse to later.
+def downstream_bitr_work_dir(project_name):
+    "Where the bitr() gene-name-conversion R job-spec JSON and staged R script are written -- passed directly as gene_id_mapper.run_bitr_conversion()'s own work_dir argument."
+    return os.path.join(downstream_dir(project_name), "bitr_work")
 
 # ---------------------------------------------------------------------------
 # Per-step parameter "recipe" (fingerprint) system

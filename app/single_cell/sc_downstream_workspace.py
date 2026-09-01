@@ -3,9 +3,9 @@ single_cell/sc_downstream_workspace.py
 
 Streamlit UI for Phase 3 of the Single-cell RNA-Seq pipeline --
 multi-sample downstream analysis (normalization, HVG selection, PCA,
-batch correction, clustering, embeddings, cell-type annotation,
-pseudobulk aggregation, and compositional analysis), built on top of
-sc_downstream_manager.py's backend functions.
+batch correction/integration, clustering, UMAP/t-SNE, cell-type
+annotation, pseudobulk aggregation, and compositional analysis), built
+on top of sc_downstream_manager.py's backend functions.
 
 This file is being built incrementally, section by section:
     SECTION 1 (delivered): Step 1 (Combine Samples) -> Step 2
@@ -67,16 +67,14 @@ manual marker scoring are treated as repeatable, additive exploration
 actions instead, matching how a real analyst actually uses them.
 
 --- Steps 1-4 explanatory content added (2026-08-25) ---
-Per direct user request: each of Steps 1-4 now includes plain-language
-"what this step does / why it matters / how to interpret the output"
-guidance, aimed at someone who understands the biology but may not
-have hands-on scanpy/anndata experience. Explanatory text is placed
-directly beneath each step's own header (the "why/what" framing, before
-any widgets) and, where a plot/result already exists, an additional
-"How to read this" caption/expander is added right next to that
-specific result -- mirroring how singlecell_workspace.py's own Phase
-1/2 pages already explain individual QC plots inline rather than in a
-single wall of text at the top.
+Per direct user request, each of Steps 1-4 (and later, Steps 5-10)
+includes plain-language "what this step does / why it matters / how to
+interpret the output" guidance, aimed at someone who understands the
+biology but may not have hands-on scanpy/anndata experience.
+Explanatory text is placed directly beneath each step's own header
+(the "why/what" framing, before any widgets), and, where a plot/result
+already exists, an additional "How to read this" caption/expander is
+added right next to that specific result.
 
 --- PCA plot: independent per-axis PC selection + optional 3D Z-axis
     (2026-08-25) ---
@@ -84,14 +82,49 @@ _render_pca_step()'s own PCA scatter plot previously hardcoded PC1 (x)
 vs. PC2 (y), 2D only. Per direct user request, this is now fully
 configurable: three independent selectboxes let the user choose ANY
 available PC for the X axis, Y axis, and (optionally, if a checkbox is
-enabled) a Z axis -- e.g. viewing PC3 vs. PC7 vs. PC1 is just as valid
-a choice as the default PC1/PC2, since a batch effect or a rare cell
-population's signal is not guaranteed to be confined to the first two
-components. Enabling the Z-axis switches the plot from
-plotly.express.scatter to plotly.express.scatter_3d, mirroring the
-exact same 2D/3D toggle pattern already used by Step 7's own embedding
-scatter plot (see _render_embedding_step below) for a consistent,
-already-familiar interaction across this workspace.
+enabled) a Z axis. Enabling the Z-axis switches the plot from
+plotly.express.scatter to plotly.express.scatter_3d.
+
+--- Gene-symbol resolution wiring: Step 1 passes gtf_path through
+    (2026-08-25) ---
+sc_downstream_manager.py's load_and_combine_samples() accepts an
+optional gtf_path parameter that overlays a corrected gene_symbol for
+any gene whose STARsolo-provided symbol looks unresolved (see that
+module's own docstring, "Gene-symbol resolution overlay"). This is a
+complete no-op unless a caller actually supplies gtf_path -- so
+_render_combine_step() below fetches this project's own confirmed
+reference GTF path (via scpm.get_reference_choice(project)
+["custom_gtf"]) and passes it straight through to
+dsm.load_and_combine_samples(). IMPORTANT: this wiring must exist on
+THIS side (the UI/workspace layer) for the manager-side fix to ever
+actually take effect at all -- a manager-only fix with no
+corresponding call-site wiring here would silently never activate,
+which looks identical to "the fix doesn't work" from the outside.
+
+--- Cluster/group label natural-sort ordering fix (2026-08-25) ---
+A real, confirmed bug, reported directly via screenshots: numeric-
+looking cluster labels ("0", "1", ..., "16") were displaying in a
+confusing, non-numeric order in TWO places in this file specifically:
+  1. Step 8a's "View top markers for cluster" dropdown used plain
+     `sorted(markers_df["cluster"].unique(), key=str)` -- a
+     LEXICOGRAPHIC string sort, which puts "10" immediately after "1"
+     and before "2" (confirmed directly matching a real reported
+     screenshot showing exactly this order).
+  2. Step 7's UMAP/t-SNE embedding scatter plot's legend used
+     `sorted(embed_df[color_by].astype(str).unique())` to build
+     group_values for the color-picker UI, but NEVER passed an
+     explicit category_orders argument to px.scatter/scatter_3d --
+     meaning Plotly's own default legend ordering (order of first
+     appearance in the underlying dataframe) took over instead,
+     producing an even more scrambled, neither-numeric-nor-alphabetical
+     legend order (confirmed directly matching a second real reported
+     screenshot).
+Both are fixed here by using sc_downstream_manager.py's new
+natural_sort_unique() helper (see that module's own docstring) instead
+of a bare sorted()/sorted(..., key=str) call, AND by explicitly passing
+category_orders={color_by: group_values} into the Step 7 scatter calls
+so Plotly is told the exact intended legend order directly, rather than
+falling back to its own "first appearance" default.
 """
 import os
 import tempfile
@@ -105,7 +138,29 @@ import streamlit as st
 import sc_project_manager as scpm
 import sc_downstream_manager as dsm
 import singlecell_workspace as scw
+import math
+import sc_marker_panel_io as mpio
+import sc_marker_confidence as mconf
+import gene_id_mapper as gim
 
+def _format_scientific_pvalue(value, sig_figs=3):
+    """
+    Format a p-value for display in true scientific notation, honestly
+    distinguishing a real (if tiny) value from a genuine float64
+    underflow (an actual 0.0 in memory that can no longer be recovered
+    to its true magnitude) -- see this file's own module docstring,
+    "Scientific-notation p-value display fix", for the full rationale.
+    """
+    if value is None:
+        return ""
+    try:
+        if math.isnan(value):
+            return ""
+    except TypeError:
+        return ""
+    if value == 0.0:
+        return "< 1e-308"
+    return f"{value:.{sig_figs}e}"
 WORKSPACE_KEY = "sc_downstream"
 
 
@@ -138,6 +193,174 @@ def _get_cached_adata(project):
         st.session_state[key] = adata
         return adata
     return None
+
+def _strip_gene_colon_prefix(gene_id):
+    """
+    Strip a leading 'gene:' prefix (the GFF3 ID-attribute convention
+    confirmed present in this project's real reference GTF) from a
+    gene_id string, so ID-type auto-detection and bitr() lookup both
+    see the real underlying accession (e.g. "ENSG00000310526") rather
+    than a prefixed, unrecognizable string that always falls through to
+    detect_id_type()'s own "SYMBOL" default.
+
+    Returns the input unchanged if it doesn't start with "gene:" (e.g.
+    a reference that never had this prefix issue at all, or a gene_id
+    that's already bare).
+    """
+    if gene_id.startswith("gene:"):
+        return gene_id[len("gene:"):]
+    return gene_id
+
+
+def _render_bitr_gene_name_fallback(project, adata):
+    """
+    Optional "fill in more gene names via Bioconductor bitr()" panel --
+    single-cell's own analogue of the Bulk RNA-Seq Differential
+    Expression workspace's "Gene ID -> Gene Name Mapping" panel
+    (differential_expression_workspace._render_gene_id_mapping_panel),
+    reusing gene_id_mapper.py directly (no changes to that module were
+    needed or made -- it's already fully pipeline-agnostic; the
+    "gene:"-prefix handling below lives entirely in THIS function,
+    since it's specific to this project's own GFF3-fallback-derived
+    references, not something gene_id_mapper.py itself should need to
+    know about).
+
+    Only offered for a PRESET reference (a real species_key is needed
+    to look up the correct Bioconductor OrgDb annotation package) --
+    for a custom/non-model-organism reference, there is no known OrgDb
+    package to consult, so this section is skipped entirely rather than
+    offering a lookup that would just fail.
+    """
+    reference_cfg = scpm.get_reference_choice(project) or {}
+    species_key = reference_cfg.get("species_key")
+    if reference_cfg.get("is_custom") or not species_key:
+        return  # no known OrgDb package for a custom/non-model reference
+
+    unresolved_ids = dsm.get_unresolved_gene_ids(adata.var)
+    n_total = adata.n_vars
+
+    with st.expander(
+        f"🏷️ Fill in more gene names via Bioconductor bitr() "
+        f"({len(unresolved_ids):,} of {n_total:,} genes still unresolved)",
+        expanded=False,
+    ):
+        st.caption(
+            "This project's reference GTF has already been used to resolve as "
+            "many gene names as it directly contains (see Step 1's own combine "
+            "summary) -- but not every gene_id in a GTF has a matching "
+            "gene-level record with a real name (e.g. transcript/exon-only "
+            "entries), so some genes remain stuck at their raw Ensembl ID. This "
+            "runs a genuine Bioconductor annotation-database lookup "
+            "(`clusterProfiler::bitr()`), completely independent of this "
+            "project's own GTF, to try to resolve real names for whatever's "
+            "still left."
+        )
+
+        if not unresolved_ids:
+            st.success("✅ Every gene already has a resolved name -- nothing left to look up.")
+            return
+
+        if not gim.bitr_tools_available():
+            orgdb_package = gim.ORGDB_PACKAGES.get(species_key, "the relevant OrgDb package")
+            st.warning(
+                f"⚠️ Rscript was not found on this system -- this needs R with "
+                f"the `clusterProfiler` package and `{orgdb_package}` installed."
+            )
+            return
+
+        # --- "gene:" prefix fix (2026-08-25) -- see this module's own
+        # docstring, "The fix", for the full rationale. Detection AND
+        # the eventual bitr() lookup both operate on the STRIPPED id;
+        # results are mapped back onto the ORIGINAL (possibly prefixed)
+        # gene_id further below.
+        stripped_to_original = {}
+        for gid in unresolved_ids:
+            stripped_to_original.setdefault(_strip_gene_colon_prefix(gid), []).append(gid)
+        stripped_ids = sorted(stripped_to_original.keys())
+
+        n_stripped = sum(1 for gid in unresolved_ids if gid.startswith("gene:"))
+        if n_stripped:
+            st.caption(
+                f"ℹ️ Detected a 'gene:' prefix on {n_stripped:,} of "
+                f"{len(unresolved_ids):,} unresolved ID(s) (e.g. "
+                f"`{unresolved_ids[0]}`) -- this is stripped automatically "
+                "before ID-type detection and lookup, and the real result "
+                "is applied back onto the original (prefixed) gene."
+            )
+
+        detection = gim.detect_id_type(stripped_ids)
+        detected_type = detection["detected_type"]
+        st.caption(
+            f"Auto-detected ID type for your unresolved gene IDs: "
+            f"**{detected_type}** ({detection['match_fraction'] * 100:.0f}% of a "
+            f"sample matched -- e.g. `{'`, `'.join(detection['example_ids'][:3])}`)."
+        )
+
+        orgdb_package = gim.ORGDB_PACKAGES.get(species_key)
+        default_to_type = gim.symbol_keytype_for_species(species_key)
+        to_type_options = gim.COMMON_KEY_TYPES
+        to_default_idx = to_type_options.index(default_to_type) if default_to_type in to_type_options else 0
+
+        col_from, col_to = st.columns(2)
+        with col_from:
+            from_type_options = gim.COMMON_KEY_TYPES
+            # Correctly pre-selects the AUTO-DETECTED type now that
+            # detection itself runs on the stripped IDs -- previously
+            # this always landed on SYMBOL's index regardless of what
+            # the real underlying IDs were, since detection itself was
+            # broken by the unstripped "gene:" prefix.
+            from_default_idx = from_type_options.index(detected_type) if detected_type in from_type_options else 0
+            picked_from_type = st.selectbox(
+                "My unresolved gene IDs are currently in this format:",
+                options=from_type_options, index=from_default_idx,
+                key="sc_bitr_from_type_select",
+            )
+        with col_to:
+            picked_to_type = st.selectbox(
+                "Convert them to:", options=to_type_options, index=to_default_idx,
+                key="sc_bitr_to_type_select",
+            )
+
+        if st.button(
+            f"✨ Fill in {len(unresolved_ids):,} missing name(s)",
+            key="sc_bitr_fill_missing_btn", type="primary",
+        ):
+            work_dir = scpm.downstream_bitr_work_dir(project)
+            with st.spinner(f"Converting {len(stripped_ids):,} gene ID(s) via bitr()..."):
+                result = gim.run_bitr_conversion(
+                    stripped_ids, picked_from_type, picked_to_type, orgdb_package, work_dir,
+                )
+            if result["success"]:
+                # Map bitr()'s own {stripped_id: converted_value}
+                # mapping back onto every ORIGINAL (possibly "gene:"-
+                # prefixed) gene_id it came from. CRITICAL: a gene
+                # bitr() genuinely couldn't resolve (its own no-op
+                # convention: converted_value == stripped_id) must map
+                # back to the ORIGINAL prefixed id -- NOT the bare
+                # stripped id -- so apply_bitr_symbol_mapping()'s own
+                # "did this actually change?" check correctly treats it
+                # as still fully unresolved, rather than silently
+                # stripping the "gene:" prefix without ever finding a
+                # real name and miscounting that as a resolution.
+                original_keyed_mapping = {}
+                for stripped_id, original_ids in stripped_to_original.items():
+                    converted_value = result["mapping"].get(stripped_id, stripped_id)
+                    for original_id in original_ids:
+                        if converted_value == stripped_id:
+                            original_keyed_mapping[original_id] = original_id
+                        else:
+                            original_keyed_mapping[original_id] = converted_value
+
+                updated_var, n_newly_resolved = dsm.apply_bitr_symbol_mapping(adata.var, original_keyed_mapping)
+                adata.var = updated_var
+                _save_adata_state(project, adata)
+                st.success(
+                    f"✅ {result['message']} ({n_newly_resolved:,} gene(s) in "
+                    "this project newly resolved.)"
+                )
+                st.rerun()
+            else:
+                st.error(f"⚠️ {result['message']}")
 
 
 def _save_adata_state(project, adata):
@@ -314,15 +537,14 @@ def _render_combine_step(project):
         sample_specs = [
             scpm.get_sample_spec_for_downstream(project, s) for s in selected_samples
         ]
-        # --- Gene-symbol resolution overlay (2026-08-25) -- see
-        # sc_downstream_manager.py's own module docstring, "Gene-symbol
-        # resolution overlay", for the full rationale: this project's
-        # already-confirmed reference GTF (Step 5) is passed through so
-        # any gene whose STARsolo-provided symbol still looks unresolved
-        # (e.g. a raw "gene:ENSG..." form, from a reference indexed
-        # BEFORE reference_manager.py's own tiered gene-name backfill
-        # fix) can be corrected here, at combine time -- WITHOUT
-        # requiring the sample to be re-aligned from scratch.
+        # --- Gene-symbol resolution overlay (2026-08-25) -- see this
+        # module's own docstring, "Gene-symbol resolution wiring", and
+        # sc_downstream_manager.py's own module docstring for the full
+        # rationale: this project's already-confirmed reference GTF
+        # (Step 5) is passed through so any gene whose STARsolo-
+        # provided symbol still looks unresolved (e.g. a raw
+        # "gene:ENSG..." form) can be corrected here, at combine time --
+        # WITHOUT requiring the sample to be re-aligned from scratch.
         reference_cfg = scpm.get_reference_choice(project) or {}
         gtf_path = reference_cfg.get("custom_gtf")
         with st.spinner(f"Loading and combining {len(selected_samples)} sample(s)..."):
@@ -356,8 +578,12 @@ def _render_combine_step(project):
             "any one sample is worth a second look; it may indicate that "
             "sample had unusually poor quality relative to the others."
         )
-
+        
+    if combine_done:
+        _render_bitr_gene_name_fallback(project, cached_adata)
     return cached_adata if combine_done else None
+  
+  
 
 
 # ---------------------------------------------------------------------------
@@ -698,10 +924,6 @@ def _render_pca_step(project, adata):
             n_pcs_available = adata.obsm["X_pca"].shape[1]
             pc_options = [f"PC{i+1}" for i in range(n_pcs_available)]
 
-            # --- Independent per-axis PC selection + optional 3D Z-axis
-            # (2026-08-25) -- see this module's own docstring for the
-            # full rationale. Mirrors _render_embedding_step's own
-            # 2D/3D toggle pattern below for a consistent interaction.
             axis_col1, axis_col2, axis_col3, axis_col4 = st.columns([1, 1, 1, 1])
             with axis_col1:
                 x_pc = st.selectbox(
@@ -736,18 +958,20 @@ def _render_pca_step(project, adata):
             )
             if pca_df is not None and x_pc in pca_df.columns and y_pc in pca_df.columns:
                 has_sample_col = "sample" in pca_df.columns
-                sample_values = sorted(pca_df["sample"].astype(str).unique()) if has_sample_col else None
+                sample_values = dsm.natural_sort_unique(pca_df["sample"].astype(str)) if has_sample_col else None
 
                 if use_z_axis and z_pc and z_pc in pca_df.columns:
                     fig2 = px.scatter_3d(
                         pca_df, x=x_pc, y=y_pc, z=z_pc,
                         color="sample" if has_sample_col else None, opacity=0.6,
+                        category_orders=({"sample": sample_values} if sample_values else None),
                     )
                     default_title = f"PCA ({x_pc} vs. {y_pc} vs. {z_pc})"
                 else:
                     fig2 = px.scatter(
                         pca_df, x=x_pc, y=y_pc,
                         color="sample" if has_sample_col else None, opacity=0.6,
+                        category_orders=({"sample": sample_values} if sample_values else None),
                     )
                     default_title = f"PCA ({x_pc} vs. {y_pc})"
 
@@ -1081,8 +1305,17 @@ def _render_clustering_step(project, adata, use_rep):
         with st.expander("📊 Cluster size summary", expanded=True):
             summary_df = dsm.get_cluster_summary(adata, cluster_key)
             if summary_df is not None:
+                # Cluster labels are ALREADY in true numeric order here
+                # (get_cluster_summary() itself now applies
+                # dsm.natural_sort_unique() -- see that function's own
+                # docstring) -- pass an explicit category_orders so the
+                # bar chart's own x-axis respects this order too, rather
+                # than Plotly silently re-deriving its own order.
                 fig = go.Figure(go.Bar(x=summary_df["cluster"], y=summary_df["n_cells"], name="n_cells"))
-                fig.update_layout(height=400, margin=dict(l=10, r=10, t=30, b=10))
+                fig.update_layout(
+                    height=400, margin=dict(l=10, r=10, t=30, b=10),
+                    xaxis=dict(type="category", categoryorder="array", categoryarray=summary_df["cluster"].tolist()),
+                )
                 style = scw._render_plot_style_controls(
                     "sc_downstream_cluster_summary",
                     single_color_default={"n_cells": "#636EFA"}, show_legend_controls=False,
@@ -1189,13 +1422,30 @@ def _render_embedding_step(project, adata, use_rep, cluster_key):
             )
             embed_df = dsm.get_embedding_coordinates(adata, method=method, color_by_columns=[color_by])
             if embed_df is not None and "Dim1" in embed_df.columns and "Dim2" in embed_df.columns:
-                group_values = sorted(embed_df[color_by].astype(str).unique()) if color_by in embed_df.columns else None
+                # --- Cluster/group label natural-sort ordering fix
+                # (2026-08-25) -- see this module's own docstring for
+                # the full rationale. Previously used
+                # sorted(embed_df[color_by].astype(str).unique()) (a
+                # plain lexicographic sort) to build group_values for
+                # the color-picker widgets, but NEVER passed an explicit
+                # category_orders to px.scatter/scatter_3d -- so Plotly's
+                # own "first appearance in the data" default legend
+                # order took over instead, producing the confirmed real
+                # scrambled legend order. Both are fixed here: natural
+                # sort for group_values, AND an explicit category_orders
+                # argument telling Plotly the exact intended order.
+                group_values = dsm.natural_sort_unique(embed_df[color_by].astype(str)) if color_by in embed_df.columns else None
+                category_orders = {color_by: group_values} if group_values else None
                 if n_components == 3 and "Dim3" in embed_df.columns:
                     fig = px.scatter_3d(
                         embed_df, x="Dim1", y="Dim2", z="Dim3", color=color_by, opacity=0.6,
+                        category_orders=category_orders,
                     )
                 else:
-                    fig = px.scatter(embed_df, x="Dim1", y="Dim2", color=color_by, opacity=0.6)
+                    fig = px.scatter(
+                        embed_df, x="Dim1", y="Dim2", color=color_by, opacity=0.6,
+                        category_orders=category_orders,
+                    )
                 fig.update_layout(height=550, margin=dict(l=10, r=10, t=30, b=10))
                 style = scw._render_plot_style_controls(
                     "sc_downstream_embed_scatter", group_values=group_values,
@@ -1277,13 +1527,49 @@ def _render_cluster_marker_explorer(project, adata, cluster_key):
     markers_df = st.session_state.get("sc_downstream_cluster_markers_df")
     if markers_df is not None:
         with st.expander("📋 Marker gene table", expanded=True):
-            cluster_options = sorted(markers_df["cluster"].unique(), key=str)
+            # --- Cluster/group label natural-sort ordering fix
+            # (2026-08-25) -- see this module's own docstring for the
+            # full rationale. This dropdown previously used
+            # sorted(markers_df["cluster"].unique(), key=str), a plain
+            # LEXICOGRAPHIC string sort that put "10" right after "1"
+            # and before "2" -- confirmed directly matching a real
+            # reported screenshot showing exactly this order. Now uses
+            # dsm.natural_sort_unique() for true numeric order instead.
+            cluster_options = dsm.natural_sort_unique(markers_df["cluster"])
             chosen_cluster = st.selectbox(
                 "View top markers for cluster:", options=["All"] + list(cluster_options),
                 key="sc_downstream_marker_table_cluster",
             )
             display_df = markers_df if chosen_cluster == "All" else markers_df[markers_df["cluster"] == chosen_cluster]
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        # --- Scientific-notation p-value display fix (2026-08-25) ---
+            # A real, confirmed issue: pvalue/pvalue_adj showed as "0"
+            # for every row -- partly because Streamlit's own default
+            # numeric display rounds away small floats, and partly
+            # because scanpy's Wilcoxon test genuinely UNDERFLOWS to a
+            # true 0.0 in float64 for large cell counts (no formatting
+            # can recover a value that's already lost). Both cases are
+            # now shown honestly: a real small p-value displays in true
+            # scientific notation, and a genuinely underflowed value is
+            # explicitly labeled "< 1e-308" (float64's own smallest
+            # representable magnitude) rather than showing a misleading
+            # bare "0" or a fabricated tiny number. The RAW, full-
+            # precision numeric values are still what's written to the
+            # CSV download below -- only this on-screen table is
+            # reformatted for readability.
+            display_df_formatted = display_df.copy()
+            for pcol in ("pvalue", "pvalue_adj"):
+                if pcol in display_df_formatted.columns:
+                    display_df_formatted[pcol] = display_df_formatted[pcol].apply(_format_scientific_pvalue)
+            st.dataframe(display_df_formatted, use_container_width=True, hide_index=True)
+            st.caption(
+                "💡 p-values are shown in scientific notation. **'< 1e-308'** means "
+                "the true p-value was so small it exceeded float64's own precision "
+                "floor (a real statistical result, not a display bug) -- this is "
+                "common with cluster-marker tests on large cell counts; see Step 8a's "
+                "own explanation above for why the p-value's exact magnitude here "
+                "matters less than `score` and `log2FoldChange` for judging a marker's "
+                "quality."
+            )
             scw._render_csv_download(
                 markers_df, "cluster_marker_genes", "sc_downstream_marker_table",
                 expander_label="⬇️ Download full marker gene table (.csv)",
@@ -1319,22 +1605,77 @@ def _render_manual_marker_scoring(project, adata, cluster_key):
     marker_sets = st.session_state["sc_downstream_marker_sets"]
 
     with st.expander("✏️ Define marker gene panels", expanded=not bool(marker_sets)):
+        # --- Input-clearing fix (2026-08-25) -- see this file's own
+        # module docstring. Confirmed via direct testing that
+        # st.form(clear_on_submit=True) does NOT reliably clear these
+        # widgets in this app's real Streamlit version (1.53.1) -- so a
+        # more robust "key-cycling" approach is used instead: an
+        # incrementing counter is baked into each widget's own key, so
+        # after a successful add, the NEXT render uses fresh widget
+        # keys Streamlit has never seen before, which always render
+        # blank -- confirmed working via direct testing.
+        if "sc_downstream_panel_form_counter" not in st.session_state:
+            st.session_state["sc_downstream_panel_form_counter"] = 0
+        _form_counter = st.session_state["sc_downstream_panel_form_counter"]
+
         col1, col2 = st.columns([1, 2])
         with col1:
-            new_cell_type = st.text_input("Cell type name:", key="sc_downstream_new_celltype_name")
+            new_cell_type = st.text_input(
+                "Cell type name:", key=f"sc_downstream_new_celltype_name_{_form_counter}",
+            )
         with col2:
             new_genes = st.text_input(
                 "Marker genes (comma-separated, symbols or IDs):",
-                key="sc_downstream_new_celltype_genes",
+                key=f"sc_downstream_new_celltype_genes_{_form_counter}",
             )
-        if st.button("➕ Add / Update Panel", key="sc_downstream_add_marker_panel_btn"):
+        if st.button("➕ Add / Update Panel", key=f"sc_downstream_add_marker_panel_btn_{_form_counter}"):
             if not new_cell_type.strip() or not new_genes.strip():
                 st.error("Enter both a cell type name and at least one marker gene.")
             else:
                 genes_list = [g.strip() for g in new_genes.split(",") if g.strip()]
                 marker_sets[new_cell_type.strip()] = genes_list
                 st.session_state["sc_downstream_marker_sets"] = marker_sets
+                st.session_state["sc_downstream_panel_form_counter"] += 1
                 st.rerun()
+
+        # --- File upload fix (2026-08-25) -- lets a user provide an
+        # entire marker panel table at once (.csv/.txt/.xlsx), instead
+        # of typing each cell type's genes one at a time. Supports BOTH
+        # a "wide" layout (one row per cell type, genes comma/semicolon/
+        # pipe-separated within one cell) and a "long" layout (one gene
+        # per row, the SAME cell_type repeated across multiple rows) --
+        # see sc_marker_panel_io.py's own module docstring for the full
+        # parsing rules. Uploaded panels are MERGED into (not replacing)
+        # any panels already defined above -- a cell type present in
+        # both is overwritten by the file's own version, matching this
+        # section's own "Add/Update" semantics.
+        st.markdown("**Or upload a marker panel file:**")
+        uploaded_panel_file = st.file_uploader(
+            "Upload a .csv, .txt, or .xlsx file:", type=["csv", "txt", "xlsx"],
+            key=f"sc_downstream_panel_upload_{_form_counter}",
+            help=(
+                "Expected format: a column identifying the cell type (e.g. "
+                "'cell_type') and a column of gene(s) (e.g. 'genes') -- either "
+                "one row per cell type with multiple genes separated by commas/"
+                "semicolons/pipes in one cell, OR one gene per row with the same "
+                "cell type repeated across multiple rows. Both layouts are "
+                "auto-detected."
+            ),
+        )
+        if uploaded_panel_file is not None:
+            if st.button("➕ Add Panels From File", key=f"sc_downstream_add_panels_from_file_btn_{_form_counter}"):
+                try:
+                    uploaded_panels = mpio.load_marker_panel_file(
+                        uploaded_panel_file.name, uploaded_panel_file.getvalue(),
+                    )
+                except ValueError as e:
+                    st.error(f"⚠️ {e}")
+                else:
+                    marker_sets.update(uploaded_panels)
+                    st.session_state["sc_downstream_marker_sets"] = marker_sets
+                    st.session_state["sc_downstream_panel_form_counter"] += 1
+                    st.success(f"✅ Added/updated {len(uploaded_panels)} panel(s) from '{uploaded_panel_file.name}'.")
+                    st.rerun()
 
         if marker_sets:
             st.markdown("**Current panels:**")
@@ -1389,6 +1730,10 @@ def _render_manual_marker_scoring(project, adata, cluster_key):
         with st.expander("📊 Mean marker score per cluster", expanded=True):
             mean_scores = adata.obs.groupby(cluster_key, observed=True)[score_cols].mean()
             mean_scores.columns = [c.replace("score_", "") for c in mean_scores.columns]
+            # Re-order rows into true numeric cluster order, matching
+            # this file's other cluster-ordering fixes.
+            ordered_index = dsm.natural_sort_unique(mean_scores.index.astype(str))
+            mean_scores = mean_scores.reindex(ordered_index)
             st.dataframe(mean_scores.style.background_gradient(cmap="RdBu_r", axis=None), use_container_width=True)
             scw._render_csv_download(
                 mean_scores.reset_index(), "mean_marker_scores_per_cluster", "sc_downstream_marker_scores",
@@ -1502,6 +1847,9 @@ def _render_celltypist_step(project, adata, cluster_key):
                 else "celltypist_predicted_label"
             )
             breakdown = pd.crosstab(adata.obs[cluster_key], adata.obs[label_col])
+            # Re-order rows into true numeric cluster order.
+            ordered_index = dsm.natural_sort_unique(breakdown.index.astype(str))
+            breakdown = breakdown.reindex(ordered_index)
             st.dataframe(breakdown, use_container_width=True)
             scw._render_csv_download(
                 breakdown.reset_index(), "celltypist_breakdown_per_cluster", "sc_downstream_celltypist_breakdown",
@@ -1678,37 +2026,70 @@ def _render_final_celltype_assignment(project, adata, cluster_key):
             "table showed no clear majority."
         )
 
-    clusters = sorted(adata.obs[cluster_key].unique(), key=str)
+    clusters = dsm.natural_sort_unique(adata.obs[cluster_key].astype(str))
     saved_recipe = scpm.get_downstream_step_recipe(project, "annotation")
     saved_labels = dict(saved_recipe["params"].get("labels", {})) if saved_recipe else {}
 
+    # --- New "top manual marker" column (2026-08-25) -- see
+    # sc_marker_confidence.py's own module docstring for the full
+    # rationale: this pulls Step 8b's own mean-score-per-cluster table
+    # directly into THIS table, so a user never has to scroll back to
+    # 8b to remember which panel scored highest for a given cluster --
+    # the exact gap that caused a real, confirmed mislabeling before.
+    mean_scores_by_cluster = {}
+    score_cols = [c for c in adata.obs.columns if c.startswith("score_")]
+    if score_cols and cluster_key in adata.obs.columns:
+        mean_scores_df = adata.obs.groupby(cluster_key, observed=True)[score_cols].mean()
+        mean_scores_df.columns = [c.replace("score_", "") for c in mean_scores_df.columns]
+        for cluster_label, row in mean_scores_df.iterrows():
+            sorted_scores = sorted(row.items(), key=lambda kv: -kv[1])
+            mean_scores_by_cluster[str(cluster_label)] = sorted_scores
+
     rows = []
     for cluster in clusters:
-        n_cells = int((adata.obs[cluster_key] == cluster).sum())
+        n_cells = int((adata.obs[cluster_key].astype(str) == cluster).sum())
         suggestion = ""
         if "celltypist_majority_voting" in adata.obs.columns:
-            mode_vals = adata.obs.loc[adata.obs[cluster_key] == cluster, "celltypist_majority_voting"].mode()
+            mode_vals = adata.obs.loc[adata.obs[cluster_key].astype(str) == cluster, "celltypist_majority_voting"].mode()
             suggestion = mode_vals.iloc[0] if not mode_vals.empty else ""
         elif "celltypist_predicted_label" in adata.obs.columns:
-            mode_vals = adata.obs.loc[adata.obs[cluster_key] == cluster, "celltypist_predicted_label"].mode()
+            mode_vals = adata.obs.loc[adata.obs[cluster_key].astype(str) == cluster, "celltypist_predicted_label"].mode()
             suggestion = mode_vals.iloc[0] if not mode_vals.empty else ""
+
+        top_marker_name, confidence, reason = mconf.classify_marker_confidence(
+            mean_scores_by_cluster.get(str(cluster), [])
+        )
+        top_marker_display = (
+            f"{mconf.CONFIDENCE_ICONS[confidence]}: {top_marker_name}" if top_marker_name
+            else mconf.CONFIDENCE_ICONS["No signal"]
+        )
+
         rows.append({
             "cluster": str(cluster), "n_cells": n_cells,
             "celltypist_suggestion": suggestion,
-            "final_label": saved_labels.get(str(cluster), suggestion or str(cluster)),
+            "top_manual_marker": top_marker_display,
+            "final_label": saved_labels.get(str(cluster), top_marker_name or suggestion or str(cluster)),
         })
     edit_df = pd.DataFrame(rows)
 
+    st.caption(
+        "💡 **'Top manual marker'** pulls Step 8b's own mean-score table directly "
+        "into this row, so you don't need to scroll back to compare -- 🟢 **High** "
+        "means a clear, trustworthy standout; 🟡 **Potential** means a real but "
+        "modest or closely-contested lead (worth double-checking); 🟠 **Low** means "
+        "only a weak hint; ⚪ **No signal** means none of your defined panels scored "
+        "positively for this cluster at all."
+    )
     edited_df = st.data_editor(
         edit_df, use_container_width=True, hide_index=True, key="sc_downstream_final_label_editor",
         column_config={
             "cluster": st.column_config.TextColumn(disabled=True),
             "n_cells": st.column_config.NumberColumn(disabled=True),
             "celltypist_suggestion": st.column_config.TextColumn(disabled=True),
+            "top_manual_marker": st.column_config.TextColumn("Top manual marker (from 8b)", disabled=True),
             "final_label": st.column_config.TextColumn("Final cell-type label"),
         },
     )
-
     current_label_map = dict(zip(edited_df["cluster"].astype(str), edited_df["final_label"].astype(str)))
     current_params = {"labels": current_label_map, "cluster_key": cluster_key}
     is_current = scpm.check_downstream_step_current(project, "annotation", current_params)

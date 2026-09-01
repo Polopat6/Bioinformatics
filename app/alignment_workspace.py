@@ -89,7 +89,7 @@ import reference_manager as rm
 import quantification_manager as qm
 import counts_matrix_manager as cmm
 import file_browser as fb
-
+import gff3_gene_name_resolver as gff3_resolver
 
 def _render_counts_matrix_step(project, method, samplesheet_df, reference_dir):
     """
@@ -603,6 +603,35 @@ def _render_bulk_mito_verification(species_key, species_labels, genome_fasta_exp
         )
         _render_readonly_contig_browser(gtf_expected)
 
+def _render_gene_name_resolution_summary(target_dir):
+    """
+    Read back and display (via a plain st.info() -- NOT a warning/error)
+    a GFF3-fallback reference's own persisted gene-name resolution
+    summary, if one exists for this reference at all -- ports single-
+    cell's singlecell_workspace._render_gene_name_resolution_summary()
+    into Bulk RNA-Seq for parity, since both pipelines share the exact
+    same underlying reference/backfill infrastructure
+    (reference_manager.py's download_genome_and_gtf() ->
+    backfill_gene_names_from_gff3_tiered()).
+
+    target_dir: the preset reference's own shared directory (the SAME
+        directory reference_manager.py's own
+        write_gene_name_resolution_summary() writes
+        gene_name_resolution_summary.json into, alongside the genome
+        FASTA and GTF).
+
+    Renders NOTHING at all (no empty box, no placeholder) if
+    rm.read_gene_name_resolution_summary() returns None -- correctly
+    the case for any species whose direct Ensembl GTF was available
+    (Ensembl's own native GTF already includes gene_name for every gene
+    it defines, so the GFF3 fallback -- and this summary file -- never
+    existed for that reference at all).
+    """
+    summary = rm.read_gene_name_resolution_summary(target_dir)
+    message = gff3_resolver.build_gene_name_resolution_summary_message(summary)
+    if message is not None:
+        st.info(message)
+
 def _render_custom_star_mito_check(genome_fasta_path, gtf_path):
     """
     Best-effort, INFORMATIONAL-ONLY mitochondrial genome check for a
@@ -1005,6 +1034,16 @@ def render():
                 genome_fasta_expected = os.path.join(shared_genome_dir, f"{species_key}.genome.fa")
                 gtf_expected = os.path.join(shared_genome_dir, f"{species_key}.annotation.gtf")
                 _render_bulk_mito_verification(species_key, species_labels, genome_fasta_expected, gtf_expected)
+                # --- Gene-name resolution summary (parity with
+                # single-cell's singlecell_workspace._render_gene_name_resolution_summary)
+                # -- see this module's own docstring for the full
+                # rationale. shared_genome_dir is the SAME directory
+                # reference_manager.py's write_gene_name_resolution_summary()
+                # writes gene_name_resolution_summary.json into --
+                # renders nothing at all for a species whose direct
+                # Ensembl GTF was available (no GFF3 fallback was ever
+                # used, so there's genuinely nothing to summarize).
+                _render_gene_name_resolution_summary(shared_genome_dir)
             else:
                 st.info(
                     f"ℹ️ No project has downloaded a reference for "

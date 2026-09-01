@@ -66,24 +66,75 @@ A real reported bug: run_bamtofastq() previously only captured/returned
 bamtofastq's own stdout/stderr when the tool exited with a NON-ZERO
 return code -- if bamtofastq exited 0 (success) but produced ZERO FASTQ
 files (a real, confirmed-possible outcome, e.g. when an explicit
-chemistry flag mismatches the BAM's actual origin -- confirmed
-motivating case: a Cell Ranger 1.1 BAM converted with the "auto"
-chemistry option instead of the required "--cr11" flag, since CR 1.1
-BAMs predate the self-describing header fields "auto" relies on),
-callers had ZERO visibility into what bamtofastq itself actually
-printed, since only a generic "completed successfully" message was ever
-returned in the success case.
+chemistry flag mismatches the BAM's actual origin), callers had ZERO
+visibility into what bamtofastq itself actually printed, since only a
+generic "completed successfully" message was ever returned in the
+success case.
 
 Fixed by having run_bamtofastq() ALWAYS capture and return bamtofastq's
 own stdout+stderr (not just on failure), and by having
 run_full_bam_recovery_pipeline()/run_bam_recovery_from_uploaded_file()
 explicitly check for this "success but zero files" case and surface
-that captured tool output directly in the returned error message --
-rather than the previous generic "bamtofastq completed but no FASTQ
-files were found" message, which gave no actionable information for
-diagnosing WHY. This is purely additive -- the normal, expected-output
-case is completely unaffected; only the previously-silent diagnostic
-gap for this specific anomalous outcome is closed.
+that captured tool output directly in the returned error message.
+
+--- "Already downloaded" detection gap fix (2026-08-31) ---
+A real reported bug: the covid_test single-cell project re-attempted
+prefetch/fasterq-dump for accessions that had already been successfully
+downloaded in a previous session. Root cause: this module previously had
+NO detection logic at all for "has this accession already been
+downloaded?" -- download_and_classify_run() unconditionally re-ran
+prefetch + fasterq-dump for every accession, every time it was called.
+
+This is made worse by finalize_role_assignment() renaming raw,
+accession-named output files (e.g. "SRR13734390_1.fastq.gz") into the
+project's standard sample-based 10x naming -- which, for MOST callers,
+would no longer contain the original accession string anywhere. Once a
+run is finalized, filenames alone can no longer answer "which accession
+produced this file?" in general.
+
+Fixed with THREE detection tiers, in priority order:
+  1. Registry (_sra_download_registry.json, in the project's fastq dir --
+     same pattern as bulk's own processed_registry.json) -- the durable,
+     general-purpose source of truth going forward, updated by
+     mark_accessions_finalized() (which callers must invoke once, right
+     after a successful finalize_role_assignment() call).
+  2. Raw staging directory fallback (_sra_work/<accession>/) -- for a run
+     downloaded but not yet finalized/moved.
+  3. Filename-pattern fallback (2026-08-31, added same day) -- SPECIFIC
+     to singlecell_workspace.py's own _render_sra_source() UI, which
+     calls finalize_role_assignment(..., sample_name) with sample_name
+     SET TO THE ACCESSION ITSELF for the SRA-download path (i.e.
+     `scsra.finalize_role_assignment(overrides, fastq_dir, run, ...)`,
+     where `run` IS the accession) -- meaning a PREVIOUSLY finalized SRA
+     run's files (from before this registry existed, so no registry
+     entry was ever written for them) are still named like
+     "SRR13734390_S1_R1_001.fastq.gz": the accession string is STILL the
+     literal filename prefix, even after finalization, for this specific
+     caller. This tier is intentionally an exact-prefix match (never a
+     loose substring search) to avoid any false-positive risk against an
+     unrelated sample. It does NOT apply to the "convert from a BAM file
+     I already have" path, since that lets the user choose an arbitrary
+     sample_name unrelated to any SRA accession.
+
+A registry hit (tier 1) is NEVER trusted blindly -- at least one file it
+references must still actually exist on disk, or the entry is treated as
+stale and ignored, so a registry out of sync with reality (e.g. someone
+manually deleted files) can't cause a silent false-positive.
+
+download_and_classify_run() and download_and_classify_runs_parallel()
+both now accept an optional force_redownload=False parameter; when
+False (the default), an accession already found via ANY of the three
+tiers above is skipped with an explicit "skipped" result rather than
+re-downloaded.
+
+backfill_registry_from_existing_files() is a new, ONE-TIME-USE utility
+that proactively scans a project's fastq dir for tier-3
+(filename-pattern) matches across a whole list of accessions and writes
+registry entries for every match found, so that subsequent lookups can
+hit the fast, general-purpose tier-1 registry check directly rather
+than re-scanning the filesystem by pattern every single time. This is
+the recommended fix for existing projects (like covid_test) that
+already have finalized runs on disk from BEFORE this fix existed.
 """
 import gzip
 import json
@@ -95,6 +146,7 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import sra_manager as sra  # reused directly -- see docstring
 import chemistry_manager as chem
@@ -179,6 +231,7 @@ def classify_assay_type_from_metadata(row):
         ),
     }
 
+
 _I1_MAX_LEN = 12
 
 
@@ -215,6 +268,8 @@ def classify_output_files(fastq_paths, n_reads=2000):
 
 
 def detect_likely_bam_derived_issue(classification):
+    if not classification:
+        return None
     roles = {info["role"] for info in classification.values()}
     if roles == {ROLE_UNKNOWN}:
         return (
@@ -232,8 +287,50 @@ def detect_likely_bam_derived_issue(classification):
     return None
 
 
-def build_prefetch_command(accession, output_dir):
-    return ["prefetch", accession, "--output-directory", output_dir]
+DEFAULT_PREFETCH_MAX_SIZE = "100G"
+
+
+def build_prefetch_command(accession, output_dir, max_size=DEFAULT_PREFETCH_MAX_SIZE):
+    """
+    --- 20GB default download-limit fix (2026-09-01) ---
+    A real, confirmed bug: prefetch's own default maximum download size
+    is 20GB. When an accession exceeds this, prefetch does NOT error --
+    it exits 0 (success) while explicitly SKIPPING the download
+    ("Download of some files was skipped because they are too large"),
+    which then caused a confusing downstream fasterq-dump VFS/404 error
+    with no indication the real cause was a silent size-limit skip one
+    step earlier. Confirmed real-world trigger: SRR13734386 (72GB), part
+    of a COVID single-cell PBMC batch where run sizes vary considerably.
+
+    Fixed by always passing an explicit --max-size, defaulting to 100GB
+    (comfortably above every real single-cell run size seen in this
+    project so far, including the 72GB case that surfaced this bug).
+    Callers needing a different ceiling (e.g. a known-huge deposition, or
+    a deliberately LOWER limit to avoid accidentally filling scratch
+    disk) can override max_size directly.
+    """
+    return [
+        "prefetch", accession, "--output-directory", output_dir,
+        "--max-size", max_size,
+    ]
+
+
+def _find_prefetched_sra_file(accession, work_dir):
+    """
+    Look for the .sra file prefetch is expected to have produced.
+    prefetch's own convention (with --output-directory <work_dir>) is to
+    write <work_dir>/<accession>/<accession>.sra -- but different
+    sra-tools versions/configurations have occasionally been observed to
+    place it directly at <work_dir>/<accession>.sra instead, so both
+    locations are checked.
+    """
+    nested_path = os.path.join(work_dir, accession, f"{accession}.sra")
+    if os.path.isfile(nested_path):
+        return nested_path
+    flat_path = os.path.join(work_dir, f"{accession}.sra")
+    if os.path.isfile(flat_path):
+        return flat_path
+    return None
 
 
 def build_fasterq_dump_command(accession, sra_file_dir, output_dir, threads=4):
@@ -244,37 +341,450 @@ def build_fasterq_dump_command(accession, sra_file_dir, output_dir, threads=4):
     ]
 
 
-def _gzip_and_remove(src_path):
+def _pigz_available():
+    "Check whether pigz (parallel gzip) is installed -- a much faster, multi-threaded alternative to Python's own single-threaded gzip module, especially valuable on a many-core HPC node."
+    return shutil.which("pigz") is not None
+
+
+def _gzip_and_remove(src_path, threads=4):
+    """
+    Compress src_path to src_path + '.gz', then delete the original.
+    Uses pigz (parallel gzip) when installed, falling back to Python's
+    own gzip module at compresslevel=6 (matching standard command-line
+    gzip's own default) otherwise.
+    """
     gz_path = src_path + ".gz"
-    with open(src_path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+
+    if _pigz_available():
+        with open(gz_path, "wb") as f_out:
+            result = subprocess.run(
+                ["pigz", "-p", str(threads), "-c", src_path],
+                stdout=f_out, stderr=subprocess.PIPE,
+            )
+        if result.returncode == 0:
+            os.remove(src_path)
+            return gz_path
+        if os.path.exists(gz_path):
+            os.remove(gz_path)
+
+    with open(src_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=6) as f_out:
         shutil.copyfileobj(f_in, f_out)
     os.remove(src_path)
     return gz_path
 
 
-def download_and_classify_run(accession, project_fastq_dir, sample_name, threads=4, subprocess_runner=None):
+# ---------------------------------------------------------------------------
+# "Already downloaded" detection (2026-08-31)
+# ---------------------------------------------------------------------------
+DOWNLOAD_REGISTRY_FILENAME = "_sra_download_registry.json"
+
+
+def _registry_path(project_fastq_dir):
+    return os.path.join(project_fastq_dir, DOWNLOAD_REGISTRY_FILENAME)
+
+
+def _load_download_registry(project_fastq_dir):
+    path = _registry_path(project_fastq_dir)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # A corrupt/unreadable registry must NEVER be silently trusted as
+        # "everything is downloaded" or crash the caller -- treat it as
+        # empty (forcing fresh, honest re-detection for every accession)
+        # rather than guessing at its intended contents.
+        return {}
+
+
+def _save_download_registry(project_fastq_dir, registry):
+    os.makedirs(project_fastq_dir, exist_ok=True)
+    path = _registry_path(project_fastq_dir)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(registry, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)  # atomic write -- avoids ever leaving a torn/partial registry file behind
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _find_raw_staged_files(accession, project_fastq_dir):
+    """
+    Tier 2: look for this accession's own already-downloaded raw output
+    still sitting in its _sra_work/<accession>/ staging directory -- i.e.
+    downloaded (and possibly classified) previously, but not yet
+    finalized/moved into the project's main fastq dir.
+    """
+    work_dir = os.path.join(project_fastq_dir, "_sra_work", accession)
+    if not os.path.isdir(work_dir):
+        return []
+    return sorted([
+        os.path.join(work_dir, f) for f in os.listdir(work_dir)
+        if f.startswith(accession) and (f.endswith(".fastq") or f.endswith(".fastq.gz"))
+    ])
+
+
+def _find_finalized_files_by_naming_convention(accession, project_fastq_dir):
+    """
+    Tier 3: filesystem-pattern fallback for accessions that were ALREADY
+    downloaded, classified, AND finalized/moved by a PRIOR session --
+    i.e. before this module's registry (and mark_accessions_finalized())
+    existed, so no registry entry was ever written for them.
+
+    This works specifically because singlecell_workspace.py's own
+    _render_sra_source() calls finalize_role_assignment(..., sample_name)
+    with sample_name SET TO THE ACCESSION ITSELF for the SRA-download
+    path (i.e. `scsra.finalize_role_assignment(overrides, fastq_dir, run,
+    ...)`, where `run` IS the accession) -- so finalize_role_assignment()'s
+    own standard 10x-style naming convention
+    ("{sample_name}_S1_{role}_001.ext" or
+    "{sample_name}_S1_L{lane}_{role}_001.ext") means a previously
+    finalized SRA run's files are named like
+    "SRR13734390_S1_R1_001.fastq.gz" -- i.e. the accession string is
+    STILL the literal filename prefix, even after finalization.
+
+    Intentionally an EXACT prefix match (never a loose substring search)
+    to avoid any false-positive risk against an unrelated sample. Does
+    NOT apply to the "convert from a BAM file I already have" path,
+    since that path lets the user choose an arbitrary sample_name
+    unrelated to any SRA accession.
+    """
+    if not os.path.isdir(project_fastq_dir):
+        return []
+    prefix_flat = f"{accession}_S1_"
+    prefix_laned = f"{accession}_S1_L"
+    matches = []
+    for f in os.listdir(project_fastq_dir):
+        if not (f.endswith(".fastq") or f.endswith(".fastq.gz")):
+            continue
+        if f.startswith(prefix_flat) or f.startswith(prefix_laned):
+            matches.append(os.path.join(project_fastq_dir, f))
+    return sorted(matches)
+
+
+def scan_pending_unfinalized_runs(project_fastq_dir):
+    """
+    --- Proactive "resume" scan for previously-downloaded-but-unconfirmed
+        runs (2026-09-01) ---
+    A real, confirmed gap: is_accession_already_downloaded()'s tier-2
+    (raw staging) check only answers "has THIS SPECIFIC accession
+    already been downloaded?" -- it must be called PER ACCESSION, and
+    singlecell_workspace.py's own _render_sra_source() UI only calls it
+    (indirectly, via download_and_classify_run()) for accessions the
+    user has re-validated and re-selected in THIS session. Its RESULT is
+    then stored only in ephemeral Streamlit session_state
+    (sc_sra_download_results), which is reset on every new
+    session/page-reload and OVERWRITTEN (not merged) on every subsequent
+    download-button click for a different subset of runs.
+
+    Net effect: a run that was downloaded in an earlier session (or an
+    earlier click, for a different run subset, in the same session) can
+    have real, valid raw FASTQ output sitting in its own
+    _sra_work/<accession>/ directory, yet be COMPLETELY INVISIBLE in the
+    "Confirm File Roles" UI until the user manually re-enters, re-
+    validates, and re-selects that exact accession again -- even though
+    the underlying data was never lost.
+
+    This function closes that gap by scanning _sra_work/ directly for
+    ANY accession subdirectory with real raw FASTQ output not yet
+    finalized (i.e. every accession this project's tier-2 raw-staging
+    check would currently match), completely independent of
+    session_state or of which accessions the user has typed/selected in
+    this particular session. Callers (e.g. this project's Step 1 UI)
+    should call this once per render and MERGE its result into
+    st.session_state["sc_sra_download_results"] (without clobbering any
+    newer/different entries already there), so every previously
+    downloaded-but-unconfirmed run reappears automatically, ready to
+    confirm, the moment the project is reopened -- with no re-entry of
+    accessions required.
+
+    Returns a dict of {accession: result_dict}, in EXACTLY the same
+    shape download_and_classify_run() itself returns for a successful
+    (non-skipped) run -- i.e. directly usable as, or merged into,
+    st.session_state["sc_sra_download_results"].
+    """
+    work_root = os.path.join(project_fastq_dir, "_sra_work")
+    if not os.path.isdir(work_root):
+        return {}
+
+    pending = {}
+    for accession in sorted(os.listdir(work_root)):
+        work_dir = os.path.join(work_root, accession)
+        if not os.path.isdir(work_dir):
+            continue
+        raw_files = _find_raw_staged_files(accession, project_fastq_dir)
+        if not raw_files:
+            # Either nothing downloaded yet for this accession (e.g. a
+            # prefetch-only, no-FASTQ-output failure like the confirmed
+            # 20GB-size-limit case), or it was already finalized/moved
+            # out of staging -- either way, nothing pending to surface.
+            continue
+        classification = classify_output_files(raw_files)
+        bam_warning = detect_likely_bam_derived_issue(classification)
+        pending[accession] = {
+            "success": True,
+            "skipped": True,
+            "message": (
+                f"Found {len(raw_files)} previously downloaded file(s) for {accession} "
+                f"already sitting in _sra_work/{accession}/ -- not yet confirmed/finalized."
+            ),
+            "classification": classification,
+            "bam_warning": bam_warning,
+        }
+    return pending
+
+
+def is_accession_already_downloaded(accession, project_fastq_dir):
+    """
+    Determine whether `accession` has already been successfully
+    downloaded, checking THREE tiers in order (see module docstring for
+    full rationale of each):
+
+      1. registry (_sra_download_registry.json)
+      2. raw staging directory (_sra_work/<accession>/)
+      3. filename-pattern match in the project's main fastq dir
+         ("<accession>_S1_..." -- catches runs finalized before this
+         registry existed)
+
+    A registry hit (tier 1) is NEVER trusted blindly -- at least one
+    file it references must still actually exist on disk, or the entry
+    is treated as stale and ignored.
+
+    Returns a dict:
+        {"already_downloaded": bool, "source": "registry" | "raw_staging" | "finalized_naming" | None,
+         "existing_files": [...], "detail": "<human-readable explanation>"}
+    """
+    registry = _load_download_registry(project_fastq_dir)
+    entry = registry.get(accession)
+    if entry:
+        candidate_files = entry.get("finalized_files") or entry.get("raw_files") or []
+        still_present = [p for p in candidate_files if os.path.exists(p)]
+        if still_present:
+            return {
+                "already_downloaded": True,
+                "source": "registry",
+                "existing_files": still_present,
+                "detail": (
+                    f"'{accession}' is recorded in the download registry as "
+                    f"'{entry.get('status', 'downloaded')}' (sample "
+                    f"'{entry.get('sample_name', '?')}'), and {len(still_present)} of its "
+                    f"recorded file(s) are still present on disk."
+                ),
+            }
+        # Registry says downloaded, but every file it references is now
+        # missing -- fall through to the remaining tiers rather than
+        # trusting a stale entry.
+
+    raw_files = _find_raw_staged_files(accession, project_fastq_dir)
+    if raw_files:
+        return {
+            "already_downloaded": True,
+            "source": "raw_staging",
+            "existing_files": raw_files,
+            "detail": (
+                f"'{accession}' already has {len(raw_files)} raw downloaded FASTQ file(s) "
+                f"sitting in its own _sra_work/{accession}/ staging directory from a previous "
+                f"run, but this accession is not (or is no longer) in the download registry -- "
+                f"these files have not been finalized/moved yet."
+            ),
+        }
+
+    finalized_files = _find_finalized_files_by_naming_convention(accession, project_fastq_dir)
+    if finalized_files:
+        return {
+            "already_downloaded": True,
+            "source": "finalized_naming",
+            "existing_files": finalized_files,
+            "detail": (
+                f"'{accession}' already has {len(finalized_files)} finalized FASTQ file(s) "
+                f"in this project's fastq directory matching this accession's standard naming "
+                f"pattern ('{accession}_S1_...'), from a run finalized before this project's "
+                f"download registry was introduced."
+            ),
+        }
+
+    return {
+        "already_downloaded": False,
+        "source": None,
+        "existing_files": [],
+        "detail": f"No existing downloaded output found for '{accession}'.",
+    }
+
+
+def mark_accessions_finalized(project_fastq_dir, accession_to_finalized_files):
+    """
+    Record, in the download registry, that one or more accessions'
+    output has been finalized (moved into the project's main fastq dir
+    by finalize_role_assignment()).
+
+    Callers should invoke this AFTER a successful finalize_role_assignment()
+    call, passing a dict mapping each accession involved to the list of
+    final destination file paths finalize_role_assignment() returned for
+    it (e.g. {"SRR13734390": ["/path/SRR13734390_S1_R1_001.fastq.gz",
+    "/path/SRR13734390_S1_R2_001.fastq.gz"]}).
+    """
+    registry = _load_download_registry(project_fastq_dir)
+    for accession, finalized_files in accession_to_finalized_files.items():
+        entry = registry.get(accession, {})
+        entry["status"] = "finalized"
+        entry["finalized_files"] = list(finalized_files)
+        entry["finalized_timestamp"] = _now_iso()
+        registry[accession] = entry
+    _save_download_registry(project_fastq_dir, registry)
+
+
+def backfill_registry_from_existing_files(project_fastq_dir, accessions):
+    """
+    ONE-TIME-USE utility for existing projects (like covid_test) that
+    already have finalized SRA runs on disk from BEFORE this registry
+    existed. Proactively scans for tier-3 (filename-pattern) matches
+    across the given list of accessions and writes registry entries for
+    every match found -- so future lookups hit the fast, general-purpose
+    registry check directly rather than re-scanning the filesystem by
+    pattern every time.
+
+    accessions: an iterable of SRA run accessions to check (e.g. every
+        accession you've ever attempted to download for this project --
+        it's harmless to include ones that were never actually
+        downloaded; they're simply skipped).
+
+    Returns a dict summarizing what was found:
+        {"backfilled": [accessions with files found and now registered],
+         "not_found": [accessions with no matching files on disk]}
+
+    Safe to run multiple times -- re-running simply re-confirms/refreshes
+    already-backfilled entries rather than duplicating anything.
+    """
+    backfilled = []
+    not_found = []
+    registry = _load_download_registry(project_fastq_dir)
+
+    for accession in accessions:
+        # Don't bother re-scanning if a live registry entry already
+        # exists and still points at real files.
+        existing = is_accession_already_downloaded(accession, project_fastq_dir)
+        if existing["already_downloaded"] and existing["source"] == "registry":
+            backfilled.append(accession)
+            continue
+
+        finalized_files = _find_finalized_files_by_naming_convention(accession, project_fastq_dir)
+        if finalized_files:
+            entry = registry.get(accession, {})
+            entry["status"] = "finalized"
+            entry["finalized_files"] = finalized_files
+            entry["finalized_timestamp"] = _now_iso()
+            entry.setdefault("sample_name", accession)
+            entry["backfilled"] = True
+            registry[accession] = entry
+            backfilled.append(accession)
+        else:
+            not_found.append(accession)
+
+    _save_download_registry(project_fastq_dir, registry)
+    return {"backfilled": backfilled, "not_found": not_found}
+
+
+def download_and_classify_run(accession, project_fastq_dir, sample_name, threads=4,
+                               subprocess_runner=None, force_redownload=False,
+                               max_size=DEFAULT_PREFETCH_MAX_SIZE):
+    """
+    Unless force_redownload=True, this now checks
+    is_accession_already_downloaded() FIRST and, if the accession is
+    already present (via any of the three detection tiers), skips
+    prefetch/fasterq-dump entirely and returns a "skipped" result
+    instead of silently re-downloading data that's already there.
+    """
     import subprocess as subprocess_module
     runner = subprocess_runner or subprocess_module.run
+
+    if not force_redownload:
+        existing = is_accession_already_downloaded(accession, project_fastq_dir)
+        if existing["already_downloaded"]:
+            classification = None
+            bam_warning = None
+            if existing["source"] in ("raw_staging", "finalized_naming"):
+                classification = classify_output_files(existing["existing_files"])
+                bam_warning = detect_likely_bam_derived_issue(classification)
+            return {
+                "success": True,
+                "skipped": True,
+                "message": (
+                    f"Skipped {accession} -- already downloaded. {existing['detail']} "
+                    f"Pass force_redownload=True to re-download anyway."
+                ),
+                "classification": classification,
+                "bam_warning": bam_warning,
+            }
 
     work_dir = os.path.join(project_fastq_dir, "_sra_work", accession)
     os.makedirs(work_dir, exist_ok=True)
 
-    prefetch_cmd = build_prefetch_command(accession, work_dir)
+    prefetch_cmd = build_prefetch_command(accession, work_dir, max_size=max_size)
     result = runner(prefetch_cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        return {"success": False, "message": f"prefetch failed for {accession}: {result.stderr}", "classification": None, "bam_warning": None}
+        return {"success": False, "skipped": False, "message": f"prefetch failed for {accession}: {result.stderr}", "classification": None, "bam_warning": None}
+
+    # --- "prefetch quiet success, no .sra file" diagnostic fix (2026-09-01) ---
+    # A real, confirmed gap: prefetch can exit 0 (success) WITHOUT
+    # actually writing the expected .sra file -- e.g. a transient NCBI
+    # network hiccup, a quota/rate-limit response that doesn't set a
+    # non-zero exit code, or (for controlled-access/dbGaP data) a silent
+    # permission issue. Previously, this code only checked
+    # result.returncode, so a "successful" prefetch with no real output
+    # would fall straight through to fasterq-dump -- which would then
+    # fail with a confusing, generic VFS "Cannot resolve accession (404)"
+    # error that gives no hint the REAL problem happened one step
+    # earlier, in prefetch itself. This check closes that gap by
+    # verifying the .sra file actually exists immediately after prefetch
+    # returns, and failing loudly with prefetch's own captured
+    # stdout/stderr plus an actionable explanation, rather than letting
+    # the confusing downstream fasterq-dump error be the only signal.
+    sra_file = _find_prefetched_sra_file(accession, work_dir)
+    if sra_file is None:
+        captured_output = (result.stdout or "") + (result.stderr or "")
+        size_limit_hit = "skipped" in captured_output.lower() and "large" in captured_output.lower()
+        if size_limit_hit:
+            hint = (
+                f"⚠️ This looks like prefetch's own max-download-size limit was hit -- its "
+                f"captured output mentions the file being skipped for being too large. This "
+                f"should not recur going forward since build_prefetch_command() now always "
+                f"passes an explicit --max-size ({DEFAULT_PREFETCH_MAX_SIZE} by default); if "
+                f"you're still seeing this, the accession may exceed even that raised limit -- "
+                f"check its real size on NCBI and pass a higher max_size if needed."
+            )
+        else:
+            hint = (
+                f"This usually means one of: (1) a transient NCBI network issue or rate-limit "
+                f"that didn't trigger a non-zero exit code -- retrying often resolves this; "
+                f"(2) this accession requires dbGaP/controlled-access authorization (an .ngc "
+                f"file) that wasn't provided; or (3) this specific run has been withdrawn or "
+                f"moved on NCBI's end."
+            )
+        return {
+            "success": False,
+            "skipped": False,
+            "message": (
+                f"prefetch for {accession} reported success (exit code 0), but no .sra file "
+                f"was found afterward at the expected location(s) under {work_dir}. {hint} "
+                f"prefetch's own captured output:\n\n{captured_output or '(no output captured)'}"
+            ),
+            "classification": None, "bam_warning": None,
+        }
 
     dump_cmd = build_fasterq_dump_command(accession, work_dir, work_dir, threads=threads)
     result2 = runner(dump_cmd, capture_output=True, text=True)
     if result2.returncode != 0:
-        return {"success": False, "message": f"fasterq-dump failed for {accession}: {result2.stderr}", "classification": None, "bam_warning": None}
+        return {"success": False, "skipped": False, "message": f"fasterq-dump failed for {accession}: {result2.stderr}", "classification": None, "bam_warning": None}
 
     raw_produced_files = sorted([
         os.path.join(work_dir, f) for f in os.listdir(work_dir)
         if f.startswith(accession) and (f.endswith(".fastq") or f.endswith(".fastq.gz"))
     ])
     if not raw_produced_files:
-        return {"success": False, "message": f"fasterq-dump produced no output files for {accession}.", "classification": None, "bam_warning": None}
+        return {"success": False, "skipped": False, "message": f"fasterq-dump produced no output files for {accession}.", "classification": None, "bam_warning": None}
 
     produced_files = []
     for path in raw_produced_files:
@@ -286,8 +796,24 @@ def download_and_classify_run(accession, project_fastq_dir, sample_name, threads
 
     classification = classify_output_files(produced_files)
     bam_warning = detect_likely_bam_derived_issue(classification)
+
+    # Record this successful raw download in the registry immediately --
+    # BEFORE finalization -- so a re-run before finalization still gets
+    # detected via the registry (in addition to the raw-staging fallback
+    # check above).
+    registry = _load_download_registry(project_fastq_dir)
+    registry[accession] = {
+        "sample_name": sample_name,
+        "status": "raw_downloaded",
+        "raw_files": produced_files,
+        "finalized_files": registry.get(accession, {}).get("finalized_files", []),
+        "timestamp": _now_iso(),
+    }
+    _save_download_registry(project_fastq_dir, registry)
+
     return {
         "success": True,
+        "skipped": False,
         "message": f"Downloaded, compressed, and classified {len(produced_files)} file(s) for {accession}.",
         "classification": classification,
         "bam_warning": bam_warning,
@@ -296,12 +822,14 @@ def download_and_classify_run(accession, project_fastq_dir, sample_name, threads
 
 def download_and_classify_runs_parallel(accession_to_sample_name, project_fastq_dir,
                                          max_workers=3, threads_per_run=4,
-                                         on_run_complete=None):
+                                         on_run_complete=None, force_redownload=False,
+                                         max_size=DEFAULT_PREFETCH_MAX_SIZE):
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_accession = {
             executor.submit(
                 download_and_classify_run, accession, project_fastq_dir, sample_name, threads_per_run,
+                None, force_redownload, max_size,
             ): accession
             for accession, sample_name in accession_to_sample_name.items()
         }
@@ -313,6 +841,7 @@ def download_and_classify_runs_parallel(accession_to_sample_name, project_fastq_
             except Exception as e:
                 result = {
                     "success": False,
+                    "skipped": False,
                     "message": f"Unexpected error downloading {accession}: {e}",
                     "classification": None,
                     "bam_warning": None,
@@ -467,24 +996,9 @@ def download_original_bam(accession, dest_dir, url=None, chunk_size=1024 * 1024,
 def run_bamtofastq(bam_path, dest_dir, chemistry_key=DEFAULT_BAMTOFASTQ_CHEMISTRY_FLAG,
                     subprocess_runner=None, timeout=3600):
     """
-    Run 10x Genomics' own `bamtofastq` tool.
-
-    --- "Quiet success, zero files" diagnostic fix (2026-08-24) ---
-    ALWAYS captures and returns bamtofastq's own stdout+stderr in the
-    message, not just on a non-zero return code -- see this module's own
-    docstring for the real motivating bug this fixes (a chemistry-flag
-    mismatch, e.g. "auto" against a pre-1.2 Cell Ranger BAM, can cause
-    bamtofastq to exit 0 while writing zero files, and the caller
-    previously had no way to see WHY since only failure-path output was
-    ever captured).
-
-    Returns (success: bool, message: str) -- success reflects ONLY
-    bamtofastq's own return code (0 = True); it does NOT check whether
-    any files were actually produced -- that check happens one level up,
-    in run_full_bam_recovery_pipeline()/run_bam_recovery_from_uploaded_file(),
-    which have access to dest_dir's actual contents AND this function's
-    own captured tool output to build an informative combined message if
-    zero files turn up despite a successful (exit 0) run.
+    Run 10x Genomics' own `bamtofastq` tool. ALWAYS captures and returns
+    bamtofastq's own stdout+stderr in the message, not just on a
+    non-zero return code.
     """
     import subprocess as subprocess_module
     runner = subprocess_runner or subprocess_module.run
@@ -508,9 +1022,6 @@ def run_bamtofastq(bam_path, dest_dir, chemistry_key=DEFAULT_BAMTOFASTQ_CHEMISTR
     except subprocess_module.TimeoutExpired:
         return False, f"bamtofastq timed out after {timeout} seconds."
 
-    # Always capture tool output now, regardless of return code -- see
-    # this function's own docstring for why the SUCCESS case specifically
-    # needed this too.
     captured_output = (result.stdout or "") + (result.stderr or "")
 
     if result.returncode != 0:
@@ -531,56 +1042,9 @@ def find_fastq_files_under(root_dir):
 def find_fastq_files_under_with_settle_retry(root_dir, max_attempts=6, delay_seconds=10,
                                               sleep_fn=None, progress_callback=None):
     """
-    Retry-with-backoff wrapper around find_fastq_files_under() -- added
-    2026-08-24 after a REAL reported bug: a completed bamtofastq run
-    (confirmed exit code 0, and a real, large ~24GB original BAM) was
-    followed by a single, immediate find_fastq_files_under() check that
-    found ZERO files -- while a directory listing checked manually
-    minutes later showed all 16 expected output files present, with
-    timestamps spread across roughly 5-10 MINUTES after the subprocess
-    call returned.
-
-    Root cause (network/cluster scratch filesystem write-visibility
-    lag, not a chemistry-flag or tool-configuration issue): the
-    project's own data directory is confirmed to live under
-    /disk/bioscratch/... -- a network-mounted (NFS/Lustre-style)
-    scratch filesystem, per the user's own real directory browser
-    screenshot. On this class of storage, a subprocess reporting "I
-    have exited" does NOT guarantee that a DIFFERENT process's (or
-    even the SAME process's) very next directory listing will reflect
-    every file that process just wrote -- there can be a real,
-    sometimes multi-minute lag between a large file's local write
-    completing and that write becoming visible via a fresh os.walk()/
-    os.listdir() call, particularly for large output files still being
-    flushed/synced to network storage. bamtofastq's own output for a
-    large BAM is written as MULTIPLE SEQUENTIAL CHUNKED FILES over an
-    extended period (confirmed directly: the user's own real recovered
-    files show creation timestamps spread across 5-10 minutes for a
-    single accession), making a bare, single, immediate check
-    especially fragile for exactly this tool/workload.
-
-    This function retries find_fastq_files_under() up to max_attempts
-    times, sleeping delay_seconds between attempts, and returns as soon
-    as ANY files are found (it does not try to guess when writing is
-    "fully complete" beyond that -- see the module docstring note
-    below on why this is a deliberately simple, bounded heuon-fix
-    rather than a more complex "wait until file count stops changing"
-    stability check).
-
-    sleep_fn: injectable for testing (defaults to time.sleep) -- so a
-        test can pass a no-op or instrumented sleep function without
-        this function actually blocking for real wall-clock time.
-    progress_callback: if given, called with a plain-language status
-        message before each retry (after the FIRST, immediate check
-        already came back empty) -- so a caller with a live progress
-        area (e.g. this module's own Step 1 UI) can show the user
-        that this specific, expected wait is happening, rather than
-        the page appearing to hang with no explanation for what could
-        be several minutes.
-
-    Returns the same sorted list of file paths find_fastq_files_under()
-    itself returns -- an empty list if genuinely no files are found
-    after exhausting all attempts.
+    Retry-with-backoff wrapper around find_fastq_files_under() -- for
+    network/cluster scratch filesystem write-visibility lag after
+    bamtofastq exits.
     """
     import time as time_module
     sleep = sleep_fn or time_module.sleep
@@ -777,19 +1241,6 @@ def classify_resolved_files(resolved_paths, lane_map):
 def run_full_bam_recovery_pipeline(accession, project_fastq_dir, sample_name,
                                     chemistry_key=DEFAULT_BAMTOFASTQ_CHEMISTRY_FLAG,
                                     progress_callback=None):
-    """
-    End-to-end orchestration of the full original-format BAM recovery
-    path for ONE accession.
-
-    --- "Quiet success, zero files" diagnostic fix (2026-08-24) ---
-    When bamtofastq itself reports success (exit 0) but produces ZERO
-    FASTQ files, this now includes bamtofastq's OWN captured tool output
-    (from run_bamtofastq()'s own message) directly in the returned error
-    message, along with an explicit hint to check whether the selected
-    chemistry_key actually matches this BAM's true origin -- rather than
-    the previous generic "no files found" message with no diagnostic
-    detail at all.
-    """
     work_dir = os.path.join(project_fastq_dir, "_sra_bam_work", accession)
     os.makedirs(work_dir, exist_ok=True)
 
@@ -805,15 +1256,6 @@ def run_full_bam_recovery_pipeline(accession, project_fastq_dir, sample_name,
     if not success:
         return {"success": False, "message": bamtofastq_message, "classification": None, "bam_warning": None, "lane_map": {}}
 
-    # --- Network/scratch-filesystem write-visibility settle-retry
-    # (2026-08-24) -- see find_fastq_files_under_with_settle_retry()'s
-    # own docstring for the full rationale: a bare, single,
-    # immediate check here was confirmed, via a real reported case, to
-    # return empty even though bamtofastq's own (large, multi-chunk)
-    # output files were still in the process of becoming visible on
-    # network/cluster scratch storage -- NOT a chemistry-flag issue,
-    # despite that having been an initially reasonable hypothesis
-    # before this was confirmed with real directory-listing timestamps.
     produced_files = find_fastq_files_under_with_settle_retry(fastq_dest_dir, progress_callback=progress_callback)
     if not produced_files:
         return {
@@ -894,19 +1336,6 @@ def save_uploaded_bam(uploaded_file, dest_dir, sample_name):
 def run_bam_recovery_from_uploaded_file(uploaded_bam_path, project_fastq_dir, sample_name,
                                          chemistry_key=DEFAULT_BAMTOFASTQ_CHEMISTRY_FLAG,
                                          progress_callback=None):
-    """
-    Recover usable FASTQ from a BAM file the USER ALREADY HAS on hand
-    (uploaded, or resolved via the server-directory browser) -- the
-    direct complement to run_full_bam_recovery_pipeline() above.
-
-    --- "Quiet success, zero files" diagnostic fix (2026-08-24) ---
-    Same fix as run_full_bam_recovery_pipeline()'s own identical
-    section above -- see that function's docstring for the full
-    rationale (this is the exact code path that surfaced the real,
-    motivating bug: a Cell Ranger 1.1 BAM converted with "auto"
-    chemistry, producing a quiet, uninformative "no files found"
-    failure).
-    """
     if not os.path.isfile(uploaded_bam_path):
         return {
             "success": False,
@@ -925,14 +1354,6 @@ def run_bam_recovery_from_uploaded_file(uploaded_bam_path, project_fastq_dir, sa
     if not success:
         return {"success": False, "message": bamtofastq_message, "classification": None, "bam_warning": None, "lane_map": {}}
 
-    # --- Network/scratch-filesystem write-visibility settle-retry
-    # (2026-08-24) -- see find_fastq_files_under_with_settle_retry()'s
-    # own docstring for the full rationale, and
-    # run_full_bam_recovery_pipeline()'s own identical block above for
-    # the real, confirmed motivating case (a genuine ~24GB BAM whose
-    # bamtofastq output only became fully visible on this project's
-    # network/cluster scratch storage several minutes after the
-    # subprocess itself had already exited).
     produced_files = find_fastq_files_under_with_settle_retry(fastq_dest_dir, progress_callback=progress_callback)
     if not produced_files:
         return {

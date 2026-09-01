@@ -136,6 +136,28 @@ read_gene_name_resolution_summary() correctly returns None for that
 case, since Ensembl's own native GTF already includes gene_name for
 every gene it defines and there is genuinely nothing to summarize.
 
+--- Parallel batch download for Step 1's SRA source (2026-08-25) ---
+A real, confirmed gap found via direct code review: sc_sra_manager.py's
+backend already implements download_and_classify_runs_parallel() (a
+direct port of the bulk pipeline's own concurrency pattern), but
+_render_sra_source() below was still downloading multiple selected runs
+SEQUENTIALLY, one at a time, in a plain Python loop -- a real,
+meaningful gap for a batch of many runs (e.g. GSE166992's 15 runs),
+which previously downloaded fully serially rather than overlapping
+their network-wait time. Fixed by wiring the existing
+download_and_classify_runs_parallel() function into this UI directly,
+with a new "Concurrent downloads" slider (max_workers) and an accurate
+warning distinguishing DISK usage (which scales roughly proportionally
+with concurrent downloads, since each needs its own temporary scratch
+space plus final compressed output at the same time) from RAM usage
+(more modest, scaling with concurrent workers x threads per run) --
+confirmed via direct testing that download_and_classify_runs_parallel()'s
+own on_run_complete callback always runs on the MAIN thread (via
+as_completed()'s own iteration in the calling thread), so it is safe to
+update Streamlit UI elements (the progress bar, a live status area)
+directly from that callback without any additional thread-safety
+handling.
+
 See sc_project_manager.py and sc_cellqc_manager.py's own module
 docstrings for full detail on all other Phase 1/Phase 2 design
 decisions and fixes made earlier the same day (mitochondrial
@@ -334,10 +356,26 @@ def _render_sra_source(project, fastq_dir):
         "Enter a **study/BioProject accession** (e.g. `PRJNA474047`) "
         "and/or paste **individual run accessions** (e.g. `SRR1234567`)."
     )
+
     prefetch_ok, fasterq_ok = sra.tools_available()
     if not (prefetch_ok and fasterq_ok):
         st.error("⚠️ The SRA Toolkit (`prefetch`/`fasterq-dump`) isn't available on this system yet.")
         return
+
+    # --- Proactive resume scan (2026-09-01) -- surfaces any previously
+    # downloaded-but-unconfirmed run immediately, even after reopening
+    # the project or a page reload, without requiring re-validation.
+    # IMPORTANT: this only merges pending accessions into session_state
+    # and falls through -- it must NOT return early, since the rest of
+    # this function (including the "Confirm File Roles" section at the
+    # bottom, which is what actually DISPLAYS these pending runs) still
+    # needs to run.
+    pending_from_disk = scsra.scan_pending_unfinalized_runs(fastq_dir)
+    if pending_from_disk:
+        existing_results = st.session_state.get("sc_sra_download_results") or {}
+        for accession, result in pending_from_disk.items():
+            existing_results.setdefault(accession, result)  # never clobber a newer/different entry already in session_state
+        st.session_state["sc_sra_download_results"] = existing_results
 
     st.info(
         "ℹ️ **Single-cell SRA data is messier than bulk.** Unlike bulk "
@@ -383,53 +421,105 @@ def _render_sra_source(project, fastq_dir):
             st.warning("⚠️ Please enter an accession or paste a list to validate.")
 
     lookup_rows = st.session_state.get("sc_sra_lookup_rows")
-    if not lookup_rows:
-        return
+    if lookup_rows:
+        assay_classifications = {row["Run"]: scsra.classify_assay_type_from_metadata(row) for row in lookup_rows}
+        display_rows = [{
+            "Run": row.get("Run", "—"), "Organism": row.get("ScientificName", "—"),
+            "Library Strategy": row.get("LibraryStrategy", "unknown") if sra.is_rna_seq(row)
+                                else f"⚠️ {row.get('LibraryStrategy', 'unknown')} (NOT RNA-Seq)",
+            "Likely Assay Type (best-effort)": {
+                scsra.ASSAY_SINGLE_CELL: "✅ Single-cell", scsra.ASSAY_SPATIAL: "⚠️ Spatial (unsupported here)",
+                scsra.ASSAY_BULK: "⚠️ Looks like bulk", scsra.ASSAY_UNKNOWN: "❔ Unclear from metadata",
+            }[assay_classifications[row["Run"]]["assay_type"]],
+            "Size (MB)": row.get("size_MB", "—"),
+        } for row in lookup_rows]
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "ℹ️ \"Likely Assay Type\" is a best-effort guess from this accession's title/description "
+            "text -- SRA's own metadata schema cannot distinguish bulk from single-cell/spatial data "
+            "directly (Library Strategy is \"RNA-Seq\" for all three). Treat this as a helpful hint, "
+            "not a certainty -- check the accession's own SRA/GEO page if you're unsure."
+        )
+        non_single_cell = [row["Run"] for row in lookup_rows if assay_classifications[row["Run"]]["assay_type"] in (scsra.ASSAY_SPATIAL, scsra.ASSAY_BULK)]
+        if non_single_cell:
+            st.warning(f"⚠️ {len(non_single_cell)} run(s) ({', '.join(non_single_cell)}) look like they might NOT be single-cell data based on their title/description -- you can still proceed if you believe this guess is wrong, but double-check first.")
 
-    assay_classifications = {row["Run"]: scsra.classify_assay_type_from_metadata(row) for row in lookup_rows}
-    display_rows = [{
-        "Run": row.get("Run", "—"), "Organism": row.get("ScientificName", "—"),
-        "Library Strategy": row.get("LibraryStrategy", "unknown") if sra.is_rna_seq(row)
-                            else f"⚠️ {row.get('LibraryStrategy', 'unknown')} (NOT RNA-Seq)",
-        "Likely Assay Type (best-effort)": {
-            scsra.ASSAY_SINGLE_CELL: "✅ Single-cell", scsra.ASSAY_SPATIAL: "⚠️ Spatial (unsupported here)",
-            scsra.ASSAY_BULK: "⚠️ Looks like bulk", scsra.ASSAY_UNKNOWN: "❔ Unclear from metadata",
-        }[assay_classifications[row["Run"]]["assay_type"]],
-        "Size (MB)": row.get("size_MB", "—"),
-    } for row in lookup_rows]
-    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
-    st.caption(
-        "ℹ️ \"Likely Assay Type\" is a best-effort guess from this accession's title/description "
-        "text -- SRA's own metadata schema cannot distinguish bulk from single-cell/spatial data "
-        "directly (Library Strategy is \"RNA-Seq\" for all three). Treat this as a helpful hint, "
-        "not a certainty -- check the accession's own SRA/GEO page if you're unsure."
-    )
-    non_single_cell = [row["Run"] for row in lookup_rows if assay_classifications[row["Run"]]["assay_type"] in (scsra.ASSAY_SPATIAL, scsra.ASSAY_BULK)]
-    if non_single_cell:
-        st.warning(f"⚠️ {len(non_single_cell)} run(s) ({', '.join(non_single_cell)}) look like they might NOT be single-cell data based on their title/description -- you can still proceed if you believe this guess is wrong, but double-check first.")
+        run_options = [row["Run"] for row in lookup_rows]
+        selected_runs = st.multiselect("Select which validated run(s) to download:", options=run_options, default=run_options, key="sc_sra_selected_runs")
+        if selected_runs:
+            detected_cores, recommended_threads = pm.get_recommended_thread_count()
+            threads = st.slider("Threads for download:", min_value=1, max_value=detected_cores, value=recommended_threads, key="sc_sra_threads")
 
-    run_options = [row["Run"] for row in lookup_rows]
-    selected_runs = st.multiselect("Select which validated run(s) to download:", options=run_options, default=run_options, key="sc_sra_selected_runs")
-    if not selected_runs:
-        return
+            # --- Parallel batch download (2026-08-25) -- see this module's own
+            # docstring, "Parallel batch download for Step 1's SRA source", for
+            # the full rationale.
+            if len(selected_runs) > 1:
+                st.warning(
+                    "⚠️ **Downloading multiple runs at once mainly multiplies DISK usage, "
+                    "not memory.** Each concurrent download needs its own temporary "
+                    "scratch space during extraction PLUS its own final compressed FASTQ "
+                    "output at the same time -- for single-cell data, a single run's "
+                    "combined R1/R2 (or R1/R2/R3/I1, for older v1-chemistry recoveries) "
+                    "can be several GB to tens of GB, so N concurrent downloads can "
+                    "briefly require roughly N times that much free disk space at their "
+                    "peak, before cleanup. RAM usage is comparatively modest per "
+                    "download, but does scale with (concurrent workers × threads per "
+                    "run), so a very high combination of both is still worth avoiding on "
+                    "a memory-constrained machine. **Recommendation:** start with 3-5 "
+                    "concurrent workers unless you've confirmed your available scratch "
+                    "disk space comfortably covers the whole batch running at once."
+                )
 
-    detected_cores, recommended_threads = pm.get_recommended_thread_count()
-    threads = st.slider("Threads for download:", min_value=1, max_value=detected_cores, value=recommended_threads, key="sc_sra_threads")
+            max_workers = st.slider(
+                "Concurrent downloads:", min_value=1, max_value=8,
+                value=min(3, len(selected_runs)) if selected_runs else 3,
+                key="sc_sra_max_workers",
+                help=(
+                    "How many runs to download/extract at the same time. Higher values "
+                    "finish a large batch faster (downloads are mostly network-wait "
+                    "time, not CPU-bound), but multiply peak disk usage roughly "
+                    "proportionally -- see the warning above before raising this for a "
+                    "batch of large single-cell runs."
+                ),
+            ) if len(selected_runs) > 1 else 1
 
-    if st.button("⬇️ Download & Classify Selected Run(s)", key="sc_sra_download_btn", type="primary"):
-        results = {}
-        progress = st.progress(0.0)
-        for i, run in enumerate(selected_runs):
-            with st.spinner(f"Downloading {run}..."):
-                results[run] = scsra.download_and_classify_run(run, fastq_dir, run, threads=threads)
-            progress.progress((i + 1) / len(selected_runs))
-        st.session_state["sc_sra_download_results"] = results
-        st.rerun()
+            if st.button("⬇️ Download & Classify Selected Run(s)", key="sc_sra_download_btn", type="primary"):
+                progress = st.progress(0.0)
+                status_area = st.empty()
+                completed_count = [0]
 
+                def _on_run_complete(accession, result):
+                    # SAFE to touch Streamlit UI here -- confirmed via direct
+                    # testing that download_and_classify_runs_parallel()'s own
+                    # as_completed() loop (and therefore every on_run_complete
+                    # call) runs on the MAIN thread, never a worker thread.
+                    completed_count[0] += 1
+                    progress.progress(completed_count[0] / len(selected_runs))
+                    icon = "✅" if result["success"] else "⚠️"
+                    status_area.write(f"{icon} {accession}: {result['message']}")
+
+                accession_to_sample_name = {run: run for run in selected_runs}
+                results = scsra.download_and_classify_runs_parallel(
+                    accession_to_sample_name, fastq_dir,
+                    max_workers=max_workers, threads_per_run=threads,
+                    on_run_complete=_on_run_complete,
+                )
+                # --- Merge fix (2026-09-01) -- previously this OVERWROTE
+                # sc_sra_download_results entirely, wiping out any
+                # previously-pending runs from an earlier click/session
+                # that weren't part of THIS batch. Now merges instead.
+                existing_results = st.session_state.get("sc_sra_download_results") or {}
+                existing_results.update(results)
+                st.session_state["sc_sra_download_results"] = existing_results
+                st.rerun()
+
+    # --- "Confirm File Roles Before Continuing" -- reads from
+    # session_state directly, so this renders regardless of whether
+    # lookup_rows exists this run (covers the resume-scan case where the
+    # user hasn't re-validated/re-selected anything this session at all).
     download_results = st.session_state.get("sc_sra_download_results")
     if not download_results:
         return
-
     st.markdown("---")
     st.markdown("**📋 Confirm File Roles Before Continuing**")
     st.caption("Each downloaded run's files were classified by read length. **Please confirm or correct these before continuing** -- an incorrect assignment here will break every downstream step.")
@@ -457,146 +547,18 @@ def _render_sra_source(project, fastq_dir):
                     overrides, fastq_dir, run, lane_map=result.get("lane_map"),
                 )
                 if scsra.ROLE_R1 in destinations and scsra.ROLE_R2 in destinations:
-                    st.success(f"✅ {run}: R1/R2 files moved into project -- ready for chemistry detection below.")
-                    any_finalized = True
-                else:
-                    st.error(f"⚠️ {run}: both an R1 and an R2 role must be assigned before this run can be used.")
-    if any_finalized:
-        st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Step 1 (BAM source option, 2026-08-24 -- upload OR server-browse)
-# ---------------------------------------------------------------------------
-def _render_bam_upload_source(project, fastq_dir):
-    """
-    Render the "convert from a BAM file I already have" FASTQ source
-    option -- for a user who already possesses a relevant single-cell
-    BAM.
-    """
-    st.markdown(
-        "If you already have a **BAM file** for single-cell data -- for example, "
-        "received from a collaborator, downloaded as part of a public dataset "
-        "distributed only as BAM, or produced by a different pipeline you've "
-        "already run -- provide it here to recover its underlying FASTQ reads "
-        "(with cell barcode/UMI sequences intact)."
-    )
-
-    if not scsra.bamtofastq_available():
-        st.error(
-            "⚠️ `bamtofastq` was not found on this system. It needs to be "
-            "installed in your environment before this feature can be used "
-            "(bioconda package: `10x_bamtofastq`)."
-        )
-        return
-
-    bam_source = st.radio(
-        "Where is this BAM file located?",
-        [
-            "📂 Browse a directory on this server (HPC) -- recommended for large files",
-            "📤 Upload from my computer",
-        ],
-        key="sc_bam_source_radio", horizontal=True,
-        help=(
-            "Original-format 10x BAM files are often very large (10-30GB or more). "
-            "If this app is running on a shared server/HPC that already has the BAM "
-            "file sitting on its own disk, browsing for it directly avoids "
-            "uploading it through your browser at all -- the same reasoning as the "
-            "FASTQ and reference-genome file inputs elsewhere in this app."
-        ),
-    )
-
-    bam_path = None
-    is_uploaded_file_object = False
-
-    if bam_source.startswith("📂"):
-        bam_path = fb.render_server_file_browser(
-            key_prefix="sc_bam_browse_hpc", file_extensions=[".bam"],
-            label="Browse for the BAM file already on this server/HPC:",
-        )
-    else:
-        uploaded_bam = st.file_uploader("Upload a BAM file (.bam):", type=["bam"], key="sc_bam_upload")
-        if uploaded_bam is not None:
-            bam_path = uploaded_bam
-            is_uploaded_file_object = True
-
-    if bam_path is None:
-        return
-
-    default_sample_name = uploaded_bam.name if is_uploaded_file_object else os.path.basename(bam_path)
-    if default_sample_name.lower().endswith(".bam"):
-        default_sample_name = default_sample_name[: -len(".bam")]
-
-    sample_name = st.text_input(
-        "What sample name should this become?", value=default_sample_name,
-        key="sc_bam_upload_sample_name",
-        help="Used to name this sample throughout the rest of the pipeline.",
-    )
-
-    chemistry_key = _render_bamtofastq_chemistry_picker(key_prefix="sc_bam_upload")
-
-    if not sample_name.strip():
-        st.warning("⚠️ Please enter a sample name before converting.")
-        return
-
-    if st.button("🔄 Convert BAM to FASTQ", key="sc_bam_upload_convert_btn", type="primary"):
-        if is_uploaded_file_object:
-            upload_dest_dir = os.path.join(fastq_dir, "_uploaded_bams")
-            resolved_bam_path = scsra.save_uploaded_bam(bam_path, upload_dest_dir, sample_name.strip())
-        else:
-            resolved_bam_path = bam_path
-
-        progress_area = st.empty()
-        progress_lines = []
-
-        def _on_progress(msg, _area=progress_area, _lines=progress_lines):
-            _lines.append(msg)
-            _area.markdown("\n\n".join(f"- {line}" for line in _lines))
-
-        with st.spinner("Converting BAM to FASTQ -- this can take a while for large files..."):
-            result = scsra.run_bam_recovery_from_uploaded_file(
-                resolved_bam_path, fastq_dir, sample_name.strip(),
-                chemistry_key=chemistry_key, progress_callback=_on_progress,
-            )
-
-        if result["success"]:
-            download_results = st.session_state.get("sc_sra_download_results") or {}
-            download_results[sample_name.strip()] = result
-            st.session_state["sc_sra_download_results"] = download_results
-            st.success(f"✅ {result['message']} Scroll down to confirm file roles.")
-            st.rerun()
-        else:
-            st.error(f"❌ {result['message']}")
-
-    download_results = st.session_state.get("sc_sra_download_results")
-    if not download_results:
-        return
-
-    st.markdown("---")
-    st.markdown("**📋 Confirm File Roles Before Continuing**")
-    st.caption("Each converted/downloaded sample's files were classified by read length. **Please confirm or correct these before continuing** -- an incorrect assignment here will break every downstream step.")
-    any_finalized = False
-    for run, result in download_results.items():
-        with st.expander(f"Sample: {run}", expanded=True):
-            if not result["success"]:
-                st.error(f"❌ {result['message']}")
-                continue
-            if result["bam_warning"]:
-                st.warning(result["bam_warning"])
-            overrides = {}
-            for path, info in result["classification"].items():
-                role_options = [scsra.ROLE_R1, scsra.ROLE_R2, scsra.ROLE_I1, scsra.ROLE_UNKNOWN]
-                default_role = info["role"] if info["role"] in role_options else scsra.ROLE_UNKNOWN
-                chosen_role = st.selectbox(
-                    f"`{os.path.basename(path)}` ({info['length']}bp):", options=role_options,
-                    index=role_options.index(default_role), key=f"sc_bamup_role_{run}_{os.path.basename(path)}",
-                )
-                overrides[path] = chosen_role
-            if st.button(f"✅ Confirm & Use These Files ({run})", key=f"sc_bamup_confirm_btn_{run}"):
-                destinations = scsra.finalize_role_assignment(
-                    overrides, fastq_dir, run, lane_map=result.get("lane_map"),
-                )
-                if scsra.ROLE_R1 in destinations and scsra.ROLE_R2 in destinations:
+                    # --- "Already downloaded" detection fix (2026-08-31) ---
+                    # Record this accession's finalized file locations in the
+                    # download registry now, while we still know BOTH the
+                    # original accession string (`run`) AND its final,
+                    # renamed destination paths.
+                    finalized_files = []
+                    for dest in destinations.values():
+                        if isinstance(dest, list):
+                            finalized_files.extend(dest)
+                        else:
+                            finalized_files.append(dest)
+                    scsra.mark_accessions_finalized(fastq_dir, {run: finalized_files})
                     st.success(f"✅ {run}: R1/R2 files moved into project -- ready for chemistry detection below.")
                     any_finalized = True
                 else:
@@ -1289,7 +1251,6 @@ def _render_mito_contig_picker(gtf_path, key_prefix, contigs_to_show=25):
             st.warning("⚠️ The selected contig(s) contain no gene-level features in this GTF -- double-check your selection.")
         return resolved
     return None
-
 
 
 _MITO_RESOLUTION_OPTIONS = [

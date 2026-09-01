@@ -109,35 +109,17 @@ way -- see this function's own inline comment at the merge site.
 A real, confirmed bug: adata.var["gene_symbol"] was previously set
 DIRECTLY from STARsolo's own features.tsv column 2 (the gene name
 STAR itself baked into the index at build time) with no further
-resolution attempted anywhere in this module -- meaning
-find_cluster_markers(), get_dotplot_data(), get_violin_plot_data(),
-get_feature_plot_data(), and get_marker_heatmap_data() ALL inherited
-whatever features.tsv happened to contain. For any sample whose STAR
-index was built BEFORE reference_manager.py's own tiered gene-name
-backfill fix (Name -> Ensembl description -> bare Ensembl ID, "gene:"
-GFF3-ID-attribute prefix stripped -- see that module's own docstring,
-"Tiered gene-name backfill for the GFF3 fallback path"), features.tsv
-itself still contains the OLD, unhelpful raw "gene:ENSG..." form as
-its gene-name column, and this module had no way to recover a better
-name after the fact -- a real reported case confirmed this exact
-symptom directly in Step 8's own cluster marker gene table.
+resolution attempted anywhere in this module. For any sample whose
+STAR index was built BEFORE reference_manager.py's own tiered gene-
+name backfill fix, features.tsv itself still contains the OLD,
+unhelpful raw "gene:ENSG..." form as its gene-name column.
 
 _resolve_better_gene_symbols() below fixes this WITHOUT requiring a
-full re-alignment (rebuilding the STAR index + re-running Step 6 +
-Phase 2 Cell-level QC again for an already-completed sample) -- it
-reuses reference_manager.py's own extract_gene_symbol_map_from_gtf()
-(already implemented there, not reimplemented here -- avoiding yet
-another independent copy of the same GTF-parsing logic, the exact
-class of bug this project has been bitten by more than once already)
-to look up a real gene name directly from the project's CURRENT
-reference GTF, and overlays it OVER (not instead of) STARsolo's own
-symbol -- but ONLY for a gene whose EXISTING symbol still looks
-unresolved (identical to its own gene_id, or still carrying the raw
-"gene:" prefix). A gene that already has a genuinely good symbol from
-features.tsv is left completely untouched, and a gene with STILL no
-better name available even in the current GTF (e.g. a genuinely
-unannotated/novel locus) is correctly left as-is rather than having a
-name fabricated for it.
+full re-alignment -- it reuses reference_manager.py's own
+extract_gene_symbol_map_from_gtf() to look up a real gene name
+directly from the project's CURRENT reference GTF, and overlays it
+OVER (not instead of) STARsolo's own symbol -- but ONLY for a gene
+whose EXISTING symbol still looks unresolved.
 
 --- REAL BUG FOUND AND FIXED, same day (2026-08-25), via direct HPC
     diagnosis on the user's own real reference/data ---
@@ -148,30 +130,13 @@ dict -- but that dict's OWN keys are whatever literal string appears
 in the GTF's own `gene_id "..."` attribute, which is NOT guaranteed to
 be the bare, unprefixed form. Confirmed directly via `grep` on the
 user's real, actual 1GB human.annotation.gtf (a GFF3-fallback-derived
-reference -- see reference_manager.py's own module docstring for that
-fallback path): every gene_id in this real file is written as
+reference): every gene_id in this real file is written as
 "gene:ENSG00000108691" -- i.e. the SAME GFF3 "gene:" ID-attribute
-prefix already known to cause confusion elsewhere in this project (see
-gff3_gene_name_resolver.py's own docstring) -- NOT the bare
-"ENSG00000108691" form that STARsolo's features.tsv (and therefore
-this pipeline's own adata.var_names/gene_id convention) actually uses.
-Because of this, EVERY lookup in the original implementation silently
-missed, and re-running "Combine Samples" with gtf_path supplied
-produced NO visible correction at all -- confirmed directly by the
-user via a real re-combine attempt that still showed unresolved
-"gene:ENSG..." symbols in Step 8's marker table afterward.
-
-Fixed by checking BOTH the bare gene_id AND its "gene:"-prefixed form
-when looking up a replacement in gtf_symbol_map -- mirroring the SAME
-defensive both-forms check already used once before, for the exact
-same underlying reason, in reference_manager.py's own
-backfill_gene_names_from_gff3_tiered() (see that function's own
-docstring, "ROBUSTNESS" note, added after a similar direct-testing
-discovery that gffread's own real GTF output convention for this
-attribute could not be assumed either way without checking). This is
-the second, independent place in this project where exactly this same
-"gene:" prefix ambiguity had to be defensively handled -- worth keeping
-in mind if a THIRD such lookup site is ever added later.
+prefix already known to cause confusion elsewhere in this project --
+NOT the bare "ENSG00000108691" form that STARsolo's features.tsv (and
+therefore this pipeline's own adata.var_names/gene_id convention)
+actually uses. Fixed by checking BOTH the bare gene_id AND its
+"gene:"-prefixed form when looking up a replacement in gtf_symbol_map.
 
 load_sample_as_anndata() and load_and_combine_samples() both accept an
 optional gtf_path parameter (default None, a complete no-op if
@@ -180,6 +145,37 @@ caller that doesn't pass it) -- the workspace UI layer is responsible
 for supplying the project's own confirmed reference GTF path (already
 available via sc_project_manager.get_reference_choice(project)
 ["custom_gtf"]) when calling load_and_combine_samples() in Step 1.
+IMPORTANT: this gtf_path wiring lives in sc_downstream_workspace.py's
+own _render_combine_step() -- if THAT file's combine step doesn't
+actually fetch and pass gtf_path through, this module's own fix here
+correctly no-ops every time (gtf_path defaults to None), which looks
+identical to "the fix doesn't work" from the outside. Both files must
+be updated together for gene-name resolution to actually take effect.
+
+--- Cluster/group label natural-sort ordering fix (2026-08-25) ---
+A real, confirmed bug, reported directly via screenshots: numeric-
+looking cluster labels ("0", "1", "2", ..., "16", as produced by
+sc.tl.leiden/louvain, which store them as strings) were being sorted
+LEXICOGRAPHICALLY in multiple places throughout this module and its
+UI layer -- e.g. plain Python sorted(...) on a list of these strings
+puts "10" immediately after "1" and before "2", since string
+comparison compares character-by-character, not numeric value. This
+produced a genuinely confusing dropdown order (0, 1, 10, 11, 12, ...,
+2, 3, ...) and, combined with Plotly's own "first order of appearance
+in the data" default legend ordering for a plain (non-Categorical)
+column, an even more scrambled legend order in UMAP/t-SNE plots.
+
+natural_sort_unique() below fixes this: it sorts purely-numeric-
+looking string labels in true NUMERIC order, and falls back to a
+normal alphabetical sort for any non-numeric label (e.g. a real
+assigned cell-type name from Step 8e, which should still sort
+alphabetically as before) -- safe to apply anywhere a list of group/
+cluster labels needs a sensible display order. Applied here to
+get_cluster_summary() (Step 6's cluster-size bar chart),
+get_dotplot_data() and get_marker_heatmap_data() (Step 8d's
+visualizations) -- see sc_downstream_workspace.py's own module
+docstring for the corresponding UI-layer fixes (Step 8a's cluster
+dropdown, Step 7's embedding legend ordering).
 """
 import json
 import os
@@ -215,6 +211,32 @@ def scvi_available():
 
 
 # ---------------------------------------------------------------------------
+# Natural-sort ordering helper (2026-08-25) -- see module docstring,
+# "Cluster/group label natural-sort ordering fix", for the full rationale.
+# ---------------------------------------------------------------------------
+
+def _natural_sort_key(value):
+    """
+    Sort key that sorts pure-numeric-looking string labels (e.g.
+    cluster IDs "0", "1", "10", "2") in NUMERIC order, rather than the
+    default lexicographic string order (which incorrectly orders these
+    as "0", "1", "10", "11", ..., "2", "3", ...). Falls back to a plain
+    string sort key for any non-purely-numeric label (e.g. a real
+    cell-type name like "T cell", or a sample name), so this is always
+    safe to apply broadly.
+    """
+    s = str(value)
+    if s.lstrip("-").isdigit():
+        return (0, int(s))
+    return (1, s)
+
+
+def natural_sort_unique(values):
+    "Return the UNIQUE values in `values`, naturally sorted (see _natural_sort_key)."
+    return sorted(set(values), key=_natural_sort_key)
+
+
+# ---------------------------------------------------------------------------
 # Gene-symbol resolution overlay (2026-08-25, fixed same day) -- see
 # module docstring
 # ---------------------------------------------------------------------------
@@ -225,12 +247,9 @@ def _gene_symbol_looks_unresolved(gene_id, symbol):
     to a real gene name -- i.e. it's just the bare gene_id itself
     (STARsolo's features.tsv correctly falling back to gene_id when no
     real name was available at STAR-index build time), OR it still
-    carries the confusing raw GFF3 "gene:" ID-attribute prefix (a
-    reference indexed BEFORE reference_manager.py's tiered gene-name
-    backfill fix, OR one whose gene_id itself uses this prefix
-    convention -- see this module's own docstring). See this module's
-    own docstring, "Gene-symbol resolution overlay", for the full
-    rationale.
+    carries the confusing raw GFF3 "gene:" ID-attribute prefix. See
+    this module's own docstring, "Gene-symbol resolution overlay", for
+    the full rationale.
     """
     if symbol is None or (isinstance(symbol, float) and pd.isna(symbol)):
         return True
@@ -270,22 +289,17 @@ def _resolve_better_gene_symbols(var_df, gtf_path):
     (via `grep` on the user's real reference GTF) that a
     GFF3-fallback-derived reference can have EVERY gene_id written in
     the "gene:ENSG..." GFF3-ID-attribute-prefixed form. Since
-    var_df's own index (this pipeline's gene_id convention, taken
-    directly from STARsolo's features.tsv) is always the BARE form,
-    looking up ONLY the bare form against gtf_symbol_map silently
-    missed every single gene for this real reference -- the original
-    version of this function had exactly this bug, and produced NO
-    visible correction at all when tested against real data. Fixed by
-    checking BOTH the bare gene_id and its "gene:"-prefixed form
-    against gtf_symbol_map below.
+    var_df's own index is always the BARE form, looking up ONLY the
+    bare form against gtf_symbol_map silently missed every single gene
+    for this real reference. Fixed by checking BOTH the bare gene_id
+    and its "gene:"-prefixed form against gtf_symbol_map below.
 
     Returns a NEW DataFrame (var_df itself is never mutated in place)
     with "gene_symbol" values corrected wherever a real GTF-derived
     name was found -- a gene with STILL no better name available in
-    the GTF either is left exactly as it was (still gene_id, or still
-    "gene:..."), never fabricated. A gene whose EXISTING symbol
-    already looks genuinely resolved is left completely untouched,
-    even if the GTF's own value happens to differ.
+    the GTF either is left exactly as it was, never fabricated. A gene
+    whose EXISTING symbol already looks genuinely resolved is left
+    completely untouched, even if the GTF's own value happens to differ.
     """
     if not gtf_path or not os.path.isfile(gtf_path):
         return var_df
@@ -303,8 +317,7 @@ def _resolve_better_gene_symbols(var_df, gtf_path):
             # EITHER, depending on how the source GTF's gene_id
             # attribute was actually written (confirmed, via real HPC
             # diagnosis, to be the prefixed form for this user's real
-            # reference). See this function's own docstring, "REAL BUG
-            # FIX", for the full story.
+            # reference).
             better_symbol = gtf_symbol_map.get(gene_id)
             if better_symbol is None:
                 better_symbol = gtf_symbol_map.get(f"gene:{gene_id}")
@@ -312,6 +325,59 @@ def _resolve_better_gene_symbols(var_df, gtf_path):
                 result.at[gene_id, "gene_symbol"] = better_symbol
 
     return result
+
+def get_unresolved_gene_ids(var_df):
+    """
+    Return the list of gene_ids in var_df whose gene_symbol still looks
+    unresolved (see _gene_symbol_looks_unresolved()'s own docstring) --
+    i.e. every gene this project's reference GTF was NEVER able to
+    resolve a real name for, and therefore a genuine candidate for the
+    bitr()-based fallback below.
+    """
+    return [
+        gid for gid in var_df.index
+        if _gene_symbol_looks_unresolved(gid, var_df.at[gid, "gene_symbol"])
+    ]
+
+
+def apply_bitr_symbol_mapping(var_df, bitr_mapping):
+    """
+    Overlay a bitr()-derived {gene_id: converted_id} mapping (the
+    "mapping" key of gene_id_mapper.run_bitr_conversion()'s own return
+    dict) onto var_df["gene_symbol"], ONLY for genes that still look
+    unresolved -- exactly mirroring _resolve_better_gene_symbols()'s
+    own "only touch what's still broken, never overwrite an
+    already-good name" design.
+
+    var_df: a DataFrame indexed by gene_id, with an existing
+        "gene_symbol" column (same shape _resolve_better_gene_symbols()
+        itself operates on).
+    bitr_mapping: dict {gene_id: converted_value} -- gene_id_mapper's
+        own bitr()-conversion result covers EVERY gene_id it was asked
+        to convert, using that same gene_id (unchanged) as the mapped
+        value for anything it genuinely couldn't resolve -- so a
+        "no-op" entry here is correctly distinguishable from a real
+        resolution without needing any separate "not found" signal.
+
+    Returns (result: DataFrame, n_newly_resolved: int) -- a NEW
+    DataFrame (var_df itself is never mutated in place) with
+    "gene_symbol" values corrected wherever bitr() found a real name,
+    plus a count of how many genes were actually newly resolved this
+    call (for a user-facing success message).
+    """
+    result = var_df.copy()
+    if hasattr(result["gene_symbol"], "cat"):
+      result["gene_symbol"] = result["gene_symbol"].astype(str)
+    n_newly_resolved = 0
+    for gene_id in result.index:
+        current_symbol = result.at[gene_id, "gene_symbol"]
+        if not _gene_symbol_looks_unresolved(gene_id, current_symbol):
+            continue
+        bitr_value = bitr_mapping.get(gene_id)
+        if bitr_value and bitr_value != gene_id:
+            result.at[gene_id, "gene_symbol"] = bitr_value
+            n_newly_resolved += 1
+    return result, n_newly_resolved
 
 
 # ---------------------------------------------------------------------------
@@ -1011,12 +1077,27 @@ def get_cluster_summary(adata, cluster_key):
     Return a per-cluster cell count summary, as a plain DataFrame --
     for the "cluster size" bar chart in the UI layer.
 
+    --- Natural-sort ordering fix (2026-08-25) -- see this module's own
+        docstring, "Cluster/group label natural-sort ordering fix",
+        for the full rationale. Previously used
+        value_counts().sort_index(), which sorts according to whatever
+        internal order the .obs column's own categories happen to be
+        in (confirmed, via a real reported screenshot, to sometimes be
+        neither numeric NOR alphabetical order) -- now explicitly
+        re-ordered via natural_sort_unique() so cluster "0", "1", "2",
+        ..., "10", "11" always display in true numeric order,
+        regardless of the underlying column's own internal category
+        order. ---
+
     Returns None if cluster_key isn't in adata.obs.
     """
     if cluster_key not in adata.obs.columns:
         return None
-    counts = adata.obs[cluster_key].value_counts().sort_index()
-    return pd.DataFrame({"cluster": counts.index.astype(str), "n_cells": counts.values})
+    cluster_values = adata.obs[cluster_key].astype(str)
+    counts = cluster_values.value_counts()
+    ordered_clusters = natural_sort_unique(cluster_values)
+    counts = counts.reindex(ordered_clusters)
+    return pd.DataFrame({"cluster": counts.index, "n_cells": counts.values})
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +1492,12 @@ def get_dotplot_data(adata, marker_genes, groupby, layer="lognorm"):
     """
     Compute the data needed for a standard single-cell dot plot.
 
+    --- Natural-sort ordering fix (2026-08-25) -- see this module's own
+        docstring for the full rationale. Previously used
+        sorted(groups.unique()) (plain lexicographic sort) -- now uses
+        natural_sort_unique() so numeric-looking group labels (e.g.
+        cluster IDs) display in true numeric order. ---
+
     Returns a DataFrame with columns: gene_symbol, group, pct_expressing,
     mean_expression -- one row per (gene, group) combination.
     """
@@ -1441,7 +1528,7 @@ def get_dotplot_data(adata, marker_genes, groupby, layer="lognorm"):
 
     rows = []
     groups = adata.obs[groupby].astype(str)
-    for group_val in sorted(groups.unique()):
+    for group_val in natural_sort_unique(groups):
         mask = (groups == group_val).values
         sub = expr_matrix[mask, :]
         for j, gene_id in enumerate(resolved_ids):
@@ -1524,6 +1611,10 @@ def get_marker_heatmap_data(adata, marker_genes, groupby, layer="lognorm", n_cel
     Build a gene x cell z-scored expression matrix for a set of marker
     genes, grouped and (optionally) downsampled by cluster/group.
 
+    --- Natural-sort ordering fix (2026-08-25) -- see this module's own
+        docstring for the full rationale. Previously used
+        sorted(groups.unique()) -- now uses natural_sort_unique(). ---
+
     Returns (z_df, ordered_cell_groups). Returns (None, None) if no
     requested genes could be resolved.
     """
@@ -1552,7 +1643,7 @@ def get_marker_heatmap_data(adata, marker_genes, groupby, layer="lognorm", n_cel
     groups = adata.obs[groupby].astype(str)
     selected_cell_indices = []
     rng = np.random.default_rng(0)
-    for group_val in sorted(groups.unique()):
+    for group_val in natural_sort_unique(groups):
         group_indices = np.where((groups == group_val).values)[0]
         if n_cells_per_group is not None and len(group_indices) > n_cells_per_group:
             group_indices = rng.choice(group_indices, size=n_cells_per_group, replace=False)
