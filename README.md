@@ -166,6 +166,16 @@ Once running, the portal's own **Setup & Deployment** page audits every Python, 
 
 ---
 
+## 🤖 A Note on AI-Assisted Development
+
+This project was built with heavy use of AI coding assistance (Claude) throughout the design, implementation, debugging, and documentation process, used as an active engineering collaborator rather than a one-off code generator — planning architecture, writing and reviewing implementation code, diagnosing real bugs against actual runtime output and tracebacks, and validating fixes against real data before considering an issue closed.
+
+Every feature in this repository was still driven by explicit domain requirements, tested against real datasets (e.g. Kang et al. 2018 GSE96583, Thompson et al. 2021 GSE166992), and iterated on based on genuine execution failures encountered on real HPC/Docker/local deployments — not accepted as-is from a single generation pass. I take full ownership of the architecture, the correctness of the science, and every design decision in this codebase.
+
+I'm sharing this openly because I believe effective, transparent use of AI tooling is quickly becoming a core professional skill in software and computational biology alike, not something to obscure — and because the resulting engineering discipline (systematic debugging, real-data validation, honest documentation of limitations) is itself representative of how I approach this work.
+
+---
+
 ## 🗺️ Roadmap
 
 - Non-model organism annotation support via eggNOG-mapper (pending a stable non-beta release with working database downloads)

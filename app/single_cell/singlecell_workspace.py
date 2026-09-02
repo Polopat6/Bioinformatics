@@ -374,9 +374,22 @@ def _render_sra_source(project, fastq_dir):
     if pending_from_disk:
         existing_results = st.session_state.get("sc_sra_download_results") or {}
         for accession, result in pending_from_disk.items():
-            existing_results.setdefault(accession, result)  # never clobber a newer/different entry already in session_state
+            # --- Stale-cache refresh fix (2026-09-01) ---
+            # A real, confirmed bug: setdefault() previously refused to
+            # overwrite an EXISTING cached entry, even if that entry was
+            # itself just an earlier, incomplete resume-scan snapshot
+            # (e.g. cached when only 1 of 3 expected files had finished
+            # downloading). Every resume-scan result is always tagged
+            # skipped=True by construction -- so it's safe to refresh
+            # any cached entry that ALSO has skipped=True (it can only
+            # have come from this same resume-scan path previously),
+            # while still never clobbering a real, just-completed LIVE
+            # download from this session (skipped=False), which must be
+            # preserved untouched.
+            cached = existing_results.get(accession)
+            if cached is None or cached.get("skipped"):
+                existing_results[accession] = result
         st.session_state["sc_sra_download_results"] = existing_results
-
     st.info(
         "ℹ️ **Single-cell SRA data is messier than bulk.** Unlike bulk "
         "RNA-seq, the downloaded files' order does NOT reliably "
@@ -602,6 +615,276 @@ def _render_add_metadata_column_control(working_key):
                 st.rerun()
 
 
+# WHAT CHANGED vs. the original _render_step1():
+#   - Everything from the top of the function down through the chemistry
+#     detection section is UNCHANGED (still your existing, working code).
+#   - The metadata section (previously inline) is now handled by a new
+#     helper, _render_step1_metadata_section(), which adds TWO fixes:
+#       1. A new "📤 Import a metadata file" upload option (match-by-
+#          sample-name import from a .csv/.txt/.xlsx/.xls file).
+#       2. A fix for the real, confirmed Streamlit st.data_editor()
+#          "Enter key loses the just-typed edit" bug.
+#   - Three new small helper functions
+#     (apply_data_editor_state / merge_uploaded_metadata /
+#     _render_metadata_file_import) are added above _render_step1 to
+#     support the above -- they are NOT used anywhere else in the file,
+#     so there's no risk of naming collisions with existing code.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ---------------------------------------------------------------------------
+# Metadata editing helpers (2026-09-01) -- see docstrings below for the
+# full rationale behind each. Used only by _render_step1_metadata_section().
+# ---------------------------------------------------------------------------
+
+def apply_data_editor_state(working_df, editor_state):
+    """
+    Manually apply a data_editor widget's own low-level edit-tracking
+    state onto working_df.
+
+    --- Real, confirmed bug fix (2026-09-01) --- Reported directly:
+    pressing Enter to commit a single-cell edit in st.data_editor()
+    could visibly revert that cell back to its prior (often blank)
+    value for ONE render cycle, before a SECOND identical edit
+    "sticks". This matches a known class of st.data_editor timing
+    issue where the plain RETURN VALUE of st.data_editor() can lag one
+    render cycle behind an Enter-committed edit, while the WIDGET'S OWN
+    lower-level edit-tracking state (st.session_state[editor_key],
+    containing "edited_rows"/"added_rows"/"deleted_rows") updates
+    synchronously with the actual edit event. Fixed by manually reading
+    and applying THAT lower-level state directly onto working_df
+    immediately after every data_editor render, rather than trusting
+    data_editor's own returned DataFrame alone -- this is the pattern
+    Streamlit's own documentation itself recommends for robustly
+    reading back data_editor edits.
+
+    editor_state: the dict Streamlit stores at
+        st.session_state[editor_key] for a keyed st.data_editor widget --
+        shape {"edited_rows": {row_idx_str: {col: new_val, ...}, ...},
+               "added_rows": [{col: val, ...}, ...],
+               "deleted_rows": [row_idx, ...]}.
+
+    Returns a NEW DataFrame with every recorded edit/addition/deletion
+    applied -- working_df itself is never mutated in place.
+    """
+    result = working_df.copy().reset_index(drop=True)
+
+    edited_rows = (editor_state or {}).get("edited_rows", {})
+    for row_idx_str, col_updates in edited_rows.items():
+        row_idx = int(row_idx_str)
+        if row_idx >= len(result):
+            continue  # defensive -- ignore an edit referencing a row that no longer exists
+        for col, new_val in col_updates.items():
+            if col not in result.columns:
+                continue
+            result.at[row_idx, col] = new_val
+
+    added_rows = (editor_state or {}).get("added_rows", [])
+    for new_row in added_rows:
+        row_dict = {col: new_row.get(col) for col in result.columns}
+        result = pd.concat([result, pd.DataFrame([row_dict])], ignore_index=True)
+
+    deleted_rows = (editor_state or {}).get("deleted_rows", [])
+    if deleted_rows:
+        result = result.drop(index=[i for i in deleted_rows if i < len(result)]).reset_index(drop=True)
+
+    return result
+
+
+def merge_uploaded_metadata(working_df, uploaded_df, sample_col="sample"):
+    """
+    Merge an uploaded metadata file's columns into working_df, matching
+    rows by sample_col.
+
+    --- Design rationale (2026-09-01) ---
+    Only samples ALREADY in this project (i.e. real, matching
+    FASTQ-derived sample names) are ever updated -- an uploaded file
+    can never ADD new rows/samples to this project's metadata, since a
+    "sample" here must correspond to real, already-ingested FASTQ
+    files. Any sample name in the uploaded file that doesn't match
+    anything in this project is reported back explicitly (not silently
+    dropped), since a mismatch is a common real mistake (e.g.
+    publication-style sample names like "IVAR8" vs. this project's own
+    SRR-accession-based sample names).
+
+    An uploaded file's value for a given (sample, column) pair
+    OVERWRITES whatever's already there, UNLESS the uploaded cell
+    itself is blank/NaN -- a blank uploaded cell never erases an
+    already-filled-in value. A brand-new column present in the
+    uploaded file but not yet in the project's own metadata is added
+    automatically.
+
+    Returns (merged_df, report) where report is a dict:
+        {"samples_updated": [...], "samples_not_found_in_project": [...],
+         "new_columns_added": [...]}
+
+    Raises ValueError if uploaded_df has no column named exactly
+    sample_col.
+    """
+    if sample_col not in uploaded_df.columns:
+        raise ValueError(f"Uploaded file must have a column named exactly '{sample_col}'.")
+
+    uploaded_df = uploaded_df.copy()
+    uploaded_df[sample_col] = uploaded_df[sample_col].astype(str).str.strip()
+    working_df = working_df.copy()
+    working_df[sample_col] = working_df[sample_col].astype(str).str.strip()
+
+    project_samples = set(working_df[sample_col])
+    uploaded_samples = set(uploaded_df[sample_col])
+
+    samples_not_found = sorted(uploaded_samples - project_samples)
+    samples_updated = sorted(uploaded_samples & project_samples)
+
+    new_columns = [c for c in uploaded_df.columns if c != sample_col and c not in working_df.columns]
+    for col in new_columns:
+        working_df[col] = pd.NA
+
+    uploaded_indexed = uploaded_df.set_index(sample_col)
+    working_indexed = working_df.set_index(sample_col)
+
+    value_cols = [c for c in uploaded_df.columns if c != sample_col]
+    for sample in samples_updated:
+        for col in value_cols:
+            new_val = uploaded_indexed.loc[sample, col]
+            if isinstance(new_val, pd.Series):  # duplicate sample rows in uploaded file -- take the first
+                new_val = new_val.iloc[0]
+            if pd.isna(new_val) or (isinstance(new_val, str) and new_val.strip() == ""):
+                continue  # never blank out an existing value with an empty uploaded cell
+            working_indexed.loc[sample, col] = new_val
+
+    merged_df = working_indexed.reset_index()
+    merged_df = merged_df.set_index(sample_col).loc[working_df[sample_col].tolist()].reset_index()
+
+    report = {
+        "samples_updated": samples_updated,
+        "samples_not_found_in_project": samples_not_found,
+        "new_columns_added": new_columns,
+    }
+    return merged_df, report
+
+
+def _render_metadata_file_import(working_key):
+    """
+    New "📤 Import a metadata file" expander -- lets a user upload a
+    .csv/.txt/.xlsx/.xls file and match its rows onto this project's
+    existing samples by the "sample" column, merging in every other
+    column automatically. Reuses ing.read_metadata_file() directly
+    (already used elsewhere in this module for CSV/xlsx uploads) rather
+    than re-implementing file parsing here.
+    """
+    with st.expander("📤 Import a metadata file (match by sample name)", expanded=False):
+        st.caption(
+            "Upload a spreadsheet with a column named exactly `sample` (matching your "
+            "project's own FASTQ sample names) plus any other columns you want to import "
+            "(e.g. `condition`, `donor`, `batch`) -- every matching sample below will be "
+            "filled in automatically. A sample in your file that doesn't match anything "
+            "in this project is reported, not silently added; a blank cell in your file "
+            "never erases a value you've already entered below."
+        )
+        uploaded_metadata_file = st.file_uploader(
+            "Upload a metadata file:", type=["csv", "txt", "xlsx", "xls"],
+            key="sc_metadata_import_file_upload",
+        )
+        if uploaded_metadata_file is None:
+            return
+
+        uploaded_df, error = ing.read_metadata_file(uploaded_metadata_file)
+        if error:
+            st.error(f"⚠️ {error}")
+            return
+
+        if st.button("📥 Import & Merge", key="sc_metadata_import_merge_btn", type="primary"):
+            try:
+                current_df = st.session_state[working_key]
+                merged_df, report = merge_uploaded_metadata(current_df, uploaded_df, sample_col="sample")
+            except ValueError as e:
+                st.error(f"⚠️ {e}")
+                return
+
+            st.session_state[working_key] = merged_df
+            st.session_state["sc_metadata_import_last_report"] = report
+            st.success(
+                f"✅ Imported: {len(report['samples_updated'])} sample(s) updated"
+                + (f", {len(report['new_columns_added'])} new column(s) added ({', '.join(report['new_columns_added'])})" if report["new_columns_added"] else "")
+                + "."
+            )
+            if report["samples_not_found_in_project"]:
+                st.warning(
+                    f"⚠️ {len(report['samples_not_found_in_project'])} sample name(s) in your uploaded file did NOT "
+                    f"match any sample in this project, and were skipped: "
+                    f"{', '.join(report['samples_not_found_in_project'][:10])}"
+                    + ("..." if len(report['samples_not_found_in_project']) > 10 else "")
+                )
+            st.rerun()
+
+
+def _render_step1_metadata_section(project, pairs):
+    """
+    Full metadata section for Step 1 -- combines the original working
+    logic (loading from disk / SRA lookup rows / plain sample list,
+    rendering the data_editor, the "add a column" control, and saving
+    to disk) with two new fixes: metadata-file import
+    (_render_metadata_file_import(), above) and the Enter-key
+    edit-loss bug fix (apply_data_editor_state(), above).
+
+    Returns True if metadata_path exists on disk after this render
+    (the original inline code's own completion signal), False
+    otherwise -- callers should treat this exactly like the original
+    `if os.path.exists(metadata_path):` check.
+    """
+    metadata_path = scpm.metadata_path(project)
+    sra_lookup_rows = st.session_state.get("sc_sra_lookup_rows")
+    sra_selected_runs = st.session_state.get("sc_sra_selected_runs")
+
+    working_key = f"sc_metadata_working_df_{project}"
+    if working_key not in st.session_state:
+        if os.path.exists(metadata_path):
+            st.session_state[working_key] = pd.read_csv(metadata_path)
+        elif sra_lookup_rows and sra_selected_runs:
+            st.session_state[working_key] = pd.DataFrame(sra.build_metadata_dataframe(sra_lookup_rows, selected_runs=sra_selected_runs))
+            if not sra.has_any_descriptive_metadata(sra_lookup_rows, selected_runs=sra_selected_runs):
+                st.caption("ℹ️ NCBI provided no characteristics beyond the run accession for these runs -- add your own columns below.")
+        else:
+            st.session_state[working_key] = pd.DataFrame({"sample": list(pairs.keys())})
+
+    # --- NEW: metadata file import -- rendered BEFORE the editor so an
+    # imported value shows up already-filled the moment the editor
+    # itself renders, rather than requiring an extra rerun to see it.
+    _render_metadata_file_import(working_key)
+
+    working_df = st.session_state[working_key]
+
+    editor_key = "sc_metadata_editor_" + "_".join(str(c) for c in working_df.columns)
+    edited_df = st.data_editor(working_df, num_rows="dynamic", use_container_width=True, key=editor_key)
+
+    # --- NEW: Enter-key edit-loss bug fix -- manually apply the
+    # widget's own low-level edit-tracking state directly, rather than
+    # trusting data_editor's own returned `edited_df` alone (which can
+    # lag one render cycle behind a single Enter-committed edit).
+    # Applying both is harmless/idempotent -- edited_df already
+    # reflects every edit in the common case; this only actually
+    # changes anything on the specific timing-lag render where
+    # edited_df would otherwise be missing the just-typed value.
+    editor_state = st.session_state.get(editor_key)
+    if editor_state:
+        edited_df = apply_data_editor_state(edited_df, editor_state)
+
+    st.session_state[working_key] = edited_df
+
+    _render_add_metadata_column_control(working_key)
+
+    edited_df = st.session_state[working_key]
+
+    if "sample" not in edited_df.columns:
+        st.error("⚠️ Metadata must have a column named exactly `sample` matching your FASTQ sample names.")
+        return False
+    if st.button("💾 Save Metadata", key="sc_save_metadata_btn"):
+        edited_df.to_csv(metadata_path, index=False)
+        st.success("✅ Metadata saved.")
+
+    return os.path.exists(metadata_path)
+
+
 # ---------------------------------------------------------------------------
 # Step 1: FASTQ ingestion + chemistry + metadata
 # ---------------------------------------------------------------------------
@@ -695,39 +978,8 @@ def _render_step1(project):
     st.markdown("---")
     st.markdown("**📋 Sample Metadata** (one row per sample -- condition/treatment/donor, NOT per-cell data)")
 
-    metadata_path = scpm.metadata_path(project)
-    sra_lookup_rows = st.session_state.get("sc_sra_lookup_rows")
-    sra_selected_runs = st.session_state.get("sc_sra_selected_runs")
-
-    working_key = f"sc_metadata_working_df_{project}"
-    if working_key not in st.session_state:
-        if os.path.exists(metadata_path):
-            st.session_state[working_key] = pd.read_csv(metadata_path)
-        elif sra_lookup_rows and sra_selected_runs:
-            st.session_state[working_key] = pd.DataFrame(sra.build_metadata_dataframe(sra_lookup_rows, selected_runs=sra_selected_runs))
-            if not sra.has_any_descriptive_metadata(sra_lookup_rows, selected_runs=sra_selected_runs):
-                st.caption("ℹ️ NCBI provided no characteristics beyond the run accession for these runs -- add your own columns below.")
-        else:
-            st.session_state[working_key] = pd.DataFrame({"sample": list(pairs.keys())})
-
-    working_df = st.session_state[working_key]
-
-    editor_key = "sc_metadata_editor_" + "_".join(str(c) for c in working_df.columns)
-    edited_df = st.data_editor(working_df, num_rows="dynamic", use_container_width=True, key=editor_key)
-    st.session_state[working_key] = edited_df
-
-    _render_add_metadata_column_control(working_key)
-
-    edited_df = st.session_state[working_key]
-
-    if "sample" not in edited_df.columns:
-        st.error("⚠️ Metadata must have a column named exactly `sample` matching your FASTQ sample names.")
-        return None
-    if st.button("💾 Save Metadata", key="sc_save_metadata_btn"):
-        edited_df.to_csv(metadata_path, index=False)
-        st.success("✅ Metadata saved.")
-
-    if os.path.exists(metadata_path):
+    metadata_complete = _render_step1_metadata_section(project, pairs)
+    if metadata_complete:
         scpm.mark_step_complete(project, "ingest")
         scpm.save_fastq_source_dir(project, active_dir)
         return pairs

@@ -45,6 +45,37 @@
 # long-unchanged utility where exact version has no bearing on
 # reproducibility, unlike e.g. star=2.7.11b or sra-tools=3.1.* above it,
 # where exact tool behavior/output format genuinely matters.
+#
+# --- seqkit addition (2026-09-01) ---
+# Added after a real, confirmed production bottleneck: single_cell/
+# singlecell_trim_manager.py's own R1/R2 resync step (re-syncing R1 down
+# to only the reads that survived fastp's R2-only trimming) originally
+# read both FASTQ files line-by-line in pure Python, building a Python
+# set() of surviving read IDs from R2 and checking every R1 read against
+# it. This is correct but does NOT scale to real single-cell run depths --
+# confirmed directly on SRR13734384 (~776 million reads), where this
+# pure-Python resync step alone took several HOURS for a single sample,
+# even though fastp's own R2 trimming (a real, multithreaded, compiled
+# C++ tool) finished quickly. Critically, the pipeline's own "threads"
+# slider had ZERO effect on this bottleneck, since that value is only
+# ever passed to fastp's own --thread flag -- the slow resync step is a
+# fully separate, single-threaded Python operation fastp's own
+# concurrency can't touch at all.
+#
+# seqkit (a fast, single-binary, compiled Go tool) fixes this: two of its
+# own long-stable subcommands (`seqkit seq -n --only-id` to extract
+# surviving R2 read IDs, then `seqkit grep -f` to filter R1 by that same
+# list) replace the pure-Python two-pass approach entirely, avoiding ever
+# holding millions of read IDs in a Python set(). See single_cell/
+# singlecell_trim_manager.py's own module docstring, "R1/R2 resync
+# performance fix", for full detail, including the automatic (slower,
+# but still correct) pure-Python fallback this module now uses if seqkit
+# is not installed, with a loud, explicit warning surfaced rather than a
+# silent slowdown.
+#
+# No version pin needed: like pigz above, seqkit's core seq/grep
+# subcommands used here are small, stable, long-unchanged functionality
+# where exact version has no bearing on reproducibility.
 name: bioportal
 channels:
   - conda-forge
@@ -73,6 +104,11 @@ dependencies:
                                # file at its default compresslevel=9; see
                                # single_cell/sc_sra_manager.py's own _gzip_and_remove()
                                # for the fix that prefers pigz here when available)
+  - seqkit                    # Fast R1/R2 resync in single_cell/singlecell_trim_manager.py --
+                               # replaces a pure-Python line-by-line implementation confirmed
+                               # to take multiple HOURS on a real, extreme-depth single-cell
+                               # run (SRR13734384, ~776M reads); see this file's own header
+                               # comment above and that module's own docstring for full detail
   - gffread
   - nextflow
   - alevin-fry               # Single-cell RNA-Seq: optional faster alternate to STARsolo

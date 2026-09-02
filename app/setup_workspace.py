@@ -131,6 +131,7 @@ import auth_manager as auth
 import hpc_manager as hpc
 import deployment_manager as dm
 import eggnog_manager as egm
+import whitelist_manager as wlm
 import reference_manager as rm
 
 # ---------------------------------------------------------------------------
@@ -179,6 +180,8 @@ _CLI_TOOLS = {
     # of runs that still have a free, direct-HTTP original-format copy
     # rather than requiring the user's own paid AWS/GCP cloud account.
     "bamtofastq": {"label": "bamtofastq (10x original-format BAM -> FASTQ recovery)", "conda_spec": "10x_bamtofastq"},
+    "pigz": {"label": "pigz (parallel gzip -- fast FASTQ compression)","conda_spec": "pigz",},
+    "seqkit": {"label": "seqkit (fast R1/R2 resync in single-cell trimming)","conda_spec": "seqkit",},
 }
 
 _R_PACKAGES = {
@@ -639,6 +642,100 @@ def _render_eggnog_download_controls(db_dir, force):
             st.rerun()
         else:
             st.error(f"❌ {message}")
+def _render_whitelist_setup():
+    st.subheader("🧬 Barcode Whitelist Setup")
+    st.markdown(
+        "Barcode whitelist files (10x Genomics' official per-chemistry cell-barcode "
+        "inclusion lists) are a **shared resource** -- like a reference genome, but much "
+        "smaller -- placed once here, then reused by every project/user on this server "
+        "for the matching chemistry. Missing a whitelist doesn't block alignment, but it "
+        "does mean chemistry selection in Step 1 can only be confirmed by read length "
+        "alone, rather than by directly checking real barcode sequences against a known "
+        "list."
+    )
+
+    if not auth.has_permission("install_dependencies"):
+        st.info(
+            "🔒 Your current role does not include permission to install dependencies "
+            "(which also covers downloading whitelist files). Contact your lab's admin "
+            "if a whitelist needs to be installed."
+        )
+        return
+
+    statuses = wlm.get_all_whitelist_statuses()
+    missing = [fname for fname, status in statuses.items() if not status["present"]]
+
+    for fname, status in statuses.items():
+        spec = wlm.WHITELIST_CATALOG[fname]
+        chem_note = ", ".join(spec["chemistry_keys"])
+        if status["present"]:
+            st.markdown(f"✅ `{fname}` -- {spec['description']} ({status['size_mb']}MB) -- used by: `{chem_note}`")
+        else:
+            st.markdown(f"❌ `{fname}` -- {spec['description']} (~{spec['approx_decompressed_mb']}MB when downloaded) -- used by: `{chem_note}`")
+
+    if not missing:
+        st.success("✅ Every known barcode whitelist is already installed on this system.")
+        return
+
+    st.warning(f"**{len(missing)} whitelist file(s) missing.**")
+
+    if wlm_install_in_progress():
+        st.markdown("A whitelist download is currently running -- wait for it to finish before starting another.")
+        _render_whitelist_install_status_panel()
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(f"📥 Download All Missing Whitelists ({len(missing)})", key="setup_whitelist_download_all_btn", type="primary"):
+            _run_whitelist_download(missing)
+    with col2:
+        chosen_single = st.selectbox("Or download just one:", options=missing, key="setup_whitelist_single_select")
+        if st.button("📥 Download Selected", key="setup_whitelist_download_one_btn"):
+            _run_whitelist_download([chosen_single])
+
+    _render_whitelist_install_status_panel()
+
+
+# --- Minimal, self-contained progress/status tracking for whitelist
+# downloads -- deliberately NOT reusing deployment_manager.py's own
+# background-subprocess install-status machinery (that module's pattern
+# is built around launching and polling an external `mamba`/`conda`
+# subprocess with its own log file; whitelist downloads are plain
+# in-process Python urllib calls with no subprocess involved at all, so
+# a lighter-weight session_state-based progress tracker is a better fit
+# here than forcing this into that subprocess-oriented pattern).
+def wlm_install_in_progress():
+    return st.session_state.get("setup_whitelist_download_running", False)
+
+
+def _run_whitelist_download(filenames):
+    st.session_state["setup_whitelist_download_running"] = True
+    progress_lines = []
+    progress_area = st.empty()
+
+    def _progress_cb(msg, _lines=progress_lines, _area=progress_area):
+        _lines.append(msg)
+        _area.code("\n".join(_lines), language="text")
+
+    results = {}
+    with st.spinner(f"Downloading {len(filenames)} whitelist file(s)..."):
+        for fname in filenames:
+            success, message = wlm.download_whitelist(fname, progress_callback=_progress_cb)
+            results[fname] = (success, message)
+
+    st.session_state["setup_whitelist_download_running"] = False
+    st.session_state["setup_whitelist_last_results"] = results
+    st.rerun()
+
+
+def _render_whitelist_install_status_panel():
+    results = st.session_state.get("setup_whitelist_last_results")
+    if not results:
+        return
+    st.markdown("**Last download result(s):**")
+    for fname, (success, message) in results.items():
+        icon = "✅" if success else "❌"
+        st.markdown(f"{icon} `{fname}`: {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +909,8 @@ def render():
     _render_environment_check()
     st.markdown("---")
     _render_install_missing_section()
+    st.markdown("---")
+    _render_whitelist_setup()
     st.markdown("---")
     _render_eggnog_database_setup()
     st.markdown("---")

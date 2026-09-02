@@ -103,18 +103,16 @@ Fixed with THREE detection tiers, in priority order:
   3. Filename-pattern fallback (2026-08-31, added same day) -- SPECIFIC
      to singlecell_workspace.py's own _render_sra_source() UI, which
      calls finalize_role_assignment(..., sample_name) with sample_name
-     SET TO THE ACCESSION ITSELF for the SRA-download path (i.e.
-     `scsra.finalize_role_assignment(overrides, fastq_dir, run, ...)`,
-     where `run` IS the accession) -- meaning a PREVIOUSLY finalized SRA
-     run's files (from before this registry existed, so no registry
-     entry was ever written for them) are still named like
-     "SRR13734390_S1_R1_001.fastq.gz": the accession string is STILL the
-     literal filename prefix, even after finalization, for this specific
-     caller. This tier is intentionally an exact-prefix match (never a
-     loose substring search) to avoid any false-positive risk against an
-     unrelated sample. It does NOT apply to the "convert from a BAM file
-     I already have" path, since that lets the user choose an arbitrary
-     sample_name unrelated to any SRA accession.
+     SET TO THE ACCESSION ITSELF for the SRA-download path -- meaning a
+     PREVIOUSLY finalized SRA run's files (from before this registry
+     existed, so no registry entry was ever written for them) are still
+     named like "SRR13734390_S1_R1_001.fastq.gz": the accession string is
+     STILL the literal filename prefix, even after finalization, for
+     this specific caller. This tier is intentionally an exact-prefix
+     match (never a loose substring search) to avoid any false-positive
+     risk against an unrelated sample. It does NOT apply to the "convert
+     from a BAM file I already have" path, since that lets the user
+     choose an arbitrary sample_name unrelated to any SRA accession.
 
 A registry hit (tier 1) is NEVER trusted blindly -- at least one file it
 references must still actually exist on disk, or the entry is treated as
@@ -135,6 +133,65 @@ hit the fast, general-purpose tier-1 registry check directly rather
 than re-scanning the filesystem by pattern every single time. This is
 the recommended fix for existing projects (like covid_test) that
 already have finalized runs on disk from BEFORE this fix existed.
+
+--- "prefetch quiet success, no .sra file" diagnostic fix (2026-09-01)
+---
+A real, confirmed bug (CONFIRMED root cause of a real download failure
+on SRR13734386, a 72GB run): prefetch's own default maximum download
+size is 20GB. When an accession exceeds this, prefetch does NOT error --
+it exits 0 (success) while explicitly SKIPPING the download ("Download
+of some files was skipped because they are too large"), which then
+produced a confusing, unrelated-looking downstream fasterq-dump VFS/404
+error ("Cannot resolve accession") with no indication the REAL cause was
+a silent size-limit skip one step earlier.
+
+Fixed two ways: (1) build_prefetch_command() now always passes an
+explicit --max-size (100G by default, raised from prefetch's own 20GB
+default, and overridable via the new max_size parameter threaded through
+download_and_classify_run()/download_and_classify_runs_parallel()); (2)
+download_and_classify_run() now verifies a real .sra file actually
+exists immediately after prefetch returns (regardless of its exit code),
+and if not, returns a clear diagnostic message -- specifically detecting
+and calling out the size-limit-skip signature in prefetch's own captured
+output when that's the cause, rather than silently falling through to
+fasterq-dump's much more confusing, seemingly-unrelated error.
+
+--- Proactive resume scan + stale-cache refresh caveat (2026-09-01)
+---
+scan_pending_unfinalized_runs() (below) is a proactive filesystem scan
+-- completely independent of Streamlit session_state -- that finds every
+accession with real, already-downloaded raw FASTQ output still sitting
+in its own _sra_work/<accession>/ staging directory, not yet finalized.
+The intended caller pattern (see singlecell_workspace.py's own
+_render_sra_source()) is to call this ONCE per render and MERGE its
+result into st.session_state["sc_sra_download_results"], so a
+previously-downloaded-but-unconfirmed run reappears automatically in the
+UI the moment a project is reopened, with no need to re-validate/
+re-select anything.
+
+*** REAL, CONFIRMED CALLER-SIDE BUG this surfaced (2026-09-01), fixed in
+    singlecell_workspace.py itself, NOT in this module ***: the
+UI-layer merge must NOT use a plain dict.setdefault()-style "only add if
+the key doesn't already exist" merge. Confirmed via a real reported case
+(SRR13734384, a 348GB run): this module's own scan can genuinely be
+called and cached MULTIPLE TIMES across a single large accession's
+download lifetime -- e.g. once when only its small 8bp I1 file had
+finished downloading (correctly reporting "could not classify" for that
+1-file snapshot at the time), and again later once its two ~348GB R1/R2
+files had ALSO finished. Every scan_pending_unfinalized_runs() result is
+always tagged skipped=True by construction (see below) -- so it is safe,
+and NECESSARY, for the UI-layer merge to overwrite ANY existing cached
+entry that is ALSO tagged skipped=True (since that entry can only have
+come from this same resume-scan path previously, and therefore may be a
+stale, incomplete snapshot from earlier in the same download), while
+still NEVER overwriting a real, just-completed LIVE download result from
+the current session (tagged skipped=False), which must always be
+preserved untouched. A caller using plain setdefault() will appear to
+work initially but will silently freeze on a run's FIRST scanned
+snapshot forever, even after the real underlying download completes and
+more files appear on disk -- this exact symptom (a run stuck showing
+only 1 of its real 3 files, indefinitely, across page reloads) is what
+originally surfaced this caveat.
 """
 import gzip
 import json
@@ -278,11 +335,17 @@ def detect_likely_bam_derived_issue(classification):
             "accession was originally deposited as a 10x Genomics BAM file "
             "rather than plain FASTQ, or when only the cDNA read was ever "
             "deposited to SRA at all (a known real gap for some older, "
-            "v1-chemistry-era 10x depositions). Check this accession's own "
-            "SRA page, or try this module's find_original_format_bam_url() / "
-            "run_full_bam_recovery_pipeline() to see whether the ORIGINAL "
-            "Cell Ranger BAM (which retains barcode/UMI tags a plain FASTQ "
-            "extraction does not) is directly recoverable for this run."
+            "v1-chemistry-era 10x depositions) -- OR, importantly, when NOT "
+            "ALL of this run's expected files have finished downloading yet "
+            "(e.g. only a small I1 index file is present so far, out of an "
+            "expected 2-3 file set) -- always double-check this run's real, "
+            "current file listing on disk before assuming this is a genuine "
+            "BAM-derived issue rather than an in-progress download. Check "
+            "this accession's own SRA page, or try this module's "
+            "find_original_format_bam_url() / run_full_bam_recovery_pipeline() "
+            "to see whether the ORIGINAL Cell Ranger BAM (which retains "
+            "barcode/UMI tags a plain FASTQ extraction does not) is directly "
+            "recoverable for this run."
         )
     return None
 
@@ -300,11 +363,11 @@ def build_prefetch_command(accession, output_dir, max_size=DEFAULT_PREFETCH_MAX_
     which then caused a confusing downstream fasterq-dump VFS/404 error
     with no indication the real cause was a silent size-limit skip one
     step earlier. Confirmed real-world trigger: SRR13734386 (72GB), part
-    of a COVID single-cell PBMC batch where run sizes vary considerably.
+    of a COVID single-cell PBMC batch where run sizes vary considerably
+    (later confirmed up to ~350GB per file for some runs in this same
+    batch).
 
-    Fixed by always passing an explicit --max-size, defaulting to 100GB
-    (comfortably above every real single-cell run size seen in this
-    project so far, including the 72GB case that surfaced this bug).
+    Fixed by always passing an explicit --max-size, defaulting to 100GB.
     Callers needing a different ceiling (e.g. a known-huge deposition, or
     a deliberately LOWER limit to avoid accidentally filling scratch
     disk) can override max_size directly.
@@ -313,24 +376,6 @@ def build_prefetch_command(accession, output_dir, max_size=DEFAULT_PREFETCH_MAX_
         "prefetch", accession, "--output-directory", output_dir,
         "--max-size", max_size,
     ]
-
-
-def _find_prefetched_sra_file(accession, work_dir):
-    """
-    Look for the .sra file prefetch is expected to have produced.
-    prefetch's own convention (with --output-directory <work_dir>) is to
-    write <work_dir>/<accession>/<accession>.sra -- but different
-    sra-tools versions/configurations have occasionally been observed to
-    place it directly at <work_dir>/<accession>.sra instead, so both
-    locations are checked.
-    """
-    nested_path = os.path.join(work_dir, accession, f"{accession}.sra")
-    if os.path.isfile(nested_path):
-        return nested_path
-    flat_path = os.path.join(work_dir, f"{accession}.sra")
-    if os.path.isfile(flat_path):
-        return flat_path
-    return None
 
 
 def build_fasterq_dump_command(accession, sra_file_dir, output_dir, threads=4):
@@ -371,6 +416,24 @@ def _gzip_and_remove(src_path, threads=4):
         shutil.copyfileobj(f_in, f_out)
     os.remove(src_path)
     return gz_path
+
+
+def _find_prefetched_sra_file(accession, work_dir):
+    """
+    Look for the .sra file prefetch is expected to have produced.
+    prefetch's own convention (with --output-directory <work_dir>) is to
+    write <work_dir>/<accession>/<accession>.sra -- but different
+    sra-tools versions/configurations have occasionally been observed to
+    place it directly at <work_dir>/<accession>.sra instead, so both
+    locations are checked.
+    """
+    nested_path = os.path.join(work_dir, accession, f"{accession}.sra")
+    if os.path.isfile(nested_path):
+        return nested_path
+    flat_path = os.path.join(work_dir, f"{accession}.sra")
+    if os.path.isfile(flat_path):
+        return flat_path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +500,8 @@ def _find_finalized_files_by_naming_convention(accession, project_fastq_dir):
     This works specifically because singlecell_workspace.py's own
     _render_sra_source() calls finalize_role_assignment(..., sample_name)
     with sample_name SET TO THE ACCESSION ITSELF for the SRA-download
-    path (i.e. `scsra.finalize_role_assignment(overrides, fastq_dir, run,
-    ...)`, where `run` IS the accession) -- so finalize_role_assignment()'s
-    own standard 10x-style naming convention
-    ("{sample_name}_S1_{role}_001.ext" or
+    path -- so finalize_role_assignment()'s own standard 10x-style
+    naming convention ("{sample_name}_S1_{role}_001.ext" or
     "{sample_name}_S1_L{lane}_{role}_001.ext") means a previously
     finalized SRA run's files are named like
     "SRR13734390_S1_R1_001.fastq.gz" -- i.e. the accession string is
@@ -463,78 +524,6 @@ def _find_finalized_files_by_naming_convention(accession, project_fastq_dir):
         if f.startswith(prefix_flat) or f.startswith(prefix_laned):
             matches.append(os.path.join(project_fastq_dir, f))
     return sorted(matches)
-
-
-def scan_pending_unfinalized_runs(project_fastq_dir):
-    """
-    --- Proactive "resume" scan for previously-downloaded-but-unconfirmed
-        runs (2026-09-01) ---
-    A real, confirmed gap: is_accession_already_downloaded()'s tier-2
-    (raw staging) check only answers "has THIS SPECIFIC accession
-    already been downloaded?" -- it must be called PER ACCESSION, and
-    singlecell_workspace.py's own _render_sra_source() UI only calls it
-    (indirectly, via download_and_classify_run()) for accessions the
-    user has re-validated and re-selected in THIS session. Its RESULT is
-    then stored only in ephemeral Streamlit session_state
-    (sc_sra_download_results), which is reset on every new
-    session/page-reload and OVERWRITTEN (not merged) on every subsequent
-    download-button click for a different subset of runs.
-
-    Net effect: a run that was downloaded in an earlier session (or an
-    earlier click, for a different run subset, in the same session) can
-    have real, valid raw FASTQ output sitting in its own
-    _sra_work/<accession>/ directory, yet be COMPLETELY INVISIBLE in the
-    "Confirm File Roles" UI until the user manually re-enters, re-
-    validates, and re-selects that exact accession again -- even though
-    the underlying data was never lost.
-
-    This function closes that gap by scanning _sra_work/ directly for
-    ANY accession subdirectory with real raw FASTQ output not yet
-    finalized (i.e. every accession this project's tier-2 raw-staging
-    check would currently match), completely independent of
-    session_state or of which accessions the user has typed/selected in
-    this particular session. Callers (e.g. this project's Step 1 UI)
-    should call this once per render and MERGE its result into
-    st.session_state["sc_sra_download_results"] (without clobbering any
-    newer/different entries already there), so every previously
-    downloaded-but-unconfirmed run reappears automatically, ready to
-    confirm, the moment the project is reopened -- with no re-entry of
-    accessions required.
-
-    Returns a dict of {accession: result_dict}, in EXACTLY the same
-    shape download_and_classify_run() itself returns for a successful
-    (non-skipped) run -- i.e. directly usable as, or merged into,
-    st.session_state["sc_sra_download_results"].
-    """
-    work_root = os.path.join(project_fastq_dir, "_sra_work")
-    if not os.path.isdir(work_root):
-        return {}
-
-    pending = {}
-    for accession in sorted(os.listdir(work_root)):
-        work_dir = os.path.join(work_root, accession)
-        if not os.path.isdir(work_dir):
-            continue
-        raw_files = _find_raw_staged_files(accession, project_fastq_dir)
-        if not raw_files:
-            # Either nothing downloaded yet for this accession (e.g. a
-            # prefetch-only, no-FASTQ-output failure like the confirmed
-            # 20GB-size-limit case), or it was already finalized/moved
-            # out of staging -- either way, nothing pending to surface.
-            continue
-        classification = classify_output_files(raw_files)
-        bam_warning = detect_likely_bam_derived_issue(classification)
-        pending[accession] = {
-            "success": True,
-            "skipped": True,
-            "message": (
-                f"Found {len(raw_files)} previously downloaded file(s) for {accession} "
-                f"already sitting in _sra_work/{accession}/ -- not yet confirmed/finalized."
-            ),
-            "classification": classification,
-            "bam_warning": bam_warning,
-        }
-    return pending
 
 
 def is_accession_already_downloaded(accession, project_fastq_dir):
@@ -687,6 +676,85 @@ def backfill_registry_from_existing_files(project_fastq_dir, accessions):
     return {"backfilled": backfilled, "not_found": not_found}
 
 
+def scan_pending_unfinalized_runs(project_fastq_dir):
+    """
+    Proactive "resume" scan for previously-downloaded-but-unconfirmed
+    runs (2026-09-01). Scans _sra_work/ directly for ANY accession
+    subdirectory with real raw FASTQ output not yet finalized --
+    completely independent of session_state or of which accessions the
+    user has typed/selected in the current session.
+
+    Intended caller pattern (see singlecell_workspace.py's own
+    _render_sra_source()): call this ONCE per render and MERGE its
+    result into st.session_state["sc_sra_download_results"], so every
+    previously downloaded-but-unconfirmed run reappears automatically,
+    ready to confirm, the moment the project is reopened.
+
+    Returns a dict of {accession: result_dict}, in EXACTLY the same
+    shape download_and_classify_run() itself returns for a successful
+    (non-skipped) run, EXCEPT this function's own results are ALWAYS
+    tagged "skipped": True (see the important caller-side caveat below).
+
+    *** IMPORTANT CALLER-SIDE CAVEAT (2026-09-01, confirmed via a real
+        reported bug on SRR13734384, a 348GB run) ***
+    This function can be called and its result cached MULTIPLE TIMES
+    across a single large accession's own download lifetime -- e.g.
+    once when only a small 8bp I1 file had finished downloading so far
+    (correctly reporting "could not classify roles" for that 1-file
+    snapshot, since classify_output_files() requires 2-3 files to
+    attempt classification at all), and again later once the run's
+    much larger R1/R2 files have ALSO finished.
+
+    Every result this function returns is tagged skipped=True by
+    construction -- callers MUST use this to distinguish "a cached
+    result that can safely be REFRESHED with a newer scan" (skipped=True
+    -- it can only have come from this same resume-scan path, and may be
+    a stale, incomplete snapshot from earlier in the same download) from
+    "a real, just-completed LIVE download result from the current
+    session" (skipped=False -- must be preserved untouched, never
+    overwritten by a resume-scan result). A caller using a plain
+    dict.setdefault()-style "only add if the key doesn't already exist"
+    merge will appear to work initially but will silently FREEZE on a
+    run's FIRST-ever scanned snapshot forever, even after the real
+    underlying download completes and more files appear on disk -- this
+    exact symptom (a run stuck showing only 1 of its real 2-3 files,
+    indefinitely, across page reloads, requiring only a page refresh to
+    ever notice something was wrong) is what originally surfaced this
+    caveat. The correct merge is: overwrite any existing cached entry
+    for accession IF that entry is missing OR itself tagged
+    skipped=True; never overwrite an existing entry tagged skipped=False.
+    """
+    work_root = os.path.join(project_fastq_dir, "_sra_work")
+    if not os.path.isdir(work_root):
+        return {}
+
+    pending = {}
+    for accession in sorted(os.listdir(work_root)):
+        work_dir = os.path.join(work_root, accession)
+        if not os.path.isdir(work_dir):
+            continue
+        raw_files = _find_raw_staged_files(accession, project_fastq_dir)
+        if not raw_files:
+            # Either nothing downloaded yet for this accession (e.g. a
+            # prefetch-only, no-FASTQ-output failure like the confirmed
+            # 20GB-size-limit case), or it was already finalized/moved
+            # out of staging -- either way, nothing pending to surface.
+            continue
+        classification = classify_output_files(raw_files)
+        bam_warning = detect_likely_bam_derived_issue(classification)
+        pending[accession] = {
+            "success": True,
+            "skipped": True,
+            "message": (
+                f"Found {len(raw_files)} previously downloaded file(s) for {accession} "
+                f"already sitting in _sra_work/{accession}/ -- not yet confirmed/finalized."
+            ),
+            "classification": classification,
+            "bam_warning": bam_warning,
+        }
+    return pending
+
+
 def download_and_classify_run(accession, project_fastq_dir, sample_name, threads=4,
                                subprocess_runner=None, force_redownload=False,
                                max_size=DEFAULT_PREFETCH_MAX_SIZE):
@@ -727,21 +795,8 @@ def download_and_classify_run(accession, project_fastq_dir, sample_name, threads
     if result.returncode != 0:
         return {"success": False, "skipped": False, "message": f"prefetch failed for {accession}: {result.stderr}", "classification": None, "bam_warning": None}
 
-    # --- "prefetch quiet success, no .sra file" diagnostic fix (2026-09-01) ---
-    # A real, confirmed gap: prefetch can exit 0 (success) WITHOUT
-    # actually writing the expected .sra file -- e.g. a transient NCBI
-    # network hiccup, a quota/rate-limit response that doesn't set a
-    # non-zero exit code, or (for controlled-access/dbGaP data) a silent
-    # permission issue. Previously, this code only checked
-    # result.returncode, so a "successful" prefetch with no real output
-    # would fall straight through to fasterq-dump -- which would then
-    # fail with a confusing, generic VFS "Cannot resolve accession (404)"
-    # error that gives no hint the REAL problem happened one step
-    # earlier, in prefetch itself. This check closes that gap by
-    # verifying the .sra file actually exists immediately after prefetch
-    # returns, and failing loudly with prefetch's own captured
-    # stdout/stderr plus an actionable explanation, rather than letting
-    # the confusing downstream fasterq-dump error be the only signal.
+    # --- "prefetch quiet success, no .sra file" diagnostic fix
+    # (2026-09-01) -- see module docstring for full rationale.
     sra_file = _find_prefetched_sra_file(accession, work_dir)
     if sra_file is None:
         captured_output = (result.stdout or "") + (result.stderr or "")
