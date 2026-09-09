@@ -459,6 +459,68 @@ def _render_sra_source(project, fastq_dir):
 
         run_options = [row["Run"] for row in lookup_rows]
         selected_runs = st.multiselect("Select which validated run(s) to download:", options=run_options, default=run_options, key="sc_sra_selected_runs")
+
+        # --- NEW: multi-run-per-sample detection (2026-09-09) ---
+        # Confirmed real gap (GSE166992): 6 of 9 biological samples were
+        # split across two SRR runs each, but accession_to_sample_name
+        # below used to be a naive 1:1 {run: run} mapping, so multi-run
+        # samples were silently processed as separate samples instead of
+        # merged lanes of one sample. finalize_role_assignment() already
+        # supports multi-file-per-role lane merging -- the only missing
+        # piece was deciding WHICH runs share a sample_name, which is
+        # what detect_multi_run_sample_groups()/build_accession_to_
+        # sample_name() (in sc_sra_manager.py) now provide.
+        confirmed_group_names = {}
+        group_enabled = {}
+        manual_group_text = ""
+        detected = {"groups": [], "singletons": []}
+
+        if selected_runs:
+            selected_rows = [row for row in lookup_rows if row["Run"] in selected_runs]
+            detected = scsra.detect_multi_run_sample_groups(selected_rows, requested_accessions=selected_runs)
+            st.session_state["sc_sra_detected_groups"] = detected
+
+            if detected["groups"]:
+                st.markdown("**🔗 Multiple runs detected for the same biological sample**")
+                st.caption(
+                    "NCBI metadata suggests these runs belong to the same underlying sample "
+                    "(e.g. one sample sequenced across two separate SRA experiments/lanes). "
+                    "Confirmed groups below will be merged and processed as multiple lanes of "
+                    "ONE sample -- STARsolo natively supports multi-lane input -- rather than as "
+                    "separate samples. **Please review before downloading**, especially any "
+                    "group flagged low confidence."
+                )
+                for group in detected["groups"]:
+                    key_base = f"sc_sra_group_{group['group_key']}"
+                    conf_icon = "✅" if group["confidence"] == "high" else "⚠️"
+                    with st.expander(
+                        f"{conf_icon} {', '.join(group['runs'])} → suggested as ONE sample "
+                        f"(matched by {group['match_basis']}, {group['confidence']} confidence)",
+                        expanded=True,
+                    ):
+                        if group["includes_unrequested_runs"]:
+                            extra_runs = [r for r in group["runs"] if r not in selected_runs]
+                            st.warning(
+                                f"⚠️ NCBI's own metadata also links {', '.join(extra_runs)} to this "
+                                f"same sample, even though you didn't select it above -- it will "
+                                f"NOT be downloaded unless you also select it in the list above."
+                            )
+                        group_enabled[group["group_key"]] = st.checkbox(
+                            "Merge these runs into one sample", value=True, key=f"{key_base}_enabled",
+                        )
+                        confirmed_group_names[group["group_key"]] = st.text_input(
+                            "Sample name to use:", value=group["suggested_sample_name"], key=f"{key_base}_name",
+                        )
+
+            with st.expander("➕ Manually merge additional runs (if auto-detection missed a match)"):
+                st.caption(
+                    "One group per line, comma-separated run accessions -- e.g. "
+                    "`SRR1234567, SRR1234568` -- for runs that are lanes of the same sample "
+                    "but share no GEO accession or SRA experiment in common (so auto-detection "
+                    "above couldn't find them)."
+                )
+                manual_group_text = st.text_area("Manual groups:", key="sc_sra_manual_groups_text", height=70)
+
         if selected_runs:
             detected_cores, recommended_threads = pm.get_recommended_thread_count()
             threads = st.slider("Threads for download:", min_value=1, max_value=detected_cores, value=recommended_threads, key="sc_sra_threads")
@@ -511,7 +573,33 @@ def _render_sra_source(project, fastq_dir):
                     icon = "✅" if result["success"] else "⚠️"
                     status_area.write(f"{icon} {accession}: {result['message']}")
 
-                accession_to_sample_name = {run: run for run in selected_runs}
+                # --- NEW: build the final mapping from confirmed/overridden
+                # groups (2026-09-09) -- replaces the old naive 1:1
+                # {run: run} mapping.
+                effective_detected = {
+                    "groups": [g for g in detected["groups"] if group_enabled.get(g["group_key"], True)],
+                    "singletons": detected["singletons"] + [
+                        r for g in detected["groups"]
+                        if not group_enabled.get(g["group_key"], True)
+                        for r in g["runs"]
+                    ],
+                }
+                manual_group_overrides = [
+                    [r.strip() for r in line.split(",") if r.strip()]
+                    for line in manual_group_text.splitlines() if line.strip()
+                ] if manual_group_text else []
+
+                accession_to_sample_name = scsra.build_accession_to_sample_name(
+                    effective_detected,
+                    confirmed_group_names=confirmed_group_names,
+                    manual_group_overrides=manual_group_overrides,
+                )
+                # Manual groups can reference runs the user didn't select
+                # above (e.g. a typo, or a run only mentioned for grouping
+                # purposes) -- restrict the final mapping to only the runs
+                # actually being downloaded.
+                accession_to_sample_name = {r: n for r, n in accession_to_sample_name.items() if r in selected_runs}
+
                 results = scsra.download_and_classify_runs_parallel(
                     accession_to_sample_name, fastq_dir,
                     max_workers=max_workers, threads_per_run=threads,
@@ -2512,6 +2600,359 @@ def _build_qc_package_zip(sample_name, qc_df, output_dir, mito_diagnostic, thres
     return buffer.getvalue()
 
 
+def _summarize_cellqc_run_for_table(sample_name, output_dir):
+    """
+    Lightweight, no-UI summary of one sample's already-completed
+    Cell-level QC run -- used to build the batch-mode results table.
+    Returns a flat dict, or None if this sample's QC output can't be
+    read at all (e.g. the run failed before producing any output).
+    """
+    qc_df = cellqc.read_cell_qc_metrics(output_dir)
+    if qc_df is None:
+        return None
+    mito_diagnostic = cellqc.read_mito_gene_diagnostic(output_dir)
+    n_cells_total = len(qc_df)
+    n_doublets = int(qc_df["predicted_doublet"].sum()) if "predicted_doublet" in qc_df.columns else None
+    mean_mito = float(qc_df["subsets_Mito_percent"].mean()) if "subsets_Mito_percent" in qc_df.columns else None
+    n_adaptive_fail = int(qc_df["adaptive_qc_fail"].sum()) if "adaptive_qc_fail" in qc_df.columns else None
+    mito_ok = mito_diagnostic is not None and mito_diagnostic.get("union_count", 0) > 0
+    return {
+        "Sample": sample_name,
+        "Cells": n_cells_total,
+        "Doublets Flagged": n_doublets if n_doublets is not None else "—",
+        "Mean Mito %": round(mean_mito, 2) if mean_mito is not None else "—",
+        "Adaptive QC Fail": n_adaptive_fail if n_adaptive_fail is not None else "—",
+        "Mito Genes Found": "✅" if mito_ok else "⚠️ None",
+    }
+
+def _check_batch_cellqc_status(align_dir, selected_samples):
+    """
+    Rebuild the batch-mode results summary by checking DISK directly for
+    each sample's already-completed Cell-level QC output -- rather than
+    relying on session_state alone (which is lost the moment the user
+    navigates away and returns, e.g. a fresh Streamlit session). Mirrors
+    the exact same "always re-read from disk" pattern already used by
+    the single-sample path's _render_cellqc_results_for_sample(), which
+    is why single-sample mode correctly "remembers" a completed run
+    across sessions while batch mode previously did not.
+    """
+    rows = []
+    for sample_name in selected_samples:
+        output_dir = os.path.join(align_dir, sample_name, "cellqc")
+        row = _summarize_cellqc_run_for_table(sample_name, output_dir)
+        if row is not None:
+            row["Status"] = "✅ Success"
+        else:
+            row = {"Sample": sample_name, "Status": "⏳ Not yet run"}
+        rows.append(row)
+    return rows
+
+
+def _list_completed_cellqc_samples(align_dir, sample_names):
+    """
+    Lightweight disk check: which of these samples already have
+    completed Cell-level QC output. Used to populate the inline
+    sample-switch dropdown (see _render_cellqc_results_for_sample()
+    below) without duplicating this check in every call site.
+    """
+    return [
+        s for s in sample_names
+        if cellqc.read_cell_qc_metrics(os.path.join(align_dir, s, "cellqc")) is not None
+    ]
+
+
+def _apply_pending_sample_switch(select_key):
+    """
+    Apply a deferred sample-switch request (if any) to `select_key`'s
+    OWN session_state entry -- MUST be called before the widget with
+    that exact key is instantiated in this run (i.e. before the
+    st.selectbox(..., key=select_key) call itself).
+
+    --- Real, confirmed bug fix (2026-09-09) ---
+    Streamlit raises StreamlitAPIException ("cannot be modified after
+    the widget with key ... is instantiated") if code tries to write
+    directly to st.session_state[key] for a widget that has ALREADY
+    been created earlier in the SAME script run. Both
+    "sc_cellqc_sample_select" (single-sample mode) and
+    "sc_cellqc_batch_view_select" (batch mode) are instantiated NEAR
+    THE TOP of their respective branches in render_cell_qc() -- well
+    BEFORE _render_cellqc_results_for_sample() (and its inline
+    "switch sample" dropdown) is ever reached later in that same run.
+    So directly assigning st.session_state[select_key] = new_sample
+    from inside the inline switcher (which runs AFTER that widget
+    already exists) always raised this exception.
+
+    Fixed with the standard Streamlit "deferred write" pattern: the
+    inline switcher (see _render_cellqc_results_for_sample() below)
+    writes the desired NEXT value into a separate, non-widget-backed
+    session_state key (f"_pending_switch_{select_key}") and triggers
+    st.rerun(). On the NEXT run, THIS function -- called from
+    render_cell_qc() before either selectbox is instantiated -- reads
+    that pending value, writes it into the real widget key (which is
+    safe here, since the widget hasn't been instantiated yet THIS
+    run), and clears the pending marker.
+
+    Must be called once per relevant select_key, unconditionally, near
+    the very top of render_cell_qc() -- before ANY st.selectbox() call
+    that uses that same key anywhere in the function.
+    """
+    pending_key = f"_pending_switch_{select_key}"
+    if pending_key in st.session_state:
+        st.session_state[select_key] = st.session_state.pop(pending_key)
+
+
+def _render_all_samples_overview(align_dir, sample_names):
+    """
+    Always-visible, at-a-glance summary of Cell-level QC status and key
+    metrics for EVERY sample in this project -- regardless of whether
+    the user is in "One sample at a time" or "Multiple samples" mode,
+    and without requiring them to select or run anything first.
+    """
+    rows = []
+    for sample_name in sample_names:
+        output_dir = os.path.join(align_dir, sample_name, "cellqc")
+        row = _summarize_cellqc_run_for_table(sample_name, output_dir)
+        if row is not None:
+            row["Status"] = "✅ Complete"
+        else:
+            row = {"Sample": sample_name, "Status": "⏳ Not yet run"}
+        rows.append(row)
+
+    n_complete = sum(1 for r in rows if r["Status"] == "✅ Complete")
+    with st.expander(f"📋 All Samples Overview ({n_complete}/{len(rows)} completed)", expanded=True):
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if n_complete == 0:
+            st.caption("No samples have completed Cell-level QC yet -- run it below to populate this overview.")
+
+
+def _render_cellqc_results_for_sample(sample_name, output_dir, mito_gtf_path, doublet_method, ambient_method,
+                                       align_dir=None, available_samples=None, select_key=None,
+                                       all_sample_names=None):
+    """
+    Full detailed Cell-level QC results display for ONE sample.
+
+    align_dir, available_samples, select_key (2026-09-09): when all
+    three are supplied, an inline "🔀 Switch to a different sample's
+    results" dropdown is rendered here -- see
+    _apply_pending_sample_switch()'s own docstring for the full
+    rationale behind its deferred-write pattern (fixes a real
+    StreamlitAPIException).
+
+    all_sample_names (2026-09-09, moved from page-top placement): when
+    supplied (together with align_dir), the "All Samples Overview"
+    table is rendered directly ABOVE the inline switcher -- i.e. in
+    context with the results/graphs the user is currently looking at,
+    rather than requiring a scroll all the way back to the top of the
+    page. Pass the FULL project sample list here (not just
+    available_samples/completed ones), so not-yet-run samples still
+    show up in the overview.
+    """
+    qc_df = cellqc.read_cell_qc_metrics(output_dir)
+    if qc_df is None:
+        st.info(f"No Cell-level QC results found yet for `{sample_name}`.")
+        return
+
+    st.markdown("---")
+    st.markdown(f"**📊 Results for `{sample_name}`**")
+
+    # --- NEW: All Samples Overview, now rendered HERE (directly above
+    # the inline switcher just below) rather than at the top of the
+    # page -- see this function's own docstring, "all_sample_names",
+    # for the full rationale.
+    if align_dir and all_sample_names:
+        _render_all_samples_overview(align_dir, all_sample_names)
+
+    if available_samples and select_key and len(available_samples) > 1:
+        switch_key = f"{select_key}_inline_switch"
+        current_index = available_samples.index(sample_name) if sample_name in available_samples else 0
+        new_sample = st.selectbox(
+            "🔀 Switch to a different sample's results:",
+            options=available_samples, index=current_index, key=switch_key,
+        )
+        if new_sample != sample_name:
+            # --- Deferred write (2026-09-09): do NOT write directly to
+            # st.session_state[select_key] here -- that widget's key
+            # was already instantiated earlier in THIS SAME run (at
+            # the top of single-sample or batch mode), and Streamlit
+            # raises StreamlitAPIException if you assign to an
+            # already-instantiated widget's key. Instead, stash the
+            # desired value in a separate "pending" key and rerun;
+            # _apply_pending_sample_switch() (called from
+            # render_cell_qc(), BEFORE that widget is instantiated on
+            # the next run) picks it up and applies it safely then.
+            st.session_state[f"_pending_switch_{select_key}"] = new_sample
+            st.rerun()
+
+    mito_diagnostic = cellqc.read_mito_gene_diagnostic(output_dir)
+    _render_mito_diagnostic(mito_diagnostic)
+    doubletfinder_diagnostic = cellqc.read_doubletfinder_diagnostic(output_dir)
+    _render_doubletfinder_diagnostic(cellqc.diagnose_doubletfinder_result(doubletfinder_diagnostic))
+
+    summary = cellqc.summarize_cellqc_results(qc_df)
+    if summary:
+        st.markdown(summary["messages"]["adaptive_qc"])
+        st.markdown(summary["messages"]["doublet"])
+        st.markdown(summary["messages"]["ambient"])
+    thresholds = cellqc.read_qc_thresholds(output_dir)
+    if thresholds:
+        st.caption(f"Adaptive thresholds used: total counts > {thresholds.get('sum_lower', 0):.0f}, genes detected > {thresholds.get('detected_lower', 0):.0f}, mitochondrial % < {thresholds.get('mito_upper', 0):.1f}%")
+
+    pk_sweep_df = cellqc.read_doubletfinder_pk_sweep(output_dir)
+    if pk_sweep_df is not None and not pk_sweep_df.empty:
+        with st.expander("🔍 DoubletFinder pK parameter sweep details"):
+            st.caption("Each row is a candidate 'pK' value DoubletFinder tested; the one with the highest **BCmetric** was automatically selected and used for the final classification above.")
+            if "doubletfinder_pK_used" in qc_df.columns and not qc_df["doubletfinder_pK_used"].empty:
+                st.caption(f"✅ Selected pK: **{qc_df['doubletfinder_pK_used'].iloc[0]}**")
+            chart_df = pk_sweep_df.copy()
+            if "pK" in chart_df.columns:
+                chart_df["pK"] = chart_df["pK"].astype(str)
+                chart_df = chart_df.set_index("pK")
+            if "BCmetric" in chart_df.columns:
+                st.bar_chart(chart_df["BCmetric"])
+            st.dataframe(pk_sweep_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    figures = _render_cellqc_visualizations(qc_df, output_dir, doublet_method, gtf_path=mito_gtf_path)
+
+    st.markdown("---")
+    st.markdown("**📦 Download Full QC Package**")
+    st.caption("Bundles the per-cell metrics table, QC thresholds, mitochondrial-gene diagnostic, top-ambient-genes table, DoubletFinder's pK sweep (if used), a plain-text summary, and PNG copies of every plot above into a single .zip file.")
+    try:
+        zip_bytes = _build_qc_package_zip(
+            sample_name, qc_df, output_dir, mito_diagnostic, thresholds, doublet_method, ambient_method, figures,
+            gtf_path=mito_gtf_path,
+        )
+        st.download_button(
+            "📦 Download QC Package (.zip)", data=zip_bytes,
+            file_name=f"{sample_name}_cellqc_package.zip", mime="application/zip",
+            key=f"sc_cellqc_download_package_btn_{sample_name}",
+        )
+    except Exception as e:
+        st.error(f"⚠️ Could not build the QC package: {e}")
+
+    st.markdown("---")
+    with st.expander("📋 Full per-cell QC table"):
+        st.dataframe(qc_df, use_container_width=True, hide_index=True)
+
+
+def _render_cellqc_shared_settings(project, mito_gene_ids_override, mito_source, is_custom_reference):
+    """
+    Render every Cell-level QC setting that SHOULD be identical across
+    a batch of samples in the same analysis (doublet method, ambient
+    method, MAD sensitivity, DoubletFinder internals) -- factored out
+    so both the single-sample and batch-mode paths configure these
+    exactly once, using identical widgets/defaults/explanations.
+
+    Deliberately does NOT include "expected doublet rate" -- that one
+    is data-driven (scales with each sample's own cell count) rather
+    than a methodology choice, so it's handled separately per-sample
+    (single mode) or with its own explicit auto-vs-fixed choice (batch
+    mode) -- see render_cell_qc()'s own batch-mode branch.
+
+    Returns a dict of every chosen setting, ready to pass straight into
+    cellqc.run_cellqc_analysis() (minus expected_doublet_rate,
+    filtered_matrix_dir/raw_matrix_dir/output_dir/work_dir, which are
+    per-sample).
+    """
+    st.markdown("**🧬 Doublet Detection**")
+    doublet_method_keys = list(cellqc.DOUBLET_METHOD_OPTIONS.keys())
+    doublet_method = st.radio("Doublet detection method:", doublet_method_keys, format_func=lambda k: cellqc.DOUBLET_METHOD_OPTIONS[k]["label"],
+                               index=doublet_method_keys.index(cellqc.DEFAULT_DOUBLET_METHOD), key="sc_doublet_method_choice")
+    st.caption(cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["explanation"])
+
+    simulation_mode = cellqc.DEFAULT_SIMULATION_MODE
+    doubletfinder_n_pcs = cellqc.DEFAULT_DOUBLETFINDER_N_PCS
+    doubletfinder_cluster_resolution = cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION
+
+    if not cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["implemented"]:
+        st.warning("⚠️ This method isn't implemented yet -- select scDblFinder to continue.")
+        return None
+
+    if doublet_method == "scDblFinder":
+        sim_mode_keys = list(cellqc.DOUBLET_SIMULATION_MODES.keys())
+        simulation_mode = st.radio("Doublet simulation mode:", sim_mode_keys, format_func=lambda k: cellqc.DOUBLET_SIMULATION_MODES[k]["label"],
+                                    index=sim_mode_keys.index(cellqc.DEFAULT_SIMULATION_MODE), key="sc_doublet_sim_mode_choice")
+        st.caption(cellqc.DOUBLET_SIMULATION_MODES[simulation_mode]["explanation"])
+    else:
+        st.info("⏱️ **DoubletFinder runs noticeably slower than scDblFinder** -- expect this to take several minutes PER SAMPLE.")
+        with st.expander("⚙️ DoubletFinder internal preprocessing settings (advanced)"):
+            doubletfinder_n_pcs = st.slider("Number of principal components:", min_value=5, max_value=50, value=cellqc.DEFAULT_DOUBLETFINDER_N_PCS, key="sc_doubletfinder_n_pcs")
+            doubletfinder_cluster_resolution = st.slider("Clustering resolution:", min_value=0.1, max_value=2.0, value=cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION, step=0.1, key="sc_doubletfinder_cluster_res")
+
+    st.markdown("---")
+    st.markdown("**🧪 Ambient RNA Correction**")
+    ambient_method_keys = list(cellqc.AMBIENT_METHOD_OPTIONS.keys())
+    ambient_method = st.radio("Ambient RNA correction method:", ambient_method_keys, format_func=lambda k: cellqc.AMBIENT_METHOD_OPTIONS[k]["label"],
+                               index=ambient_method_keys.index(cellqc.DEFAULT_AMBIENT_METHOD), key="sc_ambient_method_choice")
+    st.caption(cellqc.AMBIENT_METHOD_OPTIONS[ambient_method]["explanation"])
+
+    st.markdown("---")
+    st.markdown("**🎚️ Per-cell Filtering Thresholds**")
+    st.caption("Adaptive thresholds (median-absolute-deviations from the median) are computed automatically PER-SAMPLE for total counts, genes detected, and mitochondrial %.")
+    nmads = st.slider("MAD sensitivity (lower = stricter):", min_value=1.0, max_value=5.0, value=float(cellqc.DEFAULT_MAD_NMADS), step=0.5, key="sc_cellqc_nmads")
+    if is_custom_reference and mito_gene_ids_override is not None:
+        st.caption(f"ℹ️ Using {len(mito_gene_ids_override)} previously-resolved mitochondrial gene(s) for this custom reference (source: {mito_source}).")
+
+    return {
+        "doublet_method": doublet_method,
+        "simulation_mode": simulation_mode,
+        "doubletfinder_n_pcs": doubletfinder_n_pcs,
+        "doubletfinder_cluster_resolution": doubletfinder_cluster_resolution,
+        "ambient_method": ambient_method,
+        "nmads": nmads,
+    }
+
+
+def _list_completed_cellqc_samples(align_dir, sample_names):
+    """
+    Lightweight disk check: which of these samples already have
+    completed Cell-level QC output. Used to populate the inline
+    sample-switch dropdown (see _render_cellqc_results_for_sample()
+    below) without duplicating this check in every call site.
+    """
+    return [
+        s for s in sample_names
+        if cellqc.read_cell_qc_metrics(os.path.join(align_dir, s, "cellqc")) is not None
+    ]
+
+
+def _render_all_samples_overview(align_dir, sample_names):
+    """
+    Always-visible, at-a-glance summary of Cell-level QC status and key
+    metrics for EVERY sample in this project -- regardless of whether
+    the user is in "One sample at a time" or "Multiple samples" mode,
+    and without requiring them to select or run anything first.
+
+    Real, confirmed gap this fixes (2026-09-09): previously the ONLY
+    way to see ANY sample's Cell-level QC status was to select it
+    individually (single-sample mode) or first opt into "Multiple
+    samples" mode and select a batch. A user with many samples had no
+    way to see at a glance which samples had already been QC'd, or
+    compare key metrics (cell counts, doublets flagged, mean mito %)
+    across samples, without clicking through each one.
+
+    Always reads directly from DISK (not session_state) -- so this
+    reflects real completed runs from ANY prior session, exactly like
+    _check_batch_cellqc_status()'s own established "always re-read from
+    disk" pattern (see that function's docstring for the original bug
+    this pattern fixes).
+    """
+    rows = []
+    for sample_name in sample_names:
+        output_dir = os.path.join(align_dir, sample_name, "cellqc")
+        row = _summarize_cellqc_run_for_table(sample_name, output_dir)
+        if row is not None:
+            row["Status"] = "✅ Complete"
+        else:
+            row = {"Sample": sample_name, "Status": "⏳ Not yet run"}
+        rows.append(row)
+
+    n_complete = sum(1 for r in rows if r["Status"] == "✅ Complete")
+    with st.expander(f"📋 All Samples Overview ({n_complete}/{len(rows)} completed)", expanded=True):
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if n_complete == 0:
+            st.caption("No samples have completed Cell-level QC yet -- run it below to populate this overview.")
+
 def render_cell_qc():
     """Phase 2 entry point -- Cell-level QC."""
     st.title("🔬 Single-cell Cell-level QC")
@@ -2528,186 +2969,241 @@ def render_cell_qc():
         st.error("⚠️ Rscript was not found on this system. R with the DropletUtils, scuttle, scDblFinder, and celda (DecontX) [and, if selected, SoupX] packages needs to be installed in your environment before this step can run.")
         return
 
+    # --- Apply any deferred inline-sample-switch request BEFORE either
+    # "sc_cellqc_sample_select" or "sc_cellqc_batch_view_select" is
+    # instantiated below -- see _apply_pending_sample_switch()'s own
+    # docstring for the full rationale (fixes a real
+    # StreamlitAPIException: "cannot be modified after the widget ...
+    # is instantiated").
+    _apply_pending_sample_switch("sc_cellqc_sample_select")
+    _apply_pending_sample_switch("sc_cellqc_batch_view_select")
+
     align_dir = scpm.starsolo_output_dir(project)
     sample_names = list(pairs.keys())
     if not sample_names:
         st.warning("⚠️ No samples found for this project.")
-        return
-    sample_name = st.selectbox("Sample to run cell-level QC on:", options=sample_names, key="sc_cellqc_sample_select")
-
-    sample_out_dir = os.path.join(align_dir, sample_name)
-    output_prefix = os.path.join(sample_out_dir, f"{sample_name}_")
-    filtered_dir = star.filtered_counts_matrix_dir(output_prefix)
-    raw_dir = star.counts_matrix_dir(output_prefix)
-
-    if not os.path.isdir(filtered_dir):
-        st.error(f"⚠️ Could not find STARsolo's filtered matrix directory for `{sample_name}` at `{filtered_dir}`. Re-run Step 6 for this sample if this is unexpected.")
         return
 
     reference_cfg = scpm.get_reference_choice(project) or {}
     mito_gtf_path = reference_cfg.get("custom_gtf")
     mito_gene_ids_override = reference_cfg.get("mito_gene_ids") or None
     mito_source = reference_cfg.get("mito_source", "gtf_auto_detect")
-
-    resolved_mito_gene_ids = cellqc.resolve_mito_gene_ids(mito_gtf_path, mito_gene_ids_override)
-    stale_diagnostic = cellqc.diagnose_starsolo_matrix_for_mito(filtered_dir, mito_gene_ids=resolved_mito_gene_ids)
-    _render_stale_index_diagnostic(stale_diagnostic, sample_name)
-
-    st.markdown("---")
-    st.markdown("**🧬 Doublet Detection**")
-    doublet_method_keys = list(cellqc.DOUBLET_METHOD_OPTIONS.keys())
-    doublet_method = st.radio("Doublet detection method:", doublet_method_keys, format_func=lambda k: cellqc.DOUBLET_METHOD_OPTIONS[k]["label"],
-                               index=doublet_method_keys.index(cellqc.DEFAULT_DOUBLET_METHOD), key="sc_doublet_method_choice")
-    st.caption(cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["explanation"])
-    if not cellqc.DOUBLET_METHOD_OPTIONS[doublet_method]["implemented"]:
-        st.warning("⚠️ This method isn't implemented yet -- select scDblFinder to continue.")
-        return
-
-    simulation_mode = cellqc.DEFAULT_SIMULATION_MODE
-    doubletfinder_n_pcs = cellqc.DEFAULT_DOUBLETFINDER_N_PCS
-    doubletfinder_cluster_resolution = cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION
-
-    if doublet_method == "scDblFinder":
-        sim_mode_keys = list(cellqc.DOUBLET_SIMULATION_MODES.keys())
-        simulation_mode = st.radio("Doublet simulation mode:", sim_mode_keys, format_func=lambda k: cellqc.DOUBLET_SIMULATION_MODES[k]["label"],
-                                    index=sim_mode_keys.index(cellqc.DEFAULT_SIMULATION_MODE), key="sc_doublet_sim_mode_choice")
-        st.caption(cellqc.DOUBLET_SIMULATION_MODES[simulation_mode]["explanation"])
-    else:
-        st.info("⏱️ **DoubletFinder runs noticeably slower than scDblFinder** -- it computes its own internal PCA/clustering, then sweeps many candidate 'pK' parameter values to find the best one automatically. Expect this to take several minutes.")
-        with st.expander("ℹ️ How does DoubletFinder actually work? (click to learn more)"):
-            st.markdown(
-                "DoubletFinder works by **simulating fake doublets** (combining pairs of your "
-                "real cells' expression profiles), mixing them in with your real cells, then "
-                "checking which real cells sit unusually close to those fake doublets in "
-                "expression space. A real cell surrounded by mostly-fake-doublet neighbors is "
-                "flagged as a likely doublet.\n\n"
-                "**Two parameters control this that you DON'T need to set manually:**\n"
-                "- **pN** (how many fake doublets to generate) is fixed at DoubletFinder's own "
-                "recommended default (25%) -- its own documentation states results are "
-                "\"largely pN-invariant,\" so there's no meaningful benefit to exposing this.\n"
-                "- **pK** (how large a neighborhood to check around each cell) genuinely *does* "
-                "need to be tuned per-dataset -- this pipeline already automates that correctly "
-                "via a parameter sweep (shown as \"pK sweep\" in the run log), rather than asking "
-                "you to guess it. You'll see a warning above if that automated choice looks "
-                "uncertain (landed at the edge of what was tested).\n\n"
-                "**Important limitation:** DoubletFinder can only detect **heterotypic** "
-                "doublets (two *different* cell types combined, e.g. a T-cell + a B-cell) -- it "
-                "cannot detect a **homotypic** doublet (two cells of the *same* type combined, "
-                "e.g. two T-cells), since that looks statistically identical to one normal cell. "
-                "The \"Clustering resolution\" setting below exists specifically to estimate and "
-                "correct for this blind spot -- see its own explanation for exactly how."
-            )
-        with st.expander("⚙️ DoubletFinder internal preprocessing settings (advanced)"):
-            st.caption("These control DoubletFinder's own required internal PCA/clustering step -- **not** the pipeline's future Phase 3 clustering feature.")
-            doubletfinder_n_pcs = st.slider("Number of principal components:", min_value=5, max_value=50, value=cellqc.DEFAULT_DOUBLETFINDER_N_PCS, key="sc_doubletfinder_n_pcs",
-                help="How many principal components to use when DoubletFinder measures each cell's 'neighborhood' -- this directly affects detection quality, not just preprocessing.")
-            doubletfinder_cluster_resolution = st.slider("Clustering resolution:", min_value=0.1, max_value=2.0, value=cellqc.DEFAULT_DOUBLETFINDER_CLUSTER_RESOLUTION, step=0.1, key="sc_doubletfinder_cluster_res",
-                help="⚠️ This does NOT change which individual cells get flagged as doublets -- it's used ONLY to estimate the homotypic doublet fraction.")
-
     persisted_results = scpm.get_alignment_results(project) or []
-    cells_detected = next((r.get("Cells Detected") for r in persisted_results if r.get("Sample") == sample_name), None)
-    default_dbr = cellqc.compute_expected_doublet_rate(cells_detected) if isinstance(cells_detected, (int, float)) else 0.008
-    expected_doublet_rate = st.slider("Expected doublet rate:", min_value=0.0, max_value=0.30, value=float(default_dbr), step=0.001, format="%.3f", key="sc_expected_doublet_rate",
-        help=f"Auto-computed as ~0.8% per 1,000 cells loaded" + (f" ({cells_detected:,} cells detected in Step 6 -> {default_dbr:.3f})" if cells_detected else "") + ".")
 
-    st.markdown("---")
-    st.markdown("**🧪 Ambient RNA Correction**")
-    ambient_method_keys = list(cellqc.AMBIENT_METHOD_OPTIONS.keys())
-    ambient_method = st.radio("Ambient RNA correction method:", ambient_method_keys, format_func=lambda k: cellqc.AMBIENT_METHOD_OPTIONS[k]["label"],
-                               index=ambient_method_keys.index(cellqc.DEFAULT_AMBIENT_METHOD), key="sc_ambient_method_choice")
-    st.caption(cellqc.AMBIENT_METHOD_OPTIONS[ambient_method]["explanation"])
-    if ambient_method == "soupx" and not os.path.isdir(raw_dir):
-        st.error(f"⚠️ SoupX requires STARsolo's raw (unfiltered) matrix, which wasn't found at `{raw_dir}`.")
-        return
+    mode = st.radio(
+        "Run Cell-level QC on:",
+        ["One sample at a time", "Multiple samples, using the same settings"],
+        key="sc_cellqc_mode_radio", horizontal=True,
+        help=(
+            "Batch mode configures doublet detection, ambient RNA correction, and "
+            "MAD sensitivity ONCE and applies them identically to every selected "
+            "sample -- keeping methodology consistent across your analysis, "
+            "rather than risking different settings sample-to-sample. Each "
+            "sample's adaptive filtering thresholds and expected doublet rate "
+            "still adapt automatically to that sample's own data, since those "
+            "are data-driven, not methodology choices."
+        ),
+    )
 
-    st.markdown("---")
-    st.markdown("**🎚️ Per-cell Filtering Thresholds**")
-    st.caption("Adaptive thresholds (3 median-absolute-deviations from the median) are computed automatically per-sample for total counts, genes detected, and mitochondrial %.")
-    nmads = st.slider("MAD sensitivity (lower = stricter):", min_value=1.0, max_value=5.0, value=float(cellqc.DEFAULT_MAD_NMADS), step=0.5, key="sc_cellqc_nmads")
-    if reference_cfg.get("is_custom") and mito_gene_ids_override is not None:
-        st.caption(f"ℹ️ Using {len(mito_gene_ids_override)} previously-resolved mitochondrial gene(s) for this custom reference (source: {mito_source}).")
+    # -------------------------------------------------------------
+    # SINGLE-SAMPLE MODE (existing behavior, unchanged)
+    # -------------------------------------------------------------
+    if mode == "One sample at a time":
+        sample_name = st.selectbox("Sample to run cell-level QC on:", options=sample_names, key="sc_cellqc_sample_select")
 
-    output_dir = os.path.join(sample_out_dir, "cellqc")
-    work_dir = os.path.join(sample_out_dir, "cellqc_work")
+        sample_out_dir = os.path.join(align_dir, sample_name)
+        output_prefix = os.path.join(sample_out_dir, f"{sample_name}_")
+        filtered_dir = star.filtered_counts_matrix_dir(output_prefix)
+        raw_dir = star.counts_matrix_dir(output_prefix)
 
-    spinner_text = ("Running DoubletFinder (PCA + clustering + pK sweep) and ambient RNA correction... this can take several minutes."
-                     if doublet_method == "doublet_finder" else "Running doublet detection + ambient RNA correction... this may take a few minutes.")
-    if st.button("▶️ Run Cell-level QC", key="sc_run_cellqc_btn", type="primary"):
-        with st.spinner(spinner_text):
-            success, log = cellqc.run_cellqc_analysis(
-                filtered_matrix_dir=filtered_dir, output_dir=output_dir, work_dir=work_dir,
-                doublet_method=doublet_method, simulation_mode=simulation_mode,
-                expected_doublet_rate=expected_doublet_rate, ambient_method=ambient_method,
-                raw_matrix_dir=raw_dir if ambient_method == "soupx" else None, nmads=nmads,
-                mito_gtf_path=mito_gtf_path, mito_gene_ids_override=mito_gene_ids_override, mito_source=mito_source,
-                doubletfinder_n_pcs=doubletfinder_n_pcs, doubletfinder_cluster_resolution=doubletfinder_cluster_resolution,
-            )
-        if not success:
-            st.error("Cell-level QC failed. Details below:")
-            st.code(log)
-        else:
-            st.success("✅ Cell-level QC completed.")
-            with st.expander("📜 Run log"):
+        if not os.path.isdir(filtered_dir):
+            st.error(f"⚠️ Could not find STARsolo's filtered matrix directory for `{sample_name}` at `{filtered_dir}`. Re-run Step 6 for this sample if this is unexpected.")
+            return
+
+        resolved_mito_gene_ids = cellqc.resolve_mito_gene_ids(mito_gtf_path, mito_gene_ids_override)
+        stale_diagnostic = cellqc.diagnose_starsolo_matrix_for_mito(filtered_dir, mito_gene_ids=resolved_mito_gene_ids)
+        _render_stale_index_diagnostic(stale_diagnostic, sample_name)
+
+        st.markdown("---")
+        settings = _render_cellqc_shared_settings(project, mito_gene_ids_override, mito_source, reference_cfg.get("is_custom"))
+        if settings is None:
+            return
+
+        cells_detected = next((r.get("Cells Detected") for r in persisted_results if r.get("Sample") == sample_name), None)
+        default_dbr = cellqc.compute_expected_doublet_rate(cells_detected) if isinstance(cells_detected, (int, float)) else 0.008
+        expected_doublet_rate = st.slider("Expected doublet rate:", min_value=0.0, max_value=0.30, value=float(default_dbr), step=0.001, format="%.3f", key="sc_expected_doublet_rate",
+            help=f"Auto-computed as ~0.8% per 1,000 cells loaded" + (f" ({cells_detected:,} cells detected in Step 6 -> {default_dbr:.3f})" if cells_detected else "") + ".")
+
+        if settings["ambient_method"] == "soupx" and not os.path.isdir(raw_dir):
+            st.error(f"⚠️ SoupX requires STARsolo's raw (unfiltered) matrix, which wasn't found at `{raw_dir}`.")
+            return
+
+        output_dir = os.path.join(sample_out_dir, "cellqc")
+        work_dir = os.path.join(sample_out_dir, "cellqc_work")
+
+        spinner_text = ("Running DoubletFinder (PCA + clustering + pK sweep) and ambient RNA correction... this can take several minutes."
+                         if settings["doublet_method"] == "doublet_finder" else "Running doublet detection + ambient RNA correction... this may take a few minutes.")
+        if st.button("▶️ Run Cell-level QC", key="sc_run_cellqc_btn", type="primary"):
+            with st.spinner(spinner_text):
+                success, log = cellqc.run_cellqc_analysis(
+                    filtered_matrix_dir=filtered_dir, output_dir=output_dir, work_dir=work_dir,
+                    doublet_method=settings["doublet_method"], simulation_mode=settings["simulation_mode"],
+                    expected_doublet_rate=expected_doublet_rate, ambient_method=settings["ambient_method"],
+                    raw_matrix_dir=raw_dir if settings["ambient_method"] == "soupx" else None, nmads=settings["nmads"],
+                    mito_gtf_path=mito_gtf_path, mito_gene_ids_override=mito_gene_ids_override, mito_source=mito_source,
+                    doubletfinder_n_pcs=settings["doubletfinder_n_pcs"], doubletfinder_cluster_resolution=settings["doubletfinder_cluster_resolution"],
+                )
+            if not success:
+                st.error("Cell-level QC failed. Details below:")
                 st.code(log)
+            else:
+                st.success("✅ Cell-level QC completed.")
+                with st.expander("📜 Run log"):
+                    st.code(log)
 
-    qc_df = cellqc.read_cell_qc_metrics(output_dir)
-    if qc_df is not None:
-        st.markdown("---")
-        st.markdown("**📊 Results**")
-        mito_diagnostic = cellqc.read_mito_gene_diagnostic(output_dir)
-        _render_mito_diagnostic(mito_diagnostic)
-        doubletfinder_diagnostic = cellqc.read_doubletfinder_diagnostic(output_dir)
-        _render_doubletfinder_diagnostic(cellqc.diagnose_doubletfinder_result(doubletfinder_diagnostic))
+        # --- pass align_dir/available_samples/select_key so the inline
+        # sample-switcher renders, and all_sample_names so the "All
+        # Samples Overview" renders directly above it (2026-09-09) --
+        # see _render_cellqc_results_for_sample()'s own docstring for
+        # the full rationale.
+        completed_samples = _list_completed_cellqc_samples(align_dir, sample_names)
+        _render_cellqc_results_for_sample(
+            sample_name, output_dir, mito_gtf_path, settings["doublet_method"], settings["ambient_method"],
+            align_dir=align_dir, available_samples=completed_samples, select_key="sc_cellqc_sample_select",
+            all_sample_names=sample_names,
+        )
 
-        summary = cellqc.summarize_cellqc_results(qc_df)
-        if summary:
-            st.markdown(summary["messages"]["adaptive_qc"])
-            st.markdown(summary["messages"]["doublet"])
-            st.markdown(summary["messages"]["ambient"])
-        thresholds = cellqc.read_qc_thresholds(output_dir)
-        if thresholds:
-            st.caption(f"Adaptive thresholds used: total counts > {thresholds.get('sum_lower', 0):.0f}, genes detected > {thresholds.get('detected_lower', 0):.0f}, mitochondrial % < {thresholds.get('mito_upper', 0):.1f}%")
+    # -------------------------------------------------------------
+    # BATCH MODE (new)
+    # -------------------------------------------------------------
+    else:
+        eligible_samples = [
+            s for s in sample_names
+            if os.path.isdir(star.filtered_counts_matrix_dir(os.path.join(align_dir, s, f"{s}_")))
+        ]
+        if not eligible_samples:
+            st.error("⚠️ No samples have a completed STARsolo filtered matrix yet -- complete Step 6 first.")
+            return
 
-        pk_sweep_df = cellqc.read_doubletfinder_pk_sweep(output_dir)
-        if pk_sweep_df is not None and not pk_sweep_df.empty:
-            with st.expander("🔍 DoubletFinder pK parameter sweep details"):
-                st.caption("Each row is a candidate 'pK' value DoubletFinder tested; the one with the highest **BCmetric** was automatically selected and used for the final classification above.")
-                if "doubletfinder_pK_used" in qc_df.columns and not qc_df["doubletfinder_pK_used"].empty:
-                    st.caption(f"✅ Selected pK: **{qc_df['doubletfinder_pK_used'].iloc[0]}**")
-                chart_df = pk_sweep_df.copy()
-                if "pK" in chart_df.columns:
-                    chart_df["pK"] = chart_df["pK"].astype(str)
-                    chart_df = chart_df.set_index("pK")
-                if "BCmetric" in chart_df.columns:
-                    st.bar_chart(chart_df["BCmetric"])
-                st.dataframe(pk_sweep_df, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        figures = _render_cellqc_visualizations(qc_df, output_dir, doublet_method, gtf_path=mito_gtf_path)
-
-        st.markdown("---")
-        st.markdown("**📦 Download Full QC Package**")
-        st.caption("Bundles the per-cell metrics table, QC thresholds, mitochondrial-gene diagnostic, top-ambient-genes table, DoubletFinder's pK sweep (if used), a plain-text summary, and PNG copies of every plot above into a single .zip file.")
-        try:
-            zip_bytes = _build_qc_package_zip(
-                sample_name, qc_df, output_dir, mito_diagnostic, thresholds, doublet_method, ambient_method, figures,
-                gtf_path=mito_gtf_path,
-            )
-            st.download_button("📦 Download QC Package (.zip)", data=zip_bytes, file_name=f"{sample_name}_cellqc_package.zip", mime="application/zip", key="sc_cellqc_download_package_btn")
-        except Exception as e:
-            st.error(f"⚠️ Could not build the QC package: {e}")
+        selected_samples = st.multiselect(
+            "Which samples should run with the same settings?",
+            options=eligible_samples, default=eligible_samples, key="sc_cellqc_batch_samples",
+        )
+        if not selected_samples:
+            st.info("Select at least one sample above to continue.")
+            return
+        # Always check disk for already-completed runs first, so
+        # reopening this page shows prior progress immediately -- same
+        # principle as single-sample mode's own disk-based re-read (see
+        # _check_batch_cellqc_status's own docstring for the full
+        # rationale/bug this fixes).
+        if "sc_cellqc_batch_results" not in st.session_state:
+            st.session_state["sc_cellqc_batch_results"] = _check_batch_cellqc_status(align_dir, selected_samples)
 
         st.markdown("---")
-        with st.expander("📋 Full per-cell QC table"):
-            st.dataframe(qc_df, use_container_width=True, hide_index=True)
+        settings = _render_cellqc_shared_settings(project, mito_gene_ids_override, mito_source, reference_cfg.get("is_custom"))
+        if settings is None:
+            return
 
         st.markdown("---")
-        if st.button(
-            "➡️ Proceed to SC Analysis: Clustering & Cell Annotation",
-            key="sc_proceed_to_downstream_btn", type="primary",
-        ):
-            st.session_state["nav_request"] = SC_DOWNSTREAM_ANALYSIS_OPTION
-            st.rerun()
+        st.markdown("**⏱️ Expected Doublet Rate**")
+        dbr_mode = st.radio(
+            "How should the expected doublet rate be set for each sample?",
+            ["Auto-compute per sample from cells detected (recommended)", "Use one fixed rate for every sample"],
+            key="sc_cellqc_batch_dbr_mode",
+            help="A sample with more cells loaded genuinely has a higher expected doublet rate -- auto-computing per sample keeps this data-driven default correct for each sample's own cell count, rather than applying one value that's only right for one of them.",
+        )
+        fixed_dbr = None
+        if dbr_mode.startswith("Use one fixed"):
+            fixed_dbr = st.slider("Fixed expected doublet rate for all samples:", min_value=0.0, max_value=0.30, value=0.008, step=0.001, format="%.3f", key="sc_cellqc_batch_fixed_dbr")
+
+        if settings["ambient_method"] == "soupx":
+            missing_raw = [
+                s for s in selected_samples
+                if not os.path.isdir(star.counts_matrix_dir(os.path.join(align_dir, s, f"{s}_")))
+            ]
+            if missing_raw:
+                st.error(f"⚠️ SoupX requires STARsolo's raw (unfiltered) matrix -- missing for: {', '.join(missing_raw)}.")
+                return
+
+        st.markdown("---")
+        run_label = f"▶️ Run Cell-level QC on {len(selected_samples)} Sample(s)"
+        if st.button(run_label, key="sc_run_cellqc_batch_btn", type="primary"):
+            progress_bar = st.progress(0, text="Starting...")
+            batch_results = []
+
+            for i, sample_name in enumerate(selected_samples):
+                progress_bar.progress(i / len(selected_samples), text=f"Running QC {i + 1}/{len(selected_samples)}: {sample_name}...")
+
+                sample_out_dir = os.path.join(align_dir, sample_name)
+                output_prefix = os.path.join(sample_out_dir, f"{sample_name}_")
+                filtered_dir = star.filtered_counts_matrix_dir(output_prefix)
+                raw_dir = star.counts_matrix_dir(output_prefix)
+                output_dir = os.path.join(sample_out_dir, "cellqc")
+                work_dir = os.path.join(sample_out_dir, "cellqc_work")
+
+                if dbr_mode.startswith("Use one fixed"):
+                    expected_doublet_rate = fixed_dbr
+                else:
+                    cells_detected = next((r.get("Cells Detected") for r in persisted_results if r.get("Sample") == sample_name), None)
+                    expected_doublet_rate = cellqc.compute_expected_doublet_rate(cells_detected) if isinstance(cells_detected, (int, float)) else 0.008
+
+                success, log = cellqc.run_cellqc_analysis(
+                    filtered_matrix_dir=filtered_dir, output_dir=output_dir, work_dir=work_dir,
+                    doublet_method=settings["doublet_method"], simulation_mode=settings["simulation_mode"],
+                    expected_doublet_rate=expected_doublet_rate, ambient_method=settings["ambient_method"],
+                    raw_matrix_dir=raw_dir if settings["ambient_method"] == "soupx" else None, nmads=settings["nmads"],
+                    mito_gtf_path=mito_gtf_path, mito_gene_ids_override=mito_gene_ids_override, mito_source=mito_source,
+                    doubletfinder_n_pcs=settings["doubletfinder_n_pcs"], doubletfinder_cluster_resolution=settings["doubletfinder_cluster_resolution"],
+                )
+
+                if success:
+                    row = _summarize_cellqc_run_for_table(sample_name, output_dir) or {"Sample": sample_name}
+                    row["Status"] = "✅ Success"
+                else:
+                    row = {"Sample": sample_name, "Status": "❌ Failed"}
+                    with st.expander(f"Error details for {sample_name}"):
+                        st.code(log)
+                batch_results.append(row)
+
+            progress_bar.progress(1.0, text="Batch Cell-level QC complete.")
+            st.session_state["sc_cellqc_batch_results"] = batch_results
+            st.success(f"✅ Cell-level QC run complete for {len(selected_samples)} sample(s).")
+
+        batch_results = st.session_state.get("sc_cellqc_batch_results")
+        if batch_results:
+            st.markdown("---")
+            st.markdown("**📋 Batch Results Summary**")
+            st.dataframe(pd.DataFrame(batch_results), use_container_width=True, hide_index=True)
+
+            successful_samples = [r["Sample"] for r in batch_results if r.get("Status") == "✅ Success"]
+            if successful_samples:
+                st.markdown("---")
+                view_sample = st.selectbox(
+                    "View full detailed results for a specific sample:",
+                    options=successful_samples, key="sc_cellqc_batch_view_select",
+                )
+                view_output_dir = os.path.join(align_dir, view_sample, "cellqc")
+                # --- pass align_dir/available_samples/select_key so the
+                # inline sample-switcher renders, and all_sample_names
+                # so the "All Samples Overview" renders directly above
+                # it (2026-09-09) -- reuses successful_samples for the
+                # switcher, but the FULL sample_names list (all samples
+                # in the project) for the overview, so not-yet-run
+                # samples still show up there too.
+                _render_cellqc_results_for_sample(
+                    view_sample, view_output_dir, mito_gtf_path, settings["doublet_method"], settings["ambient_method"],
+                    align_dir=align_dir, available_samples=successful_samples, select_key="sc_cellqc_batch_view_select",
+                    all_sample_names=sample_names,
+                )
+
+    st.markdown("---")
+    if st.button(
+        "➡️ Proceed to SC Analysis: Clustering & Cell Annotation",
+        key="sc_proceed_to_downstream_btn", type="primary",
+    ):
+        st.session_state["nav_request"] = SC_DOWNSTREAM_ANALYSIS_OPTION
+        st.rerun()
 
 
 def _require_project_with_source_dir():

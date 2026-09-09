@@ -320,6 +320,7 @@ def _parse_experiment_package(pkg):
         layout = "unknown"
 
     exp_title = None
+    experiment_accession = exp.get("accession") if exp is not None else None
     if exp is not None:
         exp_title_el = exp.find("TITLE")
         if exp_title_el is not None and exp_title_el.text:
@@ -361,6 +362,7 @@ def _parse_experiment_package(pkg):
 
         rows.append({
             "Run": run.get("accession", "unknown"),
+            "Experiment": experiment_accession or "—",
             "LibraryStrategy": strategy,
             "LibraryLayout": layout,
             "ScientificName": organism,

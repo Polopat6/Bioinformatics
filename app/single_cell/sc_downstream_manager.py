@@ -650,6 +650,144 @@ def load_and_combine_samples(sample_specs, apply_qc_filters=True,
 
     return combined, per_sample_summary
 
+def merge_sample_level_metadata(adata, sample_metadata_df, sample_col="sample"):
+    """
+    Broadcast a per-SAMPLE metadata table (one row per unique sample --
+    e.g. condition/donor/batch) onto adata.obs, replicating each row's
+    values across every cell belonging to that sample.
+
+    --- Why this exists (2026-09-09) ---
+    A real, confirmed gap: load_and_combine_samples() only merges in
+    Phase 2's own per-cell QC flags (cell_qc_metrics.csv) -- it never
+    pulls in whatever sample-level condition/disease-state metadata
+    was already curated during Phase 1 ingestion (Step 1's own
+    metadata.csv, built from SRA characteristics or manual entry) or
+    any other project-level sample metadata. Without a REAL per-sample
+    condition column in adata.obs, Step 10's own "Experimental group/
+    condition column" dropdown had nothing valid to offer -- it could
+    only surface leftover per-CELL numeric QC columns (e.g. "sum",
+    Phase 2's own total-UMI-count column), which fails immediately
+    with a "must belong to exactly one group" error the moment it's
+    actually used, since such a column genuinely varies cell-to-cell
+    within a sample by design.
+
+    sample_metadata_df: a DataFrame with a column named EXACTLY
+        sample_col (matching adata.obs["sample"]'s own values), plus
+        one or more additional columns to merge in (e.g. "condition",
+        "donor", "batch").
+
+    Returns (adata, report) where report is a dict:
+        {"samples_matched": [str, ...],
+         "samples_not_found_in_data": [str, ...],  -- a metadata row
+             for a sample that doesn't actually exist in this dataset
+             (e.g. a typo, or a sample excluded at Step 1's combine)
+         "samples_missing_metadata": [str, ...],   -- a real sample in
+             this dataset with NO matching metadata row at all (gets
+             NaN for every new column, never a fabricated value)
+         "columns_added": [str, ...]}
+
+    Raises ValueError if sample_metadata_df has no column named
+    exactly sample_col, or if any sample appears MORE THAN ONCE in
+    sample_metadata_df (a sample must map to exactly one metadata
+    row -- ambiguous otherwise).
+    """
+    if sample_col not in sample_metadata_df.columns:
+        raise ValueError(f"Metadata table must have a column named exactly '{sample_col}'.")
+
+    dup_samples = sample_metadata_df[sample_col][sample_metadata_df[sample_col].duplicated()].unique().tolist()
+    if dup_samples:
+        raise ValueError(
+            f"Sample(s) appear more than once in the metadata table: {dup_samples} -- "
+            f"each sample must have exactly one metadata row."
+        )
+
+    meta_indexed = sample_metadata_df.set_index(sample_col)
+    data_samples = set(adata.obs[sample_col].astype(str).unique())
+    meta_samples = set(meta_indexed.index.astype(str))
+
+    samples_not_found_in_data = sorted(meta_samples - data_samples)
+    samples_missing_metadata = sorted(data_samples - meta_samples)
+    samples_matched = sorted(data_samples & meta_samples)
+
+    columns_added = [c for c in sample_metadata_df.columns if c != sample_col]
+    for col in columns_added:
+        # A sample with NO matching metadata row gets NaN -- never a
+        # silently fabricated value -- and this is explicitly reported
+        # back (samples_missing_metadata) rather than hidden.
+        adata.obs[col] = adata.obs[sample_col].astype(str).map(meta_indexed[col])
+
+    report = {
+        "samples_matched": samples_matched,
+        "samples_not_found_in_data": samples_not_found_in_data,
+        "samples_missing_metadata": samples_missing_metadata,
+        "columns_added": columns_added,
+    }
+    return adata, report
+
+
+def get_sample_level_condition_columns(adata, sample_key="sample", excluded_columns=None):
+    """
+    Return every .obs column suitable for use as an EXPERIMENTAL
+    CONDITION column (Step 10's "group/condition to compare across")
+    -- i.e. a column that is genuinely CONSTANT within every sample,
+    the same property get_sample_level_group_mapping() itself already
+    requires downstream.
+
+    --- Why this is a SEPARATE, stricter function from
+        sc_downstream_workspace.py's own _get_groupable_obs_columns()
+        (2026-09-09) ---
+    _get_groupable_obs_columns() is deliberately broad -- it's also
+    used by Step 9's pseudobulk groupby_columns multiselect, where a
+    per-CELL column like a cluster/cell_type label is a genuinely
+    valid, meaningful additional grouping dimension (combined with
+    "sample"). Step 10's condition column has a fundamentally
+    different requirement: it must describe an attribute of the
+    SAMPLE itself (e.g. "Healthy" vs. "COVID-19"), not of individual
+    cells -- a cluster/cell_type label describes the CELL, not the
+    sample's own experimental condition, and a per-cell QC metric
+    (e.g. "sum") isn't a condition at all.
+
+    Rather than maintain an ever-growing, name-based exclusion list
+    (fragile -- confirmed via a real, reported bug: "sum" wasn't on
+    the previous hardcoded exclusion list, so it was incorrectly
+    offered as a condition-column choice), this function uses a
+    general, name-INDEPENDENT rule instead: a column only qualifies if
+    it takes exactly one distinct value within every sample. A per-
+    cell QC metric that genuinely varies cell-to-cell (sum, detected,
+    doublet_score, etc.) is automatically excluded by this rule
+    regardless of its name, with no maintenance required as new QC
+    columns are added elsewhere in the pipeline.
+
+    excluded_columns: an optional set/list of column names to exclude
+        outright before even checking constancy -- callers should pass
+        the cluster_key and "cell_type" here, since those describe the
+        CELL (the thing being tested), not the sample's own condition,
+        even though they may happen to also be constant-per-sample in
+        a degenerate single-cluster-per-sample edge case.
+
+    Returns a list of column names (may be empty, if no real per-
+    sample metadata has been added to this project yet -- e.g. via
+    merge_sample_level_metadata() above).
+    """
+    if sample_key not in adata.obs.columns:
+        return []
+
+    excluded_columns = set(excluded_columns or ())
+    excluded_columns.add(sample_key)
+
+    candidates = [c for c in adata.obs.columns if c not in excluded_columns]
+
+    groupable = []
+    for c in candidates:
+        try:
+            n_unique_per_sample = adata.obs.groupby(sample_key, observed=True)[c].nunique(dropna=False)
+        except TypeError:
+            # A column with an unhashable/unusual dtype -- skip rather
+            # than crash; not a realistic condition column anyway.
+            continue
+        if (n_unique_per_sample <= 1).all():
+            groupable.append(c)
+    return groupable
 
 # ---------------------------------------------------------------------------
 # 3.1: Normalization

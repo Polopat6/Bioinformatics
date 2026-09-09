@@ -162,7 +162,7 @@ def _format_scientific_pvalue(value, sig_figs=3):
         return "< 1e-308"
     return f"{value:.{sig_figs}e}"
 WORKSPACE_KEY = "sc_downstream"
-
+EXCLUDED_CELL_TYPES_UNS_KEY = "excluded_cell_types"
 
 # ---------------------------------------------------------------------------
 # AnnData session/disk cache helpers
@@ -583,6 +583,184 @@ def _render_combine_step(project):
         _render_bitr_gene_name_fallback(project, cached_adata)
     return cached_adata if combine_done else None
   
+SAMPLE_METADATA_COLUMNS_UNS_KEY = "sample_metadata_columns"
+
+
+def _render_sample_metadata_step(project, adata):
+    st.header("Step 1b: Label Samples with Metadata")
+    with st.expander("ℹ️ What is this step, and why does it matter?", expanded=False):
+        st.markdown(
+            "**What it does:** Attaches sample-level metadata (e.g. experimental "
+            "condition, donor, batch) onto every cell belonging to that sample -- "
+            "so a column like 'condition' becomes available throughout the rest "
+            "of this workspace, exactly the same way 'sample' itself already is.\n\n"
+            "**Why it matters:** Step 9's pseudobulk export and Step 10's "
+            "compositional analysis BOTH need a real experimental condition "
+            "column to compare across (e.g. 'Healthy' vs. 'COVID-19') -- without "
+            "this step, there is nothing valid to choose from those dropdowns "
+            "yet, since Phase 2's own per-cell QC columns (e.g. 'sum', a total "
+            "UMI count) are NOT sample-level conditions and cannot be used this "
+            "way (they vary cell-to-cell, even within one sample).\n\n"
+            "**Where this metadata can come from:** if you already filled in a "
+            "metadata table during this project's Step 1 ingestion (FASTQ "
+            "ingestion + chemistry + metadata, on the 🧫 Single-cell RNA-Seq "
+            "page), you can import it directly below with one click. You can "
+            "also edit sample metadata manually, or upload a fresh file -- "
+            "whichever is easiest."
+        )
+
+    sample_key = "sample"
+    if sample_key not in adata.obs.columns:
+        st.warning("⚠️ No 'sample' column found in this dataset -- this step cannot run.")
+        return
+
+    unique_samples = sorted(adata.obs[sample_key].astype(str).unique())
+    existing_columns = list(adata.uns.get(SAMPLE_METADATA_COLUMNS_UNS_KEY, []))
+
+    if existing_columns:
+        st.success(
+            f"✅ This project currently has {len(existing_columns)} sample-level "
+            f"metadata column(s) attached: **{', '.join(existing_columns)}**."
+        )
+        preview_df = adata.obs[[sample_key] + existing_columns].drop_duplicates(subset=[sample_key])
+        preview_df = preview_df.sort_values(sample_key).reset_index(drop=True)
+        with st.expander("👀 Current sample metadata", expanded=False):
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+    else:
+        st.info(
+            "ℹ️ No sample-level metadata attached yet -- add at least a "
+            "'condition' column below before Step 10 (Compositional Analysis) "
+            "can run."
+        )
+
+    working_key = f"sc_downstream_sample_metadata_working_df_{project}"
+    if working_key not in st.session_state:
+        if existing_columns:
+            base_df = adata.obs[[sample_key] + existing_columns].drop_duplicates(subset=[sample_key])
+            base_df = base_df.sort_values(sample_key).reset_index(drop=True)
+        else:
+            base_df = pd.DataFrame({sample_key: unique_samples})
+        st.session_state[working_key] = base_df
+
+    # --- Option 1: import directly from this project's own Phase 1
+    # ingestion metadata.csv, if it exists.
+    phase1_metadata_path = scpm.metadata_path(project)
+    if os.path.isfile(phase1_metadata_path):
+        with st.expander("📥 Import from this project's own ingestion metadata (Step 1)", expanded=not bool(existing_columns)):
+            phase1_df = pd.read_csv(phase1_metadata_path)
+            st.caption(
+                f"Found `{os.path.basename(phase1_metadata_path)}` from this project's "
+                f"own Step 1 ingestion -- preview below."
+            )
+            st.dataframe(phase1_df, use_container_width=True, hide_index=True)
+            if sample_key not in phase1_df.columns:
+                st.warning(
+                    f"⚠️ This file has no column named exactly '{sample_key}' -- cannot "
+                    f"import automatically. Use manual entry or file upload below instead."
+                )
+            else:
+                importable_columns = [c for c in phase1_df.columns if c != sample_key]
+                cols_to_import = st.multiselect(
+                    "Which column(s) should be imported as sample metadata?",
+                    options=importable_columns, default=importable_columns,
+                    key="sc_downstream_sample_meta_phase1_cols",
+                )
+                if cols_to_import and st.button(
+                    "📥 Import Selected Column(s)", key="sc_downstream_sample_meta_import_phase1_btn",
+                ):
+                    import_df = phase1_df[[sample_key] + cols_to_import].drop_duplicates(subset=[sample_key])
+                    current_working = st.session_state[working_key]
+                    merged_working = current_working.merge(import_df, on=sample_key, how="outer", suffixes=("", "_imported"))
+                    for col in cols_to_import:
+                        imported_col = f"{col}_imported"
+                        if imported_col in merged_working.columns:
+                            merged_working[col] = merged_working[imported_col].combine_first(merged_working.get(col))
+                            merged_working = merged_working.drop(columns=[imported_col])
+                    st.session_state[working_key] = merged_working
+                    st.success(f"✅ Imported {len(cols_to_import)} column(s) -- review below, then save.")
+                    st.rerun()
+
+    # --- Option 2: upload a fresh CSV/TXT/XLSX file (sample + arbitrary columns).
+    with st.expander("📤 Upload a sample metadata file", expanded=False):
+        st.caption(
+            "Upload a spreadsheet with a column named exactly 'sample' (matching "
+            "this project's own sample names) plus any other columns you want "
+            "(e.g. 'condition', 'donor', 'batch')."
+        )
+        uploaded_file = st.file_uploader(
+            "Upload a metadata file:", type=["csv", "txt", "xlsx", "xls"],
+            key="sc_downstream_sample_meta_upload",
+        )
+        if uploaded_file is not None:
+            uploaded_df, error = ing.read_metadata_file(uploaded_file)
+            if error:
+                st.error(f"⚠️ {error}")
+            elif sample_key not in uploaded_df.columns:
+                st.error(f"⚠️ Uploaded file must have a column named exactly '{sample_key}'.")
+            else:
+                st.dataframe(uploaded_df, use_container_width=True, hide_index=True)
+                if st.button("📥 Merge Uploaded File", key="sc_downstream_sample_meta_upload_merge_btn"):
+                    current_working = st.session_state[working_key]
+                    merged_working = current_working.merge(uploaded_df, on=sample_key, how="outer", suffixes=("", "_uploaded"))
+                    for col in uploaded_df.columns:
+                        if col == sample_key:
+                            continue
+                        uploaded_col = f"{col}_uploaded"
+                        if uploaded_col in merged_working.columns:
+                            merged_working[col] = merged_working[uploaded_col].combine_first(merged_working.get(col))
+                            merged_working = merged_working.drop(columns=[uploaded_col])
+                    st.session_state[working_key] = merged_working
+                    st.success("✅ Merged uploaded file -- review below, then save.")
+                    st.rerun()
+
+    # --- Option 3: direct manual editing.
+    st.markdown("**✏️ Edit sample metadata directly:**")
+    working_df = st.session_state[working_key]
+    edited_df = st.data_editor(
+        working_df, use_container_width=True, hide_index=True, num_rows="fixed",
+        key="sc_downstream_sample_metadata_editor",
+        column_config={sample_key: st.column_config.TextColumn(disabled=True)},
+    )
+    st.session_state[working_key] = edited_df
+
+    with st.expander("➕ Add a new column (e.g. 'condition', 'donor', 'batch')"):
+        new_col_name = st.text_input("New column name:", key="sc_downstream_sample_meta_new_col_name")
+        if st.button("➕ Add Column", key="sc_downstream_sample_meta_add_col_btn"):
+            clean_name = new_col_name.strip()
+            if not clean_name:
+                st.error("⚠️ Enter a column name first.")
+            elif clean_name in edited_df.columns:
+                st.error(f"⚠️ A column named `{clean_name}` already exists.")
+            else:
+                new_df = edited_df.copy()
+                new_df[clean_name] = ""
+                st.session_state[working_key] = new_df
+                st.rerun()
+
+    if st.button("💾 Save Sample Metadata", key="sc_downstream_save_sample_metadata_btn", type="primary"):
+        final_df = st.session_state[working_key]
+        metadata_columns = [c for c in final_df.columns if c != sample_key]
+        if not metadata_columns:
+            st.error("⚠️ Add at least one metadata column before saving.")
+        else:
+            adata, report = dsm.merge_sample_level_metadata(adata, final_df, sample_col=sample_key)
+            all_columns = sorted(set(existing_columns) | set(metadata_columns))
+            adata.uns[SAMPLE_METADATA_COLUMNS_UNS_KEY] = all_columns
+            _save_adata_state(project, adata)
+            st.success(f"✅ Saved sample metadata -- columns now available: {', '.join(all_columns)}.")
+            if report["samples_missing_metadata"]:
+                st.warning(
+                    f"⚠️ {len(report['samples_missing_metadata'])} sample(s) in this dataset have NO "
+                    f"metadata row and will show blank/NaN values: "
+                    f"{', '.join(report['samples_missing_metadata'])}"
+                )
+            if report["samples_not_found_in_data"]:
+                st.info(
+                    f"ℹ️ {len(report['samples_not_found_in_data'])} metadata row(s) didn't match any "
+                    f"sample actually in this dataset (ignored): "
+                    f"{', '.join(report['samples_not_found_in_data'])}"
+                )
+            st.rerun()
   
 
 
@@ -1339,8 +1517,121 @@ def _render_clustering_step(project, adata, use_rep):
                     summary_df, "cluster_sizes", "sc_downstream_cluster_summary",
                     expander_label="⬇️ Download cluster size data (.csv)",
                 )
+        # --- NEW: cluster x sample breakdown (2026-09-09) -- see this
+        # function's own docstring for the full rationale.
+        _render_cluster_sample_breakdown(adata, cluster_key)
 
     return fully_current
+
+
+DEFAULT_SAMPLE_DOMINANCE_THRESHOLD = 0.7
+
+
+def _render_cluster_sample_breakdown(adata, cluster_key, sample_key="sample",
+                                      dominance_threshold=DEFAULT_SAMPLE_DOMINANCE_THRESHOLD):
+    """
+    Cross-tabulates each cluster against the 'sample' column, to help
+    distinguish a genuinely rare-but-real cell population from a
+    cluster that's actually a batch/technical artifact -- i.e. a
+    cluster composed almost entirely of cells from just ONE sample,
+    rather than being spread across many samples (and, ideally, across
+    multiple experimental conditions).
+
+    dominance_threshold: if a single sample accounts for this fraction
+        (or more) of a cluster's total cells, that cluster is flagged
+        for review. 0.7 (70%) is a reasonable starting heuristic, not a
+        hard statistical cutoff -- a project with very few samples
+        overall, or a genuinely rare cell type expected to concentrate
+        in only one condition, may reasonably trip this flag without
+        it indicating a real problem. Always cross-check a flagged
+        cluster's own marker genes (Step 8a) before concluding it's a
+        technical artifact rather than real, condition-specific
+        biology.
+
+    Renders nothing (returns immediately) if sample_key isn't present
+    in adata.obs at all (e.g. a single-sample project with no
+    meaningful cross-sample comparison to make here).
+    """
+    if sample_key not in adata.obs.columns or cluster_key not in adata.obs.columns:
+        return
+
+    n_samples_in_data = adata.obs[sample_key].nunique()
+    if n_samples_in_data <= 1:
+        return  # nothing to cross-tab against with only one sample
+
+    with st.expander("📊 Cluster x sample breakdown (checking for batch artifacts)", expanded=True):
+        st.caption(
+            "Each cluster's cells should generally be MIXED across multiple samples "
+            "(and ideally across conditions) -- a cluster made up almost entirely of "
+            "ONE sample's cells is a signal worth double-checking before treating it "
+            "as a real, reproducible cell type: it could be a residual batch effect, "
+            "or a sample-specific technical artifact (e.g. a leftover doublet "
+            "population) rather than genuine biology."
+        )
+
+        counts_df = pd.crosstab(adata.obs[cluster_key].astype(str), adata.obs[sample_key].astype(str))
+        ordered_clusters = dsm.natural_sort_unique(adata.obs[cluster_key].astype(str))
+        counts_df = counts_df.reindex(ordered_clusters)
+        proportions_df = counts_df.div(counts_df.sum(axis=1), axis=0)
+
+        flagged = []
+        for cluster in proportions_df.index:
+            row = proportions_df.loc[cluster]
+            max_sample = row.idxmax()
+            max_prop = row.max()
+            if max_prop >= dominance_threshold:
+                flagged.append({
+                    "cluster": cluster,
+                    "n_cells": int(counts_df.loc[cluster].sum()),
+                    "dominant_sample": max_sample,
+                    "fraction_from_dominant_sample": round(float(max_prop), 3),
+                })
+
+        if flagged:
+            flagged_clusters_str = ", ".join(f"{f['cluster']}" for f in flagged)
+            st.warning(
+                f"⚠️ {len(flagged)} cluster(s) are dominated (\u2265{dominance_threshold*100:.0f}%) by a "
+                f"single sample: **{flagged_clusters_str}**. Review these against Step 8a's marker "
+                f"genes before assigning them a confident cell-type label -- see the table below."
+            )
+            st.dataframe(pd.DataFrame(flagged), use_container_width=True, hide_index=True)
+        else:
+            st.success(
+                f"✅ No cluster is dominated by a single sample (using a "
+                f"{dominance_threshold*100:.0f}% threshold) -- every cluster's cells are "
+                f"reasonably mixed across multiple samples."
+            )
+
+        # Stacked bar plot: proportion of each cluster contributed by
+        # each sample -- lets a user visually scan every cluster at
+        # once, not just the ones that cross the numeric threshold above.
+        long_df = proportions_df.reset_index().melt(
+            id_vars=cluster_key if cluster_key in proportions_df.reset_index().columns else "index",
+            var_name=sample_key, value_name="proportion",
+        )
+        long_df = long_df.rename(columns={long_df.columns[0]: "cluster"})
+        sample_values = dsm.natural_sort_unique(long_df[sample_key].astype(str))
+        fig = px.bar(
+            long_df, x="cluster", y="proportion", color=sample_key,
+            category_orders={"cluster": ordered_clusters, sample_key: sample_values},
+        )
+        fig.update_layout(
+            height=450, barmode="stack", margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(type="category", categoryorder="array", categoryarray=ordered_clusters),
+        )
+        scw._render_plotly_chart(fig)
+        st.caption(
+            "💡 **How to read this:** each bar is one cluster, and each colored segment is "
+            "the fraction of that cluster's cells contributed by one sample. A bar that's "
+            "almost entirely ONE color is the same signal flagged numerically above -- "
+            "worth a closer look before finalizing that cluster's cell-type label."
+        )
+        scw._render_pdf_export(fig, "sc_downstream_cluster_sample_breakdown", "cluster_sample_breakdown")
+        scw._render_csv_download(
+            counts_df.reset_index().rename(columns={"index": "cluster"}),
+            "cluster_sample_counts", "sc_downstream_cluster_sample_breakdown",
+            expander_label="⬇️ Download cluster x sample counts (.csv)",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2089,9 +2380,35 @@ def _render_final_celltype_assignment(project, adata, cluster_key):
             "top_manual_marker": st.column_config.TextColumn("Top manual marker (from 8b)", disabled=True),
             "final_label": st.column_config.TextColumn("Final cell-type label"),
         },
-    )
+     )
+    # --- NEW: exclude specific cell-type label(s) from Step 9/10
+    # (2026-09-09) -- see this file's own "excluded cell types" patch
+    # notes for the full rationale. A stale label (e.g. renamed since
+    # the last save) is automatically dropped from the default
+    # selection below, rather than causing an error.
+    final_label_options = sorted(edited_df["final_label"].astype(str).unique())
+    default_excluded = [
+        c for c in adata.uns.get(EXCLUDED_CELL_TYPES_UNS_KEY, []) if c in final_label_options
+    ]
+    excluded_cell_types = st.multiselect(
+        "🚫 Exclude cell-type label(s) from Step 9 (Pseudobulk) & Step 10 (Compositional Analysis):",
+        options=final_label_options, default=default_excluded,
+        key="sc_downstream_excluded_cell_types",
+        help=(
+            "Cells with an excluded label are NOT removed from the dataset -- they "
+            "remain fully visible everywhere else (plots, marker exploration, "
+            "downloads). They are only filtered out of Step 9 and Step 10's own "
+            "analyses. Use this for QC-artifact 'cell types' (e.g. ambient RNA/RBC "
+            "contamination) that aren't real biological populations and would only "
+            "add noise -- or a misleading result -- to a differential-expression or "
+            "compositional comparison."
+        ),
+    )    
     current_label_map = dict(zip(edited_df["cluster"].astype(str), edited_df["final_label"].astype(str)))
-    current_params = {"labels": current_label_map, "cluster_key": cluster_key}
+    current_params = {
+        "labels": current_label_map, "cluster_key": cluster_key,
+        "excluded_cell_types": sorted(excluded_cell_types),   # <-- NEW
+    }
     is_current = scpm.check_downstream_step_current(project, "annotation", current_params)
     already_done = "cell_type" in adata.obs.columns
 
@@ -2102,11 +2419,11 @@ def _render_final_celltype_assignment(project, adata, cluster_key):
 
     if st.button("✅ Save Final Cell-Type Labels", key="sc_downstream_save_final_labels_btn", type="primary"):
         adata.obs["cell_type"] = adata.obs[cluster_key].astype(str).map(current_label_map)
+        adata.uns[EXCLUDED_CELL_TYPES_UNS_KEY] = sorted(excluded_cell_types)   # <-- NEW
         _save_adata_state(project, adata)
         scpm.save_downstream_step_recipe(project, "annotation", current_params)
         st.success("✅ Final cell-type labels saved to `adata.obs['cell_type']`.")
         st.rerun()
-
     return already_done and is_current
 
 
@@ -2196,6 +2513,23 @@ def _render_pseudobulk_step(project, adata, cluster_key):
             "unreliable pseudobulk sample even if it clears the minimum-cell "
             "threshold."
         )
+     # --- NEW: respect Step 8e's excluded cell-type list (2026-09-09)
+     # -- see this file's own "excluded cell types" patch notes for the
+     # full rationale. Rebinding `adata` here is scoped to THIS
+     # function call only -- confirmed safe since this function never
+     # calls _save_adata_state(), so the caller's own combined
+     # AnnData object is never affected.
+    excluded_cell_types = list(adata.uns.get(EXCLUDED_CELL_TYPES_UNS_KEY, []))
+    if excluded_cell_types and "cell_type" in adata.obs.columns:
+        n_before = adata.n_obs
+        adata = adata[~adata.obs["cell_type"].isin(excluded_cell_types)].copy()
+        st.info(
+            f"ℹ️ Excluding {len(excluded_cell_types)} cell-type label(s) set aside in "
+            f"Step 8e (**{', '.join(excluded_cell_types)}**) -- {n_before - adata.n_obs:,} "
+            f"of {n_before:,} cells are excluded from THIS step only; the full dataset "
+            f"itself is unaffected."
+        )
+
 
     groupable_columns = _get_groupable_obs_columns(adata)
     default_groupby = _recipe_default(project, "pseudobulk", "groupby_columns", ["sample"])
@@ -2393,16 +2727,27 @@ def _render_compositional_step(project, adata, cluster_key):
         help="'cell_type' (Step 8's final labels) is offered first if available, since it's typically more interpretable than raw cluster numbers.",
     )
 
-    candidate_condition_columns = [
-        c for c in _get_groupable_obs_columns(adata)
-        if c not in ("sample", cluster_key, "cell_type")
-    ]
+    # --- FIXED (2026-09-09): use the new, stricter
+    # dsm.get_sample_level_condition_columns() instead of the broad
+    # _get_groupable_obs_columns() -- see that function's own docstring
+    # for the full rationale. This ONLY offers a column here if it is
+    # genuinely CONSTANT within every sample (a real condition/donor/
+    # batch attribute), which is what get_sample_level_group_mapping()
+    # itself already requires further below -- so a per-cell QC metric
+    # like "sum" (which varies cell-to-cell within a sample) can never
+    # be offered here again, regardless of its name. cluster_key and
+    # "cell_type" are explicitly excluded too, since those describe the
+    # CELL being tested, not the sample's own experimental condition.
+    candidate_condition_columns = dsm.get_sample_level_condition_columns(
+        adata, sample_key="sample", excluded_columns={cluster_key, "cell_type"},
+    )
     if not candidate_condition_columns:
         st.warning(
-            "⚠️ No candidate condition/group column found in this dataset's metadata "
-            "besides 'sample' and cluster/cell-type columns -- compositional analysis "
-            "requires an experimental group column (e.g. 'condition') carried through "
-            "from each sample's original metadata."
+            "⚠️ No sample-level condition/group column found yet in this dataset's "
+            "metadata -- compositional analysis requires a real per-sample "
+            "experimental condition column (e.g. 'condition': Healthy vs. "
+            "COVID-19). Complete **Step 1b (Label Samples with Metadata)** "
+            "above to add one before this step can run."
         )
         return False
 
@@ -2580,6 +2925,16 @@ def render():
     adata = _render_combine_step(project)
     if adata is None:
         return
+
+    # --- NEW: Step 1b -- Label Samples with Metadata (2026-09-09) --
+    # see _render_sample_metadata_step()'s own docstring for the full
+    # rationale. Placed here (immediately after Combine succeeds, before
+    # Normalization) since every later step -- including Step 9's
+    # pseudobulk export and Step 10's compositional analysis -- can
+    # benefit from a real per-sample condition column being available
+    # as early as possible.
+    st.markdown("---")
+    _render_sample_metadata_step(project, adata)
 
     st.markdown("---")
     normalize_ready = _render_normalize_step(project, adata)

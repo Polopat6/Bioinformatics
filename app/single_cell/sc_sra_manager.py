@@ -755,6 +755,221 @@ def scan_pending_unfinalized_runs(project_fastq_dir):
     return pending
 
 
+_MATCH_BASIS_CONFIDENCE = {
+    "GEOAccession": "high",
+    "Experiment": "high",
+    "SampleTitle": "low",
+}
+
+
+def _group_key_priority(row):
+    """
+    Return an ordered list of (match_basis, group_key) candidates for a
+    single SRA metadata row (as returned by sra.lookup_multiple_
+    accessions() / sra.lookup_accession()), from strongest to weakest
+    same-biological-sample identity signal. Used by
+    detect_multi_run_sample_groups() below.
+    """
+    candidates = []
+    geo = (row.get("GEOAccession") or "").strip()
+    if geo:
+        candidates.append(("GEOAccession", geo))
+    experiment = (row.get("Experiment") or "").strip()
+    if experiment and experiment != "—":
+        candidates.append(("Experiment", experiment))
+    title = (row.get("SampleTitle") or "").strip()
+    if title:
+        candidates.append(("SampleTitle", title))
+    return candidates
+
+
+def detect_multi_run_sample_groups(rows, requested_accessions=None):
+    """
+    Given SRA metadata rows (the same shape returned by
+    sra_manager.lookup_multiple_accessions() / lookup_accession(), once
+    PART 1's "Experiment" field is added), detect which runs likely
+    belong to the SAME biological sample and should therefore be merged
+    as multiple lanes of one sample_name (via finalize_role_
+    assignment()'s existing multi-file-per-role lane-numbering support)
+    rather than being treated as separate samples.
+
+    Grouping is attempted using the STRONGEST available identity signal
+    for each row, in priority order:
+
+      1. GEOAccession (GSM) -- the most reliable cross-experiment
+         "same biological sample" signal for GEO-derived datasets.
+         Multiple SRX experiments deposited for one GSM sample (e.g. a
+         sample resequenced or split across separate SRA experiment
+         submissions -- the confirmed real-world pattern in GSE166992)
+         all still point back to the same SAMPLE/GSM element.
+      2. Experiment (SRX) -- multiple runs registered under ONE
+         experiment/library (a single EXPERIMENT_PACKAGE's own
+         RUN_SET/RUN can list more than one run) are guaranteed to be
+         the same sequenced library, even for non-GEO datasets with no
+         GSM at all.
+      3. SampleTitle -- a much weaker fallback (free-text, so only an
+         EXACT match is used, and even then flagged "low" confidence)
+         for datasets with neither a GEO accession nor a shared
+         experiment accession.
+
+    A row is claimed by the FIRST (highest-priority) tier it matches
+    another row on; it is never double-counted across tiers. A row
+    that matches nothing is left as its own singleton -- i.e. today's
+    existing 1-run-1-sample behavior, unchanged.
+
+    requested_accessions, if given (e.g. the exact list of Run
+    accessions the user actually pasted/uploaded), is used only to flag
+    -- via "includes_unrequested_runs" -- when a detected group contains
+    a sibling run the user did NOT originally ask for. This is a real,
+    expected possibility: NCBI's own efetch response for an
+    EXPERIMENT_PACKAGE includes EVERY run in that experiment's RUN_SET
+    regardless of which specific run accession was searched for, so a
+    sibling run can legitimately surface here even if the user only
+    pasted one of the two. This must always be surfaced to the user for
+    confirmation, never silently auto-included.
+
+    Returns a dict:
+        {
+          "groups": [
+              {
+                  "group_key": str,
+                  "match_basis": "GEOAccession" | "Experiment" | "SampleTitle",
+                  "confidence": "high" | "low",
+                  "runs": [run_accession, ...],   # sorted, stable order
+                  "suggested_sample_name": str,
+                  "includes_unrequested_runs": bool,
+              },
+              ...   # only groups with 2+ runs are included
+          ],
+          "singletons": [run_accession, ...],   # no detected match
+        }
+    """
+    requested_set = set(requested_accessions) if requested_accessions is not None else None
+
+    by_basis = {"GEOAccession": {}, "Experiment": {}, "SampleTitle": {}}
+    row_by_run = {}
+    for row in rows:
+        run = row.get("Run")
+        if not run:
+            continue
+        row_by_run[run] = row
+        for basis, key in _group_key_priority(row):
+            by_basis[basis].setdefault(key, []).append(run)
+
+    grouped_runs = set()
+    groups = []
+
+    for basis in ("GEOAccession", "Experiment", "SampleTitle"):
+        for key, runs in by_basis[basis].items():
+            # Only runs not already claimed by a HIGHER-priority tier
+            # are eligible here, and only 2+ *remaining* runs form a
+            # real multi-run group.
+            remaining = [r for r in dict.fromkeys(runs) if r not in grouped_runs]
+            if len(remaining) < 2:
+                continue
+
+            remaining_sorted = sorted(remaining)
+            grouped_runs.update(remaining_sorted)
+
+            geo_for_name = row_by_run[remaining_sorted[0]].get("GEOAccession") or ""
+            suggested_name = geo_for_name.strip() or key or remaining_sorted[0]
+
+            includes_unrequested = (
+                requested_set is not None
+                and any(r not in requested_set for r in remaining_sorted)
+            )
+
+            groups.append({
+                "group_key": key,
+                "match_basis": basis,
+                "confidence": _MATCH_BASIS_CONFIDENCE[basis],
+                "runs": remaining_sorted,
+                "suggested_sample_name": suggested_name,
+                "includes_unrequested_runs": includes_unrequested,
+            })
+
+    singletons = sorted(r for r in row_by_run if r not in grouped_runs)
+
+    return {"groups": groups, "singletons": singletons}
+
+
+def build_accession_to_sample_name(detected, confirmed_group_names=None,
+                                    manual_singleton_names=None,
+                                    manual_group_overrides=None):
+    """
+    Turn detect_multi_run_sample_groups()'s output into the final
+    accession -> sample_name mapping to pass into
+    download_and_classify_runs_parallel() (and, downstream,
+    finalize_role_assignment()) -- AFTER the user has reviewed and
+    confirmed (or overridden) the detected grouping in the UI.
+
+    confirmed_group_names: optional {group_key: sample_name} overriding
+        a detected group's own suggested_sample_name (e.g. the user
+        edited the auto-suggested name in the UI).
+
+    manual_singleton_names: optional {run_accession: sample_name} for
+        runs left as singletons -- default is sample_name == run
+        accession (today's existing 1:1 behavior); this allows override.
+
+    manual_group_overrides: optional list of run-accession lists the
+        user manually grouped together in the UI -- this is the
+        "manual override allowing users to indicate that multiple
+        FASTQ files represent different lanes of a single sample" from
+        the original design notes, for cases auto-detection misses
+        entirely (e.g. two runs sharing none of the three identity
+        signals above). e.g. [["SRR1", "SRR2"]]. Each inner list's runs
+        are merged under one sample_name, taken from
+        confirmed_group_names keyed by a synthetic "manual:<i>" key, or
+        defaulting to the first (sorted) run's own accession.
+
+    Every run accession from `detected` (groups + singletons) MUST
+    appear in the returned mapping exactly once, unless it was moved
+    into a manual_group_overrides group instead. This function performs
+    a completeness check and raises ValueError if any run ends up
+    unmapped -- a silently-dropped accession would mean a real sample's
+    data never gets downloaded/finalized at all, which must never
+    happen quietly.
+    """
+    confirmed_group_names = confirmed_group_names or {}
+    manual_singleton_names = manual_singleton_names or {}
+    manual_group_overrides = manual_group_overrides or []
+
+    mapping = {}
+    manually_placed = set()
+
+    for i, run_list in enumerate(manual_group_overrides):
+        synthetic_key = f"manual:{i}"
+        sample_name = confirmed_group_names.get(synthetic_key) or sorted(run_list)[0]
+        for run in run_list:
+            mapping[run] = sample_name
+            manually_placed.add(run)
+
+    for group in detected.get("groups", []):
+        sample_name = confirmed_group_names.get(group["group_key"], group["suggested_sample_name"])
+        for run in group["runs"]:
+            if run in manually_placed:
+                continue
+            mapping[run] = sample_name
+
+    for run in detected.get("singletons", []):
+        if run in manually_placed:
+            continue
+        mapping[run] = manual_singleton_names.get(run, run)
+
+    all_known_runs = set(mapping) | manually_placed
+    expected_runs = set(detected.get("singletons", []))
+    for group in detected.get("groups", []):
+        expected_runs.update(group["runs"])
+    missing = expected_runs - all_known_runs
+    if missing:
+        raise ValueError(
+            f"The following run accession(s) were not assigned a sample_name and would be "
+            f"silently skipped: {sorted(missing)}. This should never happen -- please report it."
+        )
+
+    return mapping
+
+
 def download_and_classify_run(accession, project_fastq_dir, sample_name, threads=4,
                                subprocess_runner=None, force_redownload=False,
                                max_size=DEFAULT_PREFETCH_MAX_SIZE):

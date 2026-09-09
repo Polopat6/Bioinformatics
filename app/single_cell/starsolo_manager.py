@@ -52,6 +52,37 @@ ADAPTER_SEQUENCE_KEYS_R1/R2 already uses for exactly this kind of
 not-fully-confirmed-schema situation. If none of the candidate keys
 match on a real run, this returns None rather than silently guessing --
 callers must handle that case (see singlecell_workspace.py's Step 6).
+
+--- --soloBarcodeReadLength 0 fix for symmetric-length sequencing runs
+    (2026-09-02) ---
+A real, confirmed production failure: STARsolo, by default, strictly
+validates that the barcode read's (R1's) TOTAL sequenced length exactly
+equals soloCBlen + soloUMIlen, and raises a FATAL ERROR and exits
+immediately if it doesn't -- confirmed directly via a real run on
+SRR13734384 (part of the Thompson et al. 2021 COVID PBMC dataset,
+GSE166992), which failed with: "the total length of barcode sequence is
+150 not equal to expected 26". This is NOT a data-quality problem or a
+misconfigured chemistry/whitelist choice -- it is the well-documented,
+common real-world sequencing-core practice of running BOTH R1 and R2 at
+a single, uniform read length (150bp here) regardless of what each read
+type actually needs biologically. For 10x 5' chemistries specifically,
+the true barcode+UMI information is confirmed to still only occupy the
+FIRST 26bp of that 150bp R1 read (16bp cell barcode + 10bp UMI for 5'
+v1.1/v2) -- the remaining ~124bp per read is simply unused sequencing
+overrun that STARsolo is fully capable of ignoring, but only if told to
+skip its own default strict-length-equality check.
+
+Fixed by always passing STARsolo's own documented
+--soloBarcodeReadLength 0 flag (per STARsolo's own error message:
+"To avoid checking of barcode read length, specify
+--soloBarcodeReadLength 0"), which disables that check entirely and
+lets STARsolo correctly read only the first soloCBlen+soloUMIlen bases
+of R1 regardless of that read's own total sequenced length. This is
+always safe to pass unconditionally (not just for known-symmetric-length
+datasets) -- for a dataset where R1's length already exactly matches
+soloCBlen+soloUMIlen, this flag is a harmless no-op, since there is
+nothing beyond that length for STARsolo to encounter or need to ignore
+in the first place.
 """
 import csv
 import os
@@ -112,6 +143,15 @@ def build_starsolo_command(genome_dir, r1_files, r2_files, whitelist_path, cb_le
         "--soloCBwhitelist", wl_arg,
         "--soloCBstart", "1", "--soloCBlen", str(cb_len),
         "--soloUMIstart", str(cb_len + 1), "--soloUMIlen", str(umi_len),
+        # --soloBarcodeReadLength 0 (2026-09-02): disables STARsolo's own
+        # default strict check that R1's TOTAL length must exactly equal
+        # soloCBlen+soloUMIlen. Real, confirmed-necessary fix for
+        # symmetric-length sequencing runs (e.g. R1 sequenced at 150bp
+        # even though only the first 26bp is real barcode+UMI data) --
+        # see module docstring's own "--soloBarcodeReadLength 0 fix"
+        # section for the full rationale. Always safe to pass: a no-op
+        # when R1's length already matches exactly.
+        "--soloBarcodeReadLength", "0",
         "--soloStrand", strand_flag,
         "--soloCellFilter", CELL_FILTER_OPTIONS[cell_filter]["starsolo_flag"],
         "--soloFeatures", "Gene",
