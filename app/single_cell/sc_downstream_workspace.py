@@ -2557,6 +2557,16 @@ def _render_pseudobulk_step(project, adata, cluster_key):
         "Minimum cells required per group (groups below this are excluded):",
         min_value=1, max_value=1000, value=int(default_min_cells),
         key="sc_downstream_pb_min_cells",
+        help=(
+            "A pseudobulk 'sample' built from very few cells is a noisy, unreliable stand-in "
+            "for that sample/cell-type's true expression profile -- summing counts from just a "
+            "handful of cells barely differs from that handful's own individual noise. 10 (the "
+            "default) is a reasonable, conservative floor for typical droplet-based scRNA-seq. "
+            "Consider raising it (e.g. 20-50) if you have plenty of cells to spare and want "
+            "higher-confidence pseudobulk samples, or lowering it only if aggregating by sample "
+            "+ cell type would otherwise exclude a genuinely rare-but-important population "
+            "entirely -- check the group-size preview table below before deciding."
+        ),
     )
 
     with st.expander("👀 Preview group sizes before aggregating", expanded=True):
@@ -2581,6 +2591,12 @@ def _render_pseudobulk_step(project, adata, cluster_key):
         st.error("⚠️ No raw 'counts' layer found -- this should have been set automatically in Step 1 (Combine Samples).")
         return False
     layer = layer_options[0]
+    st.caption(
+        "ℹ️ Pseudobulk aggregation always sums RAW (unnormalized) counts -- never Step 2's "
+        "log-normalized values -- because DESeq2 requires true integer counts as input; it "
+        "models the raw count distribution directly and performs its own size-factor "
+        "normalization internally as part of that model."
+    )
 
     current_params = {
         "groupby_columns": sorted(groupby_columns), "min_cells": int(min_cells), "layer": layer,
@@ -2637,6 +2653,13 @@ def _render_pseudobulk_step(project, adata, cluster_key):
         export_name = st.text_input(
             "Export name:", key="sc_downstream_pb_export_name",
             placeholder="e.g. by_sample_and_celltype",
+            help=(
+                "Becomes a folder name under this project's own storage, containing "
+                "'pseudobulk_counts.csv' and 'pseudobulk_metadata.csv' -- the exact files you'll "
+                "upload as the counts matrix and sample sheet in the Bulk RNA-Seq pipeline's own "
+                "DESeq2 workflow. Use a descriptive name if you plan to export more than one "
+                "grouping from this project (e.g. 'by_sample' vs. 'by_sample_and_celltype')."
+            ),
         )
         if st.button("💾 Save Pseudobulk Export", key="sc_downstream_pb_save_export_btn"):
             if not export_name.strip():
@@ -2727,17 +2750,6 @@ def _render_compositional_step(project, adata, cluster_key):
         help="'cell_type' (Step 8's final labels) is offered first if available, since it's typically more interpretable than raw cluster numbers.",
     )
 
-    # --- FIXED (2026-09-09): use the new, stricter
-    # dsm.get_sample_level_condition_columns() instead of the broad
-    # _get_groupable_obs_columns() -- see that function's own docstring
-    # for the full rationale. This ONLY offers a column here if it is
-    # genuinely CONSTANT within every sample (a real condition/donor/
-    # batch attribute), which is what get_sample_level_group_mapping()
-    # itself already requires further below -- so a per-cell QC metric
-    # like "sum" (which varies cell-to-cell within a sample) can never
-    # be offered here again, regardless of its name. cluster_key and
-    # "cell_type" are explicitly excluded too, since those describe the
-    # CELL being tested, not the sample's own experimental condition.
     candidate_condition_columns = dsm.get_sample_level_condition_columns(
         adata, sample_key="sample", excluded_columns={cluster_key, "cell_type"},
     )
@@ -2754,6 +2766,12 @@ def _render_compositional_step(project, adata, cluster_key):
     group_column = st.selectbox(
         "Experimental group/condition column to compare across:",
         options=candidate_condition_columns, key="sc_downstream_comp_group_column",
+        help=(
+            "The sample-level metadata column defining the groups being compared (e.g. "
+            "'condition': Healthy vs. COVID-19). Only columns that are genuinely constant "
+            "within every sample are offered here -- if the column you expected isn't listed, "
+            "add or edit sample metadata in Step 1b first."
+        ),
     )
 
     sample_key = "sample"
@@ -2763,25 +2781,87 @@ def _render_compositional_step(project, adata, cluster_key):
         st.error(f"⚠️ {e}")
         return False
 
-    with st.expander("📊 Composition overview (stacked bar plot)", expanded=True):
-        barplot_df = dsm.get_composition_barplot_data(proportions_df)
-        fig = px.bar(
-            barplot_df, x="sample", y="proportion", color="cluster",
-            labels={"cluster": cell_type_key},
-        )
-        fig.update_layout(height=450, barmode="stack", margin=dict(l=10, r=10, t=30, b=10))
-        scw._render_plotly_chart(fig)
-        scw._render_pdf_export(fig, "sc_downstream_composition_barplot", "composition_barplot")
-        scw._render_csv_download(
-            barplot_df, "composition_proportions", "sc_downstream_composition_barplot",
-            expander_label="⬇️ Download composition data (.csv)",
-        )
-
+    # --- MOVED UP (2026-09-09): sample_group_df is now computed here,
+    # BEFORE the stacked bar plot below, so the plot can use it to
+    # label/facet samples by condition. Previously this was computed
+    # further down, after the plot had already been rendered.
     try:
         sample_group_df = dsm.get_sample_level_group_mapping(adata, sample_key, group_column)
     except ValueError as e:
         st.error(f"⚠️ {e}")
         return False
+
+    with st.expander("📊 Composition overview (stacked bar plot)", expanded=True):
+        barplot_df = dsm.get_composition_barplot_data(proportions_df)
+
+        # --- NEW (2026-09-09): merge in each sample's condition/group
+        # and facet the plot by it, so it's immediately obvious which
+        # samples belong to which condition -- no need to cross-
+        # reference a separate table anymore. See this patch's own
+        # module-level docstring for the full rationale; validated via
+        # test_composition_condition_merge.py (clean 1:1 merge, no
+        # duplicated/dropped rows, every sample maps to exactly one
+        # condition).
+        barplot_df = barplot_df.merge(sample_group_df, on=sample_key, how="left")
+
+        # --- FIXED (2026-09-09): a real, confirmed bug in the FIRST
+        # version of this fix -- passing a GLOBAL category_orders for
+        # the sample axis (spanning ALL 15 samples) forces Plotly to
+        # apply that SAME category list to EVERY facet's x-axis, even
+        # though each facet only actually has a handful of those
+        # samples. This produced a confirmed, reported visual bug: the
+        # "Healthy" facet showed 11 blank, empty category slots for
+        # COVID-19 samples it doesn't have, and vice versa --
+        # fig.update_xaxes(matches=None) only unlinks zoom/pan
+        # behavior between the two facets' axes, it does NOT stop them
+        # from sharing that global category list.
+        #
+        # Fixed by NOT passing category_orders for the sample axis at
+        # all -- instead, the dataframe itself is pre-sorted into
+        # natural sample order, and Plotly Express's own DEFAULT
+        # per-facet-subplot behavior (deriving each facet's category
+        # axis only from the rows actually present in that facet) then
+        # produces the correct result: each facet shows ONLY its own
+        # samples, in the right order, with no blank slots. Validated
+        # directly via test_facet_sort_fix.py (each facet's own sample
+        # list is correctly ordered, with zero cross-contamination
+        # between facets).
+        sample_order_all = dsm.natural_sort_unique(barplot_df[sample_key].astype(str))
+        sample_rank = {s: i for i, s in enumerate(sample_order_all)}
+        barplot_df = barplot_df.sort_values(
+            by=sample_key, key=lambda col: col.astype(str).map(sample_rank),
+        ).reset_index(drop=True)
+
+        fig = px.bar(
+            barplot_df, x=sample_key, y="proportion", color="cluster",
+            facet_col=group_column, facet_col_spacing=0.04,
+            labels={"cluster": cell_type_key, sample_key: "Sample"},
+        )
+        # Each facet's x-axis is independent by default once no GLOBAL
+        # category_orders is specified for the sample dimension -- this
+        # additionally frees each facet's zoom/pan to move
+        # independently of the other, which is also desirable here
+        # (e.g. zooming into the smaller Healthy panel shouldn't move
+        # the COVID-19 panel's own view).
+        fig.update_xaxes(matches=None)
+        # Plotly Express's own default facet-title text is
+        # "condition=Healthy" -- strip the "condition=" prefix so each
+        # panel's header just reads the condition value itself (e.g.
+        # "Healthy"), which is clearer for a non-technical viewer.
+        fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+        fig.update_layout(height=450, barmode="stack", margin=dict(l=10, r=10, t=30, b=10))
+        scw._render_plotly_chart(fig)
+        st.caption(
+            "💡 Samples are now split into one panel per condition (matching your "
+            f"'{group_column}' selection above) -- each panel's header shows the condition, "
+            "so you can compare cell-type composition WITHIN and BETWEEN conditions at a "
+            "glance, without needing to cross-reference sample names against another table."
+        )
+        scw._render_pdf_export(fig, "sc_downstream_composition_barplot", "composition_barplot")
+        scw._render_csv_download(
+            barplot_df, "composition_proportions", "sc_downstream_composition_barplot",
+            expander_label="⬇️ Download composition data (.csv)",
+        )
 
     method_keys = list(dsm.COMPOSITIONAL_METHOD_OPTIONS.keys())
     default_method = _recipe_default(project, "compositional", "method", dsm.DEFAULT_COMPOSITIONAL_METHOD)
@@ -2816,11 +2896,43 @@ def _render_compositional_step(project, adata, cluster_key):
     if method == "propeller":
         col1, col2, col3 = st.columns(3)
         with col1:
-            transform = st.radio("Transform:", ["logit", "asin"], key="sc_downstream_comp_transform", horizontal=True)
+            transform = st.radio(
+                "Transform:", ["logit", "asin"], key="sc_downstream_comp_transform", horizontal=True,
+                help=(
+                    "Proportions are bounded between 0 and 1, which violates the assumptions of "
+                    "the underlying linear model -- both options re-scale proportions onto an "
+                    "unbounded numeric range before testing. **logit** (recommended default) "
+                    "works well for most cell types, but can behave oddly for one sitting very "
+                    "close to 0% or 100% in some samples. **asin** (arcsine-square-root) is the "
+                    "classic variance-stabilizing transform for proportions and tends to be more "
+                    "stable at those extremes, at a small cost to statistical power for cell "
+                    "types in the middle of the range."
+                ),
+            )
         with col2:
-            robust = st.checkbox("Robust variance estimation", value=True, key="sc_downstream_comp_robust")
+            robust = st.checkbox(
+                "Robust variance estimation", value=True, key="sc_downstream_comp_robust",
+                help=(
+                    "When checked (recommended), uses a robust regression method that limits how "
+                    "much any ONE outlier sample can distort a cell type's estimated variance -- "
+                    "so a single unusual sample doesn't dominate the result. Especially valuable "
+                    "when you have only a small number of samples, where one outlier otherwise "
+                    "carries disproportionate weight."
+                ),
+            )
         with col3:
-            trend = st.checkbox("Fit mean-variance trend", value=False, key="sc_downstream_comp_trend")
+            trend = st.checkbox(
+                "Fit mean-variance trend", value=False, key="sc_downstream_comp_trend",
+                help=(
+                    "When checked, explicitly models the relationship between how variable a "
+                    "cell type's proportion is and how common that cell type is on average (rarer "
+                    "cell types are naturally noisier) -- borrowing extra statistical strength "
+                    "across cell types, similar in spirit to how RNA-seq tools like limma-voom "
+                    "borrow information across genes at different expression levels. Off by "
+                    "default; worth enabling if you have many cell types spanning a wide range "
+                    "of abundances (e.g. very common T cells alongside very rare pDCs)."
+                ),
+            )
 
     current_params = {
         "method": method, "cell_type_key": cell_type_key, "group_column": group_column,

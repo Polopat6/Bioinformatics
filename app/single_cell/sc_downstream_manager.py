@@ -179,6 +179,7 @@ dropdown, Step 7's embedding legend ordering).
 """
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -2171,6 +2172,75 @@ write.csv(props_out, file.path(job$output_dir, "propeller_proportions.csv"), row
 
 cat("propeller analysis completed successfully.\n")
 '''
+def _sanitize_r_level_name(label):
+    """
+    Convert an arbitrary group/condition label into a syntactically
+    valid R name, closely replicating R's own make.names() rules --
+    see this patch's own module-level docstring, "The fix", for the
+    full rationale (a real, confirmed bug: a label like "COVID-19"
+    breaks propeller's design-matrix/makeContrasts step, since R
+    requires every name used that way to be a valid R identifier).
+
+    Any character outside [A-Za-z0-9_.] is replaced with a dot, and a
+    result that doesn't already start with a letter gets an "X"
+    prepended (matching R's own make.names() behavior for e.g. a label
+    starting with a digit).
+    """
+    s = str(label)
+    s = re.sub(r"[^A-Za-z0-9_.]", ".", s)
+    if not re.match(r"^[A-Za-z]", s):
+        s = "X" + s
+    return s
+
+
+def _build_sanitized_group_mapping(original_labels):
+    """
+    Build {original_label: sanitized_label} for every DISTINCT group
+    label in original_labels (order-preserving, de-duplicated).
+
+    Raises ValueError if two DISTINCT original labels sanitize to the
+    SAME value -- an ambiguous collision that must be surfaced clearly
+    and immediately (before ever invoking R), rather than silently
+    auto-uniquified (as R's own make.names() would do internally) or
+    left to surface as a confusing downstream R/statistical error.
+    """
+    deduped_labels = list(dict.fromkeys(str(l) for l in original_labels))
+    mapping = {}
+    sanitized_seen = {}
+    for label in deduped_labels:
+        sanitized = _sanitize_r_level_name(label)
+        if sanitized in sanitized_seen and sanitized_seen[sanitized] != label:
+            raise ValueError(
+                f"Group labels '{sanitized_seen[sanitized]}' and '{label}' both reduce to the "
+                f"same R-safe name '{sanitized}' -- rename one of these condition values in "
+                f"Step 1b's sample metadata to avoid this ambiguous collision."
+            )
+        sanitized_seen[sanitized] = label
+        mapping[label] = sanitized
+    return mapping
+
+
+def _reverse_map_column_names(columns, sanitized_to_original):
+    """
+    Restore every ORIGINAL (unsanitized) group label back into a list
+    of output column names, wherever a sanitized label appears as a
+    substring (e.g. propeller's own "PropMean.COVID.19" -> "PropMean.
+    COVID-19"). Sanitized labels are checked LONGEST-FIRST, so a
+    shorter sanitized label can never accidentally partial-match
+    inside a longer one before the correct, longer match is tried.
+
+    Columns containing no sanitized label at all (e.g. "cluster",
+    "Tstatistic", "FDR") are returned completely unchanged.
+    """
+    ordered_pairs = sorted(sanitized_to_original.items(), key=lambda kv: -len(kv[0]))
+    new_columns = []
+    for col in columns:
+        new_col = col
+        for sanitized, original in ordered_pairs:
+            if sanitized in new_col:
+                new_col = new_col.replace(sanitized, original)
+        new_columns.append(new_col)
+    return new_columns
 
 
 def run_propeller_analysis(adata, sample_key, cluster_key, group_column,
@@ -2200,13 +2270,29 @@ def run_propeller_analysis(adata, sample_key, cluster_key, group_column,
     if not replication_check["is_valid"]:
         return False, replication_check["message"]
 
+    # --- R-safe group-label sanitization fix (2026-09-09) -- see this
+    # module's own docstring, "sanitize R-invalid group labels", for
+    # the full rationale (a real, confirmed bug: a label like
+    # "COVID-19" breaks propeller's design-matrix/makeContrasts step,
+    # since R requires every name used that way to be a valid R
+    # identifier). Collisions are checked FIRST and raised as a clear,
+    # actionable error before ever invoking R.
+    try:
+        original_to_sanitized = _build_sanitized_group_mapping(sample_group_df["group"].unique())
+    except ValueError as e:
+        return False, str(e)
+    sanitized_to_original = {v: k for k, v in original_to_sanitized.items()}
+
+    sample_group_df_for_r = sample_group_df.copy()
+    sample_group_df_for_r["group"] = sample_group_df_for_r["group"].map(original_to_sanitized)
+
     cell_level_df = adata.obs[[sample_key, cluster_key]].rename(
         columns={sample_key: "sample", cluster_key: "cluster"}
     )
     cell_level_path = os.path.join(work_dir, "propeller_cell_level.csv")
     sample_group_path = os.path.join(work_dir, "propeller_sample_group.csv")
     cell_level_df.to_csv(cell_level_path, index=False)
-    sample_group_df.to_csv(sample_group_path, index=False)
+    sample_group_df_for_r.to_csv(sample_group_path, index=False)  # sanitized labels only
 
     job_spec = {
         "cell_level_path": os.path.abspath(cell_level_path),
@@ -2227,11 +2313,25 @@ def run_propeller_analysis(adata, sample_key, cluster_key, group_column,
     cmd = ["Rscript", r_script_path, job_spec_path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
-        return True, result.stdout + result.stderr
+        log = result.stdout + result.stderr
     except subprocess.CalledProcessError as e:
         return False, f"propeller analysis failed: {(e.stdout or '') + (e.stderr or '')}"
     except subprocess.TimeoutExpired:
         return False, f"propeller analysis timed out after {timeout // 60} minutes."
+
+    # --- Restore original (unsanitized) group labels in the output
+    # (2026-09-09) -- the R script itself only ever sees/writes the
+    # sanitized labels; this restores "COVID.19" back to "COVID-19"
+    # (etc.) in propeller's own results CSV so anything reading it
+    # afterward (read_propeller_results(), the UI) sees the labels the
+    # user actually entered, not R's sanitized versions.
+    results_path = os.path.join(output_dir, "propeller_results.csv")
+    if os.path.isfile(results_path):
+        results_df = pd.read_csv(results_path)
+        results_df.columns = _reverse_map_column_names(list(results_df.columns), sanitized_to_original)
+        results_df.to_csv(results_path, index=False)
+
+    return True, log
 
 
 def read_propeller_results(output_dir):
