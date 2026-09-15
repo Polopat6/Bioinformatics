@@ -1,0 +1,23 @@
+{
+  "ollama_chat/bio-coder-7b": {
+    "max_tokens": 16384,
+    "max_input_tokens": 12000,
+    "max_output_tokens": 4096,
+    "litellm_provider": "ollama_chat",
+    "mode": "chat"
+  },
+  "ollama_chat/uiux-designer-7b": {
+    "max_tokens": 16384,
+    "max_input_tokens": 12000,
+    "max_output_tokens": 4096,
+    "litellm_provider": "ollama_chat",
+    "mode": "chat"
+  },
+  "ollama_chat/doc-explainer-7b": {
+    "max_tokens": 16384,
+    "max_input_tokens": 12000,
+    "max_output_tokens": 4096,
+    "litellm_provider": "ollama_chat",
+    "mode": "chat"
+  }
+}

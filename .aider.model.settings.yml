@@ -1,0 +1,17 @@
+- name: ollama_chat/bio-coder-7b
+  edit_format: whole
+  use_repo_map: true
+  extra_params:
+    num_ctx: 16384
+
+- name: ollama_chat/uiux-designer-7b
+  edit_format: whole
+  use_repo_map: true
+  extra_params:
+    num_ctx: 16384
+
+- name: ollama_chat/doc-explainer-7b
+  edit_format: whole
+  use_repo_map: true
+  extra_params:
+    num_ctx: 16384

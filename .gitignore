@@ -77,3 +77,6 @@ docs/site/
 # __pycache__/
 # *.pyc
 # .ipynb_checkpoints/
+.aider*
+!.aider.model.settings.yml
+!.aider.model.metadata.json
