@@ -980,9 +980,8 @@ def _compute_confidence_ellipse(x_vals, y_vals, confidence=0.95, n_points=100):
     }
 
 
-def _plot_pca(pca_df, pct_variance, color_by, show_confidence_ellipse=False, confidence_level=0.95):
-    """
-    Build a PC1 vs PC2 scatter plot, colored by the given metadata
+def _plot_pca(pca_df, pct_variance, color_by, show_confidence_ellipse=False, confidence_level=0.95, show_labels=True):
+    """    Build a PC1 vs PC2 scatter plot, colored by the given metadata
     column.
 
     show_confidence_ellipse, confidence_level: if show_confidence_ellipse
@@ -1022,13 +1021,14 @@ def _plot_pca(pca_df, pct_variance, color_by, show_confidence_ellipse=False, con
         subset = pca_df[pca_df[color_by].astype(str) == group_value]
         fig.add_trace(go.Scatter(
             x=subset["PC1"], y=subset["PC2"],
-            mode="markers+text",
-            text=subset["sample"],
+            mode="markers+text" if show_labels else "markers",
+            text=subset["sample"] if show_labels else None,
             textposition="top center",
             name=group_value,
             marker=dict(size=12),
+            hovertext=subset["sample"],
+            hovertemplate="%{hovertext}<br>PC1: %{x:.2f}<br>PC2: %{y:.2f}<extra></extra>",
         ))
-
         if show_confidence_ellipse:
             ellipse = _compute_confidence_ellipse(subset["PC1"], subset["PC2"], confidence=confidence_level)
             if ellipse is not None:

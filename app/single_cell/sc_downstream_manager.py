@@ -1841,7 +1841,8 @@ def _build_pseudobulk_sample_name(group_key, groupby_columns):
 
 
 def aggregate_pseudobulk(adata, groupby_columns, layer="counts",
-                          min_cells=DEFAULT_MIN_CELLS_PER_PSEUDOBULK_GROUP):
+                          min_cells=DEFAULT_MIN_CELLS_PER_PSEUDOBULK_GROUP,
+                          sample_key="sample"):
     """
     Aggregate raw per-cell counts into pseudobulk "samples" by summing
     within each group defined by groupby_columns.
@@ -1851,6 +1852,18 @@ def aggregate_pseudobulk(adata, groupby_columns, layer="counts",
     Raises ValueError if "counts" (or the specified layer) is missing
     from adata.layers, or if groupby_columns references a column not in
     adata.obs.
+
+    FIX (2026-09-15): automatically carries forward any real sample-level
+    condition column (see get_sample_level_condition_columns()) into the
+    pseudobulk metadata, even if it wasn't part of groupby_columns.
+    Previously, grouping by "sample" alone -- a common, reasonable choice
+    -- produced pseudobulk metadata with NO condition column at all, even
+    though real condition metadata (e.g. "Healthy" vs "COVID-19") already
+    existed per-sample via merge_sample_level_metadata(). Only auto-added
+    when sample_key is itself one of groupby_columns, since that
+    guarantees every pseudobulk group comes from exactly one real sample
+    -- so it's safe to read the condition value from any single cell in
+    that group.
     """
     if layer not in adata.layers:
         raise ValueError(
@@ -1866,6 +1879,12 @@ def aggregate_pseudobulk(adata, groupby_columns, layer="counts",
         counts_matrix = counts_matrix.toarray()
 
     groups = adata.obs.groupby(groupby_columns, dropna=False, observed=True).indices
+
+    auto_condition_columns = []
+    if sample_key in groupby_columns:
+        auto_condition_columns = get_sample_level_condition_columns(
+            adata, sample_key=sample_key, excluded_columns=set(groupby_columns)
+        )
 
     sample_columns = {}
     metadata_rows = []
@@ -1889,6 +1908,8 @@ def aggregate_pseudobulk(adata, groupby_columns, layer="counts",
         metadata_row = dict(zip(groupby_columns, group_key_tuple))
         metadata_row["sample"] = pseudobulk_sample_name
         metadata_row["n_cells_aggregated"] = n_cells
+        for col in auto_condition_columns:
+            metadata_row[col] = adata.obs.iloc[cell_indices[0]][col]
         metadata_rows.append(metadata_row)
 
     if not sample_columns:
@@ -1904,12 +1925,10 @@ def aggregate_pseudobulk(adata, groupby_columns, layer="counts",
 
     pseudobulk_metadata_df = pd.DataFrame(metadata_rows)
     other_cols = [c for c in groupby_columns if c != "sample"]
-    ordered_cols = ["sample"] + other_cols + ["n_cells_aggregated"]
+    ordered_cols = ["sample"] + other_cols + auto_condition_columns + ["n_cells_aggregated"]
     pseudobulk_metadata_df = pseudobulk_metadata_df[ordered_cols]
 
     return pseudobulk_counts_df, pseudobulk_metadata_df, excluded_groups
-
-
 def _flatten_to_1d(summed_counts):
     "Normalize a numpy matrix/array sum() result into a plain 1D array."
     import numpy as np

@@ -104,10 +104,11 @@ import streamlit as st
 
 import auth_manager as auth
 
+
 # 1. Global Setup Layout -- set_page_config must run before ANY other
 # Streamlit call in the script, including the login gate below, per
 # Streamlit's own requirement that it be the first st.* call made.
-st.set_page_config(layout="wide", page_title="Multi-Omics Bioinformatics Portal")
+st.set_page_config(layout="wide", page_title="Pretty Awesome Transcriptomics Tool")
 
 # ---------------------------------------------------------------------
 # Authentication gate -- must run before any sidebar/routing/workspace
@@ -134,6 +135,9 @@ import ontology_workspace
 import setup_workspace
 import singlecell_workspace
 import sc_downstream_workspace
+import sc_deseq2_workspace
+import sc_ontology_workspace
+import sc_comparecluster_workspace
 
 HOME_OPTION = "📊 Portal Home"
 SETUP_OPTION = "⚙️ Setup & Deployment"
@@ -190,13 +194,13 @@ PIPELINE_GROUPS = {
     "single_cell": {
         "title": "🧫 Single-cell RNA-Seq",
         "options": [
-            "🧫 Single-cell RNA-Seq",
-            "🧪 SC Trimming & Post-Trim QC",
-            "🧬 SC Alignment & Cell-Calling",
-            "🔬 SC Cell-level QC",
+            "🧫 Single-cell RNA-Seq", "🧪 SC Trimming & Post-Trim QC",
+            "🧬 SC Alignment & Cell-Calling", "🔬 SC Cell-level QC",
             SC_DOWNSTREAM_ANALYSIS_OPTION,
-        ],
-    },
+            "🌋 SC DESeq2", 
+            "🧬 SC Ontology Analysis","🔀 SC compareCluster",
+        ],    
+        },
     "spatial": {
         "title": "🧠 Spatial Transcriptomics",
         "options": [
@@ -276,7 +280,7 @@ if "active_workspace" not in st.session_state:
 
 # 2. Main Portal Routing Menu
 
-st.sidebar.title("🧬 Multi-Omics Portal")
+st.sidebar.title("🧬 Pretty Awesome Transcriptomics Tool")
 auth.render_user_badge()
 st.sidebar.markdown("---")
 
@@ -316,14 +320,91 @@ assay_choice = st.session_state["active_workspace"]
 # 🏠 WORKSPACE 1: PORTAL HOME
 # ==========================================
 
-if assay_choice == "📊 Portal Home":
-    st.title("🎛️ Clinical Multi-Omics Orchestration Hub")
+if assay_choice == HOME_OPTION:
+    st.title("🧬 Pretty Awesome Transcriptomics Tool")
+    st.caption("Yes, that spells P.A.T. -- a little nod to the person who built it.")
     st.markdown(
-        "Welcome to the production-grade multi-omics interface. Select an "
-        "active pipeline workspace from the sidebar menu to process "
-        "structural data metrics or view interactive expression atlases."
+        "Welcome! This portal walks you through complete RNA-seq analysis "
+        "workflows -- from raw reads to differential expression and "
+        "biological interpretation -- without requiring a bioinformatics "
+        "background. Pick a workflow below to get started, or continue an "
+        "existing project from the sidebar."
     )
+    st.markdown("---")
 
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        with st.container(border=True):
+            st.markdown("### 🧬 Bulk RNA-Seq")
+            st.markdown(
+                "Analyze gene expression averaged across a whole tissue or "
+                "sample -- the classic RNA-seq workflow. Upload FASTQ files, "
+                "trim and QC your reads, align and quantify against a "
+                "reference genome, run DESeq2 to find differentially "
+                "expressed genes between conditions, and finish with "
+                "GO/KEGG/Reactome enrichment to understand the biology "
+                "behind your results."
+            )
+            st.caption(
+                "Best for: comparing conditions (e.g. treated vs. control) "
+                "at the tissue/sample level."
+            )
+            if st.button(
+                "Start Bulk RNA-Seq →", key="home_card_bulk_btn",
+                use_container_width=True, type="primary",
+            ):
+                st.session_state["nav_request"] = "🧬 Bulk RNA-Seq Pipeline"
+                st.rerun()
+
+    with col2:
+        with st.container(border=True):
+            st.markdown("### 🧫 Single-cell RNA-Seq")
+            st.markdown(
+                "Analyze gene expression at INDIVIDUAL CELL resolution "
+                "instead of a tissue-wide average. Ingest droplet-based "
+                "(10x-style) FASTQ files, detect chemistry automatically, "
+                "align with STARsolo, run cell-level QC (doublets, ambient "
+                "RNA), then cluster, annotate cell types, and explore "
+                "composition differences across your samples."
+            )
+            st.caption(
+                "Best for: discovering which cell types exist and how they "
+                "individually respond to a condition."
+            )
+            if st.button(
+                "Start Single-cell RNA-Seq →", key="home_card_sc_btn",
+                use_container_width=True, type="primary",
+            ):
+                st.session_state["nav_request"] = "🧫 Single-cell RNA-Seq"
+                st.rerun()
+
+    with col3:
+        with st.container(border=True):
+            st.markdown("### ⚙️ Setup & Deployment")
+            st.markdown(
+                "Check which external tools (STAR, Salmon, R/DESeq2, "
+                "clusterProfiler, etc.) are available in this environment, "
+                "install anything missing, and manage HPC SSH connections "
+                "for running heavier jobs on a remote cluster."
+            )
+            st.caption(
+                "Best for: first-time setup, or troubleshooting a 'tool not "
+                "found' error on another page."
+            )
+            if st.button(
+                "Go to Setup & Deployment →", key="home_card_setup_btn",
+                use_container_width=True,
+            ):
+                st.session_state["nav_request"] = SETUP_OPTION
+                st.rerun()
+
+    st.markdown("---")
+    st.caption(
+        "🧠 Also available: Spatial Transcriptomics (10x Visium) and "
+        "Advanced Modes (Auto / Monitor Mode) -- see the sidebar drawers on "
+        "the left."
+    )
 # ==========================================
 # 🧠 WORKSPACE 2: SPATIAL TRANSCRIPTOMICS
 # ==========================================
@@ -413,7 +494,13 @@ elif assay_choice == "🧬 SC Alignment & Cell-Calling":
 elif assay_choice == "🔬 SC Cell-level QC":
     singlecell_workspace.render_cell_qc()
 
-# Phase 3 route (2026-08-23, renamed 2026-08-25) -- see this file's own
+elif assay_choice == "🌋 SC DESeq2":
+    sc_deseq2_workspace.render()
+elif assay_choice == "🧬 SC Ontology Analysis":
+  sc_ontology_workspace.render()
+elif assay_choice == "🔀 SC compareCluster":
+  sc_comparecluster_workspace.render()  
+    # Phase 3 route (2026-08-23, renamed 2026-08-25) -- see this file's own
 # module docstring section "Phase 3 sidebar entry renamed" and
 # sc_downstream_workspace.render()'s own docstring for context. Routes
 # to the SAME single page for all of Steps 1-10 (see that module's own

@@ -1921,9 +1921,28 @@ def _render_step5(project, pairs):
                     "If this new reference's mitochondrial genes aren't auto-detected above, "
                     "use the resolution options shown to set them again for THIS reference."
                 )
+            
             scpm.save_reference_choice(project, reference_cfg)
             scpm.mark_step_complete(project, "reference")
+
+            # --- Layer-1 gene_id -> gene_name map (2026-09-15) -- mirrors
+            # the bulk pipeline's own auto-derived symbol map, generated
+            # here from this project's confirmed reference GTF (works
+            # identically whether preset or custom, and whether the GTF
+            # came directly from Ensembl or via the GFF3-fallback tiered
+            # backfill -- ref.extract_gene_symbol_map_from_gtf() only
+            # needs a GTF with gene_name attributes, which both paths
+            # already produce).
+            confirmed_gtf_path = reference_cfg.get("custom_gtf")
+            if confirmed_gtf_path and os.path.isfile(confirmed_gtf_path):
+                try:
+                    symbol_map = ref.extract_gene_symbol_map_from_gtf(confirmed_gtf_path)
+                    ref.save_gene_symbol_map_csv(symbol_map, scpm.sc_reference_gene_symbol_map_path(project))
+                except Exception as e:
+                    st.caption(f"ℹ️ Could not auto-generate a gene name map from this reference's GTF: {e}")
+
             st.success("✅ Reference setup confirmed.")
+            
 
 
 # ---------------------------------------------------------------------------

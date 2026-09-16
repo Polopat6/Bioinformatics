@@ -198,6 +198,27 @@ def strip_id_version(gene_id, id_type):
     match = pattern.match(gene_id)
     return match.group(1) if match else gene_id
 
+def _strip_gene_colon_prefix(gene_id):
+    """
+    Strip a GFF3-style 'gene:' ID-attribute prefix, if present -- e.g.
+    'gene:ENSG00000000003' -> 'ENSG00000000003'. This prefix comes from
+    Ensembl GFF3 files' own ID attribute convention (ID=gene:ENSG...)
+    and can end up embedded directly in gene_id values when a project's
+    reference/counts matrix was built from a GFF3-derived pipeline
+    rather than a GTF (see gff3_gene_name_resolver.py's own
+    _strip_gene_prefix(), which handles this identical artifact for
+    GFF3 parsing specifically -- this is the same fix, pushed down into
+    the shared ID-detection/conversion module so every caller benefits,
+    rather than each caller needing its own local copy).
+
+    Without this stripping, a real Ensembl ID like "gene:ENSG00000000003"
+    fails EVERY pattern in _ID_PATTERNS (pattern.match() anchors at the
+    start of the string, and "gene:" isn't "ENS..."), silently falling
+    back to "SYMBOL" -- and would also fail bitr() outright with "None
+    of the keys entered are valid keys", the same failure mode a
+    version suffix causes (see strip_id_version() above).
+    """
+    return gene_id[len("gene:"):] if gene_id.startswith("gene:") else gene_id
 
 # ---------------------------------------------------------------------------
 # ID type auto-detection
@@ -259,12 +280,13 @@ def detect_id_type(gene_ids, sample_size=200):
         return {"detected_type": "SYMBOL", "match_fraction": 0.0, "example_ids": [], "has_version_suffix": False}
 
     sample = ids[:sample_size]
+    stripped_sample = [_strip_gene_colon_prefix(gid) for gid in sample]
     best_type, best_count = "SYMBOL", 0
     for type_name, pattern in _ID_PATTERNS:
-        count = sum(1 for gid in sample if pattern.match(gid))
+        count = sum(1 for gid in stripped_sample if pattern.match(gid))
         if count > best_count:
             best_type, best_count = type_name, count
-
+            
     match_fraction = (best_count / len(sample)) if sample else 0.0
     # Require a reasonably strong majority match before trusting a
     # database-ID guess over the SYMBOL fallback -- a handful of
@@ -275,8 +297,8 @@ def detect_id_type(gene_ids, sample_size=200):
 
     has_version_suffix = False
     if best_type in _VERSIONED_ID_PATTERNS:
-        versioned_count = sum(1 for gid in sample if strip_id_version(gid, best_type) != gid)
-        has_version_suffix = versioned_count >= (len(sample) * 0.5)
+        versioned_count = sum(1 for gid in stripped_sample if strip_id_version(gid, best_type) != gid)
+        has_version_suffix = versioned_count >= (len(stripped_sample) * 0.5)
 
     return {
         "detected_type": best_type,
@@ -424,7 +446,8 @@ def run_bitr_conversion(gene_ids, from_type, to_type, orgdb_package, work_dir):
     # every original input that mapped to it.
     stripped_to_originals = {}
     for original_id in unique_ids_raw:
-        stripped_id = strip_id_version(original_id, from_type)
+        cleaned_id = _strip_gene_colon_prefix(original_id)
+        stripped_id = strip_id_version(cleaned_id, from_type)
         stripped_to_originals.setdefault(stripped_id, []).append(original_id)
 
     lookup_ids = sorted(stripped_to_originals.keys())

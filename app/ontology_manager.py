@@ -556,6 +556,15 @@ df <- df[!is.na(df$gene_id) & !is.na(df$padj) & !is.na(df$log2FoldChange), ]
 
 from_type <- "{from_type}"
 
+# Clean gene_id BEFORE bitr() -- a leftover GFF3 "gene:" prefix (safe to
+# strip unconditionally -- no real ID type ever starts with it) and/or a
+# trailing Ensembl/RefSeq version suffix (only stripped for namespaces
+# that use versioning) otherwise make bitr() reject every ID outright.
+df$gene_id <- sub("^gene:", "", df$gene_id)
+if (from_type %in% c("ENSEMBL", "ENSEMBLTRANS", "ENSEMBLPROT", "REFSEQ")) {{
+  df$gene_id <- sub("\\.[0-9]+$", "", df$gene_id)
+}}
+
 if (from_type == "ENTREZID") {{
   df$ENTREZID <- df$gene_id
 }} else {{
@@ -686,6 +695,12 @@ df <- read.csv(input_path, stringsAsFactors = FALSE)
 df <- df[!is.na(df$gene_id) & !is.na(df$log2FoldChange), ]
 
 from_type <- "{from_type}"
+
+# See the identical comment in _R_ORA_SCRIPT_TEMPLATE above.
+df$gene_id <- sub("^gene:", "", df$gene_id)
+if (from_type %in% c("ENSEMBL", "ENSEMBLTRANS", "ENSEMBLPROT", "REFSEQ")) {{
+  df$gene_id <- sub("\\.[0-9]+$", "", df$gene_id)
+}}
 
 if (from_type == "ENTREZID") {{
   df$ENTREZID <- df$gene_id
@@ -831,6 +846,12 @@ for (i in seq_len(nrow(manifest))) {{
 
   df <- read.csv(input_path, stringsAsFactors = FALSE)
   df <- df[!is.na(df$gene_id) & !is.na(df$padj) & !is.na(df$log2FoldChange), ]
+
+  # See the identical comment in _R_ORA_SCRIPT_TEMPLATE above.
+  df$gene_id <- sub("^gene:", "", df$gene_id)
+  if (from_type %in% c("ENSEMBL", "ENSEMBLTRANS", "ENSEMBLPROT", "REFSEQ")) {{
+    df$gene_id <- sub("\\.[0-9]+$", "", df$gene_id)
+  }}
 
   if (from_type == "ENTREZID") {{
     df$ENTREZID <- df$gene_id

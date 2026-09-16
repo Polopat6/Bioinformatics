@@ -116,6 +116,15 @@ def custom_reference_dir(project_name):
     """
     return os.path.join(project_dir(project_name), "custom_reference")
 
+def sc_reference_gene_symbol_map_path(project_name):
+    """
+    Where this project's GTF-auto-derived gene_id -> gene_name map lives
+    (layer 1 of the SC gene-ID-mapping panel's 3-layer lookup, mirroring
+    the bulk pipeline's own layer 1). Project-scoped (not export-scoped):
+    this depends only on the project's confirmed reference GTF, which is
+    shared across every pseudobulk export in this project.
+    """
+    return os.path.join(custom_reference_dir(project_name), "gene_symbol_map.csv")
 
 def star_index_dir(project_name):
     """
@@ -457,7 +466,105 @@ def delete_downstream_pseudobulk_export(project_name, export_name):
     shutil.rmtree(path)
     return True
 
+# ---------------------------------------------------------------------------
+# Step 9 -> DE bridge: DESeq2 + Ontology Analysis on a saved pseudobulk export
+# ---------------------------------------------------------------------------
+#
+# Mirrors project_manager.py's own deseq2_dir()/deseq2_output_dir()/
+# deseq2_work_dir()/ontology_dir()/ontology_output_dir()/ontology_work_dir()
+# naming convention exactly, but scoped one level deeper -- under a
+# SPECIFIC pseudobulk export (downstream_pseudobulk_export_dir(project,
+# export_name)) rather than directly under the project root. This is
+# necessary, not just cosmetic: a single-cell project can have MULTIPLE
+# independent pseudobulk exports (e.g. grouped by "sample" vs. by
+# "sample"+"cell_type"), and each is really its own independent
+# "bulk-like" counts matrix that needs its own independent DESeq2/
+# Ontology results -- exactly the same way two different bulk projects
+# would never share one set of DESeq2 results.
 
+
+def sc_reference_gene_symbol_map_path(project_name):
+    """
+    Where this project's GTF-auto-derived gene_id -> gene_name map lives
+    (layer 1 of the SC gene-ID-mapping panel's 3-layer lookup, mirroring
+    the bulk pipeline's own layer 1 -- see sc_deseq2_workspace.py's
+    module docstring). Project-scoped (not export-scoped): this depends
+    only on the project's confirmed reference GTF, which is shared
+    across every pseudobulk export in this project.
+    """
+    return os.path.join(custom_reference_dir(project_name), "gene_symbol_map.csv")
+
+def sc_deseq2_dir(project_name, export_name):
+    "Where DESeq2 analysis inputs/outputs live for ONE pseudobulk export of this single-cell project."
+    return os.path.join(downstream_pseudobulk_export_dir(project_name, export_name), "deseq2")
+
+def sc_deseq2_output_dir(project_name, export_name):
+    "DESeq2's actual result CSVs for this pseudobulk export -- same file shapes deseq2_manager.py writes for a bulk project."
+    return os.path.join(sc_deseq2_dir(project_name, export_name), "output")
+
+def sc_deseq2_work_dir(project_name, export_name):
+    "Scratch directory for this pseudobulk export's temporary DESeq2 R script + job spec JSON."
+    return os.path.join(sc_deseq2_dir(project_name, export_name), "work")
+
+def sc_deseq2_config_path(project_name, export_name):
+    """
+    Where this pseudobulk export's confirmed DESeq2 configuration is
+    saved -- mirrors project_manager.save_deseq2_config()'s own info,
+    but stored as its own small JSON file INSIDE this export's deseq2
+    directory rather than nested inside project_info.json, since a
+    single-cell project's DIFFERENT pseudobulk exports each need their
+    own completely independent DESeq2 configuration.
+    """
+    return os.path.join(sc_deseq2_dir(project_name, export_name), "deseq2_config.json")
+
+def save_sc_deseq2_config(project_name, export_name, config):
+    "Persist this pseudobulk export's confirmed DESeq2 configuration -- see sc_deseq2_config_path()'s own docstring."
+    os.makedirs(sc_deseq2_dir(project_name, export_name), exist_ok=True)
+    with open(sc_deseq2_config_path(project_name, export_name), "w") as f:
+        json.dump(config, f, indent=2)
+
+def get_sc_deseq2_config(project_name, export_name):
+    "Return this pseudobulk export's previously saved DESeq2 configuration, or None if DESeq2 has never been run for it."
+    path = sc_deseq2_config_path(project_name, export_name)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+def sc_ontology_dir(project_name, export_name):
+    "Where Ontology Analysis (GO/KEGG/Reactome enrichment) inputs/outputs live for this pseudobulk export."
+    return os.path.join(downstream_pseudobulk_export_dir(project_name, export_name), "ontology")
+
+def sc_ontology_output_dir(project_name, export_name):
+    "Root directory for this pseudobulk export's Ontology Analysis result files."
+    return os.path.join(sc_ontology_dir(project_name, export_name), "output")
+
+def sc_ontology_work_dir(project_name, export_name):
+    "Scratch directory for this pseudobulk export's temporary Ontology Analysis R scripts + input gene list CSVs."
+    return os.path.join(sc_ontology_dir(project_name, export_name), "work")
+
+def save_sc_ontology_species(project_name, export_name, species_key):
+    """
+    Persist a manually-confirmed organism choice for this pseudobulk
+    export's Ontology Analysis. Deliberately NOT auto-derived from this
+    project's alignment reference_choice -- that dict's exact shape
+    differs between preset and custom references, and guessing at its
+    keys here risks silently resolving the wrong species. Asking the
+    user to confirm once (mirroring ontology_workspace.py's own
+    _render_species_override_picker pattern for an unrecognized bulk
+    reference) is the safer, always-correct approach.
+    """
+    path = os.path.join(sc_ontology_dir(project_name, export_name), "species_choice.json")
+    os.makedirs(sc_ontology_dir(project_name, export_name), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"species_key": species_key}, f, indent=2)
+
+def get_sc_ontology_species(project_name, export_name):
+    path = os.path.join(sc_ontology_dir(project_name, export_name), "species_choice.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f).get("species_key")
 # --- Step 10: Compositional analysis output/work directories ---
 #
 # Unlike pseudobulk exports above, compositional analysis results are
@@ -746,3 +853,36 @@ def get_sample_spec_for_downstream(project_name, sample_name):
         "starsolo_output_prefix": os.path.join(sample_dir, f"{sample_name}_"),
         "cellqc_output_dir": os.path.join(sample_dir, "cellqc"),
     }
+# ---------------------------------------------------------------------------
+# Append to sc_project_manager.py -- gene-ID-mapping tracking for the SC
+# DESeq2/Ontology bridge (v1 scope: bitr conversion + manual CSV upload
+# only -- see sc_deseq2_workspace.py's module docstring for why the bulk
+# pipeline's "layer 1 auto-derived-from-alignment-reference" gene map
+# isn't ported here yet).
+# ---------------------------------------------------------------------------
+
+def sc_gene_symbol_map_path(project_name, export_name):
+    "Where this pseudobulk export's gene_id -> gene_name mapping (from bitr conversion) is saved."
+    return os.path.join(sc_deseq2_dir(project_name, export_name), "gene_symbol_map.csv")
+
+
+def get_sc_gene_id_mapping_meta(project_name, export_name):
+    "Return this export's saved gene-ID-mapping metadata (which conversion was run, when), or None."
+    path = os.path.join(sc_deseq2_dir(project_name, export_name), "gene_id_mapping_meta.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_sc_gene_id_mapping_meta(project_name, export_name, meta):
+    "Persist this export's gene-ID-mapping metadata."
+    os.makedirs(sc_deseq2_dir(project_name, export_name), exist_ok=True)
+    path = os.path.join(sc_deseq2_dir(project_name, export_name), "gene_id_mapping_meta.json")
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def sc_gene_id_mapping_work_dir(project_name, export_name):
+    "Scratch directory for this export's gene-ID-mapping (bitr) intermediate files."
+    return os.path.join(sc_deseq2_work_dir(project_name, export_name), "gene_id_mapping")
