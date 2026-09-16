@@ -49,8 +49,10 @@ from datetime import datetime
 import streamlit as st
 
 import auth_manager as auth
+import app_paths
+import atomic_io
 
-PROJECTS_ROOT = "data/projects"
+PROJECTS_ROOT = app_paths.data_path("projects")
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +165,7 @@ def reference_dir(project_name):
 # IMPORTANT for delete_project() below: this root is deliberately OUTSIDE
 # PROJECTS_ROOT / project_dir(), so deleting any single project's folder
 # can never touch another project's (or its own) shared reference files.
-SHARED_REFERENCES_ROOT = "data/shared_references"
+SHARED_REFERENCES_ROOT = app_paths.data_path("shared_references")
 
 
 def shared_reference_dir(species_key):
@@ -483,17 +485,15 @@ def create_project(project_name):
 
 
 def load_info(project_name):
-    path = info_path(project_name)
-    if not os.path.exists(path):
-        return {"created_at": None, "steps_completed": []}
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(
+        info_path(project_name),
+        default={"created_at": None, "steps_completed": []},
+        on_corrupt="raise",
+    )
 
 
 def save_info(project_name, info):
-    os.makedirs(project_dir(project_name), exist_ok=True)
-    with open(info_path(project_name), "w") as f:
-        json.dump(info, f, indent=2)
+    atomic_io.atomic_write_json(info_path(project_name), info)
 
 
 def mark_step_complete(project_name, step_name):

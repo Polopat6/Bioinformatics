@@ -51,8 +51,10 @@ data/singlecell_projects/<project>/
 import json
 import os
 from datetime import datetime
+import app_paths
+import atomic_io
 
-SC_PROJECTS_ROOT = "data/singlecell_projects"
+SC_PROJECTS_ROOT = app_paths.data_path("singlecell_projects")
 
 
 def list_projects():
@@ -172,17 +174,16 @@ def create_project(project_name):
 
 
 def load_info(project_name):
-    path = info_path(project_name)
-    if not os.path.exists(path):
-        return {"created_at": None, "steps_completed": [], "pipeline_type": "single_cell"}
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(
+        info_path(project_name),
+        default={"created_at": None, "steps_completed": [],
+                 "pipeline_type": "single_cell"},
+        on_corrupt="raise",
+    )
 
 
 def save_info(project_name, info):
-    os.makedirs(project_dir(project_name), exist_ok=True)
-    with open(info_path(project_name), "w") as f:
-        json.dump(info, f, indent=2)
+    atomic_io.atomic_write_json(info_path(project_name), info)
 
 
 def mark_step_complete(project_name, step_name):

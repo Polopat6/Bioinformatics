@@ -103,12 +103,13 @@ import secrets
 from datetime import datetime
 
 import streamlit as st
-
+import app_paths
+import atomic_io
 # ---------------------------------------------------------------------------
 # Storage locations + built-in role constants
 # ---------------------------------------------------------------------------
 
-AUTH_DIR = os.path.join("data", "auth")
+AUTH_DIR = app_paths.data_path("auth")
 USERS_PATH = os.path.join(AUTH_DIR, "users.json")
 ROLES_PATH = os.path.join(AUTH_DIR, "roles.json")
 
@@ -173,20 +174,15 @@ def _hash_password(password, salt_bytes):
 
 
 def _load_users():
-    if not os.path.isfile(USERS_PATH):
-        return {}
-    with open(USERS_PATH) as f:
-        return json.load(f)
+    # on_corrupt="raise" is deliberate and load-bearing: a damaged
+    # users.json must NEVER read as {} here, because any_users_exist()
+    # would then be False and render_login_gate() would show the
+    # unauthenticated "create first admin" bootstrap form.
+    return atomic_io.read_json(USERS_PATH, default={}, on_corrupt="raise")
 
 
 def _save_users(users):
-    os.makedirs(AUTH_DIR, exist_ok=True)
-    with open(USERS_PATH, "w") as f:
-        json.dump(users, f, indent=2)
-    try:
-        os.chmod(USERS_PATH, 0o600)
-    except OSError:
-        pass
+    atomic_io.atomic_write_json(USERS_PATH, users, mode=0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -194,20 +190,11 @@ def _save_users(users):
 # ---------------------------------------------------------------------------
 
 def _load_roles():
-    if not os.path.isfile(ROLES_PATH):
-        return {}
-    with open(ROLES_PATH) as f:
-        return json.load(f)
+    return atomic_io.read_json(ROLES_PATH, default={}, on_corrupt="raise")
 
 
 def _save_roles(roles):
-    os.makedirs(AUTH_DIR, exist_ok=True)
-    with open(ROLES_PATH, "w") as f:
-        json.dump(roles, f, indent=2)
-    try:
-        os.chmod(ROLES_PATH, 0o600)
-    except OSError:
-        pass
+    atomic_io.atomic_write_json(ROLES_PATH, roles, mode=0o600)
 
 
 def _ensure_builtin_roles():
@@ -589,19 +576,21 @@ def require_admin(message=None):
 # ---------------------------------------------------------------------------
 
 def render_login_gate():
-    """
-    The single entry point app.py should call before rendering ANYTHING
-    else. Returns True if the caller should proceed to render the rest
-    of the app (already logged in), or False if a login/bootstrap form
-    was shown instead.
-    """
     if is_logged_in():
         return True
-
-    if not any_users_exist():
+    try:
+        users_exist = any_users_exist()
+    except atomic_io.CorruptStateFile as e:
+        st.error(
+            "🔒 The user account file is damaged, so login is disabled. "
+            "This is a fail-closed safety measure -- it does NOT mean your "
+            "accounts are gone."
+        )
+        st.caption(f"Damaged file preserved at: {e.backup_path}")
+        return False
+    if not users_exist:
         _render_bootstrap_admin_form()
         return False
-
     _render_login_form()
     return False
 

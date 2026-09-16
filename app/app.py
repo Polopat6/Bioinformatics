@@ -122,8 +122,9 @@ if not auth.render_login_gate():
 # this file's own docstring note above) -- inserted once, at import time,
 # before singlecell_workspace itself (or anything it depends on) is
 # imported below.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "single_cell"))
-
+_SINGLE_CELL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "single_cell")
+if _SINGLE_CELL_DIR not in sys.path:
+    sys.path.insert(0, _SINGLE_CELL_DIR)
 import spatial_workspace
 import bulk_rnaseq_workspace
 import advanced_mode_workspace
