@@ -27,7 +27,7 @@ import shutil
 import subprocess
 
 import pandas as pd
-
+import atomic_io
 
 KEGG_ORGANISM_CODES = {
     "human": "hsa",
@@ -411,17 +411,12 @@ def parse_simplify_outcomes_from_log(log_text):
 
 def save_simplify_status(output_dir, outcomes):
     path = os.path.join(output_dir, "simplify_status.json")
-    os.makedirs(output_dir, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(outcomes, f, indent=2)
+    atomic_io.atomic_write_json(path, outcomes)
 
 
 def load_simplify_status(output_dir):
     path = os.path.join(output_dir, "simplify_status.json")
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(path, default=None, on_corrupt="default")
 
 
 def _build_semdata_setup_snippet(orgdb_package, go_ontology, measure, semdata_var):

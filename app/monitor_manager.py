@@ -114,6 +114,7 @@ import project_manager as pm
 import ingestion_manager as ingest
 import advanced_mode_orchestrator as orch
 import notification_manager as notif
+import atomic_io
 
 MONITOR_ROOT = app_paths.data_path("monitor")
 FASTQ_EXTENSIONS = (".fastq", ".fastq.gz", ".fq", ".fq.gz")
@@ -218,17 +219,12 @@ def create_monitor(monitor_id, config):
 
 
 def save_monitor_config(monitor_id, config):
-    os.makedirs(monitor_dir(monitor_id), exist_ok=True)
-    with open(monitor_config_path(monitor_id), "w") as f:
-        json.dump(config, f, indent=2)
+    atomic_io.atomic_write_json(monitor_config_path(monitor_id), config)
 
 
 def load_monitor_config(monitor_id):
-    path = monitor_config_path(monitor_id)
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(monitor_config_path(monitor_id), default=None,
+                               on_corrupt="default")
 
 
 def delete_monitor(monitor_id):
@@ -280,21 +276,17 @@ def _effective_notification_config(monitor_config):
 # Registry (persisted "already processed" set), per monitor
 # ---------------------------------------------------------------------------
 def _load_registry(monitor_id):
-    path = monitor_registry_path(monitor_id)
-    if not os.path.exists(path):
-        return {}
-    with open(path) as f:
-        return json.load(f)
+    # on_corrupt="default" -> an unreadable registry is treated as empty.
+    # Note the real consequence: folders already launched are no longer
+    # remembered, so _process_one_folder() will re-see them. The existing
+    # "a project named X already exists -- skipping" guard catches that
+    # and rejects rather than launching a duplicate run.
+    return atomic_io.read_json(monitor_registry_path(monitor_id), default={},
+                               on_corrupt="default")
 
 
 def _save_registry(monitor_id, registry):
-    path = monitor_registry_path(monitor_id)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(registry, f, indent=2)
-    os.replace(tmp, path)
-
+    atomic_io.atomic_write_json(monitor_registry_path(monitor_id), registry)
 
 def _log_activity(monitor_id, entry):
     entry["timestamp"] = datetime.now().isoformat(timespec="seconds")
@@ -311,7 +303,17 @@ def read_activity_log(monitor_id, n_most_recent=50):
         return []
     with open(path) as f:
         lines = f.readlines()
-    entries = [json.loads(line) for line in lines[-n_most_recent:]]
+    entries = []
+    for line in lines[-n_most_recent:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A single torn line (killed mid-append) must not blank the
+            # entire activity feed -- skip it and show the rest.
+            continue
     return list(reversed(entries))
 
 

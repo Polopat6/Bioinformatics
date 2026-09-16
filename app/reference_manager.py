@@ -109,6 +109,7 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime
+import atomic_io
 
 # On some systems (notably macOS with Python installed from python.org),
 # Python's SSL module doesn't automatically use the operating system's
@@ -981,8 +982,7 @@ def write_gene_name_resolution_summary(dest_dir, summary):
     if summary is None:
         return
     summary_path = os.path.join(dest_dir, "gene_name_resolution_summary.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+    atomic_io.atomic_write_json(summary_path, summary)
 
 
 def read_gene_name_resolution_summary(target_dir):

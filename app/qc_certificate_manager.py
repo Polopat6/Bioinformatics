@@ -71,7 +71,7 @@ import quantification_manager as qm
 import ingestion_manager as ingest
 import fastqc_manager as fastqc
 import fastp_manager as fastp
-
+import atomic_io
 
 # ---------------------------------------------------------------------------
 # Per-stage data collection -- each function reads whatever artifacts that
@@ -166,6 +166,7 @@ def _collect_trimming_summary(project_name):
         pass
 
     poly_tail_events = []
+    notes = []
     try:
         poly_tail_issues = fastp.scan_all_samples_for_poly_tail_issues(reports_dir)
         for sample_name, issues in (poly_tail_issues or {}).items():
@@ -174,14 +175,17 @@ def _collect_trimming_summary(project_name):
                     "sample": sample_name, "read": issue.get("read"), "base": issue.get("base"),
                     "tail_pct_after": issue.get("tail_pct_after"),
                 })
-                # Note: this is informational, not necessarily a failure --
-                # the orchestrator auto-fixes these when auto_fix_poly_tails
-                # is enabled (the default). Still worth surfacing so a
-                # downstream reviewer knows a residual-tail correction
-                # happened, rather than only seeing "trimming: ok".
-                flags.append(
-                    f"Sample '{sample_name}': residual poly-{issue.get('base')} tail detected on {issue.get('read')} "
-                    f"({issue.get('tail_pct_after')}% in the tail window) -- auto-corrected if poly-tail auto-fix was enabled."
+                # These go to `notes`, NOT `flags`. The orchestrator
+                # auto-fixes poly tails by default, so this is the most
+                # common benign event in the pipeline -- routing it into
+                # `flags` made overall_status "flagged" for runs where
+                # nothing was actually wrong, which is exactly the alarm
+                # fatigue this certificate exists to prevent. Still
+                # surfaced in the report, just not as a failure.
+                notes.append(
+                    f"Sample '{sample_name}': residual poly-{issue.get('base')} tail on "
+                    f"{issue.get('read')} ({issue.get('tail_pct_after')}% in the tail "
+                    "window) was detected and auto-corrected."
                 )
     except Exception:
         pass
@@ -189,6 +193,7 @@ def _collect_trimming_summary(project_name):
     return {
         "status": "flagged" if flags else "ok",
         "flags": flags,
+        "notes": notes,
         "detail": {"per_sample": per_sample, "poly_tail_events": poly_tail_events},
     }
 
@@ -409,6 +414,9 @@ def _render_stage_html(stage_key, stage):
     else:
         body_html = '<p class="no-flags">✅ No issues detected.</p>'
 
+    for note in stage.get("notes", []):
+        body_html += f'<div class="flag-item">ℹ️ {_escape(note)}</div>'
+
     detail = stage.get("detail", {})
     if stage_key == "quantification" and detail.get("per_sample"):
         rows = "".join(
@@ -511,10 +519,18 @@ def save_qc_certificate(project_name, run_mode="auto", monitor_id=None):
     json_path = pm.qc_certificate_path(project_name)
     html_path = pm.qc_report_html_path(project_name)
 
-    os.makedirs(os.path.dirname(json_path), exist_ok=True)
-    with open(json_path, "w") as f:
-        json.dump(certificate, f, indent=2)
-    with open(html_path, "w") as f:
+    atomic_io.atomic_write_json(json_path, certificate)
+
+    # The HTML report ships to collaborators alongside the counts matrix,
+    # so a truncated file would render as a blank/broken page in their
+    # browser with no indication anything was wrong. Same temp-then-
+    # rename discipline, just for text rather than JSON.
+    os.makedirs(os.path.dirname(html_path), exist_ok=True)
+    tmp_html = html_path + ".tmp"
+    with open(tmp_html, "w") as f:
         f.write(html_report)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_html, html_path)
 
     return json_path, html_path

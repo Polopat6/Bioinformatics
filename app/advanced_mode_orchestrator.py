@@ -92,8 +92,8 @@ import ingestion_manager as ingest
 import fastqc_manager as fastqc
 import fastp_manager as fastp
 import sra_manager as sra
-import qc_certificate_manager as qccert  
-
+import qc_certificate_manager as qccert
+import atomic_io
 # Ordered list of (stage_key, project_manager step_name) -- this order
 # IS the pipeline's execution order, and matches the step-tracking
 # vocabulary alignment_workspace.py / bulk_rnaseq_workspace.py /
@@ -123,10 +123,15 @@ def _now():
 
 
 def _load_status(project_name):
-    path = status_path(project_name)
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
+    # on_corrupt="default" is deliberate: a damaged status file must
+    # fall back to the fresh-start default below rather than raising,
+    # because is_run_in_progress() and the Streamlit polling UI both
+    # call this on every rerun. Failing closed here would make the
+    # project's Advanced Mode page permanently unopenable.
+    existing = atomic_io.read_json(status_path(project_name), default=None,
+                                   on_corrupt="default")
+    if existing is not None:
+        return existing
     return {
         "pipeline_status": "not_started",
         "current_stage": None,
@@ -142,9 +147,7 @@ def _load_status(project_name):
 
 def _save_status(project_name, status):
     status["updated_at"] = _now()
-    os.makedirs(pm.project_dir(project_name), exist_ok=True)
-    with open(status_path(project_name), "w") as f:
-        json.dump(status, f, indent=2)
+    atomic_io.atomic_write_json(status_path(project_name), status)
 
 
 def _set_stage_status(project_name, status, stage_key, stage_status, message=None):
@@ -187,31 +190,22 @@ def launch_info_path(project_name):
 
 
 def save_config(project_name, config):
-    os.makedirs(pm.project_dir(project_name), exist_ok=True)
-    with open(config_path(project_name), "w") as f:
-        json.dump(config, f, indent=2)
+    atomic_io.atomic_write_json(config_path(project_name), config)
 
 
 def load_config(project_name):
-    path = config_path(project_name)
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(config_path(project_name), default=None,
+                               on_corrupt="default")
 
 
 def _save_launch_info(project_name, pid):
     info = {"pid": pid, "launched_at": _now()}
-    with open(launch_info_path(project_name), "w") as f:
-        json.dump(info, f, indent=2)
+    atomic_io.atomic_write_json(launch_info_path(project_name), info)
 
 
 def get_launch_info(project_name):
-    path = launch_info_path(project_name)
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(launch_info_path(project_name), default=None,
+                               on_corrupt="default")
 
 
 def _is_zombie(pid):
@@ -963,8 +957,12 @@ def run_pipeline(project_name, config):
             # never silently absent just because the run didn't finish.
             try:
                 qccert.save_qc_certificate(project_name, run_mode=run_mode, monitor_id=monitor_id)
-            except Exception:
-                pass  # QC certificate generation must never mask the real pipeline error above
+            except Exception as cert_error:
+                # Still must never mask the real pipeline error above --
+                # but record it instead of discarding it entirely, so a
+                # missing certificate on an errored run is explainable.
+                status["qc_certificate_error"] = str(cert_error)
+                _save_status(project_name, status)
             return status
 
     status["pipeline_status"] = "complete"
@@ -973,8 +971,9 @@ def run_pipeline(project_name, config):
     # NEW: generate the QC Certificate for a successfully completed run.
     try:
         qccert.save_qc_certificate(project_name, run_mode=run_mode, monitor_id=monitor_id)
-    except Exception:
-        pass  # QC certificate generation must never mask a successful pipeline result
+    except Exception as cert_error:
+        status["qc_certificate_error"] = str(cert_error)
+        _save_status(project_name, status)
     return status
 
 
