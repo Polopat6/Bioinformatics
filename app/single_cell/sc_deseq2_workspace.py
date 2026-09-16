@@ -402,15 +402,7 @@ def _render_sc_gene_id_mapping_panel(project, export_name, cell_type_suffix, cou
         except Exception:
             pass
 
-    # Layer 2 override: any prior bitr conversion saved specifically for
-    # THIS pseudobulk export, layered on top of layer 1.
-    auto_map_path = scpm.sc_gene_symbol_map_path(project, full_export_name)
-    if os.path.exists(auto_map_path):
-        try:
-            auto_map_df = pd.read_csv(auto_map_path)
-            auto_gene_name_map = dict(zip(auto_map_df["gene_id"].astype(str), auto_map_df["gene_name"].astype(str)))
-        except Exception:
-            auto_gene_name_map = {}
+
 
     gene_ids_all = sorted(set(counts_df["gene_id"].astype(str)))
     n_total = len(gene_ids_all)
