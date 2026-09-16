@@ -20,9 +20,11 @@ project using that chemistry.
 """
 import gzip
 import os
+import app_paths
+
 from collections import Counter
 
-SHARED_WHITELISTS_ROOT = "data/shared_whitelists"
+SHARED_WHITELISTS_ROOT = app_paths.data_path("shared_whitelists")
 
 # --- Recommended R2 (cDNA) sequencing length, per chemistry (2026-08-17) ---
 # CONFIRMED directly from 10x Genomics' own support KB article ("Can I

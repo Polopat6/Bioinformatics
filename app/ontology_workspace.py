@@ -26,7 +26,7 @@ import gene_id_mapper as gim
 import ontology_manager as om
 import differential_expression_workspace as dew
 import eggnog_manager as egm
-
+import app_paths
 WORKSPACE_KEY = "bulk_rnaseq"
 
 SEQUENTIAL_COLORSCALE_OPTIONS = dew.SEQUENTIAL_COLORSCALE_OPTIONS
@@ -798,7 +798,7 @@ def _eggnog_output_paths(genome_fasta_path):
     output are treated as the shared, reference-keyed resource here.
     """
     ref_key = _eggnog_reference_key_for_project(genome_fasta_path)
-    base_dir = os.path.join("data", "shared_resources", "eggnog_annotations", ref_key)
+    base_dir = app_paths.data_path("shared_resources", "eggnog_annotations", ref_key)
     return {
         "annotations": os.path.join(base_dir, "annotations.emapper.annotations"),
         "go_term2gene": os.path.join(base_dir, "go_term2gene.csv"),
@@ -915,7 +915,7 @@ def _render_eggnog_run_controls(project, genome_fasta, gtf_path, paths):
         target_taxa_args = egm.build_emapper_target_taxa_args(
             chosen_scope, custom_taxid=custom_taxid if chosen_scope == "closely_related" else None,
         )
-        eggnog_db_dir = os.path.join("data", "shared_resources", "eggnog_database")
+        eggnog_db_dir = app_paths.data_path("shared_resources", "eggnog_database")
         if not egm.eggnog_database_is_installed(eggnog_db_dir):
             st.error(
                 "⚠️ The eggNOG database has not been installed on this system yet -- "

@@ -54,10 +54,12 @@ import os
 import shutil
 import subprocess
 import threading
+import app_paths
+import atomic_io
 from datetime import datetime
 
-INSTALL_STATUS_PATH = "data/setup_install_status.json"
-INSTALL_LOG_PATH = "data/setup_install_log.txt"
+INSTALL_STATUS_PATH = app_paths.data_path("setup_install_status.json")
+INSTALL_LOG_PATH = app_paths.data_path("setup_install_log.txt")
 
 # --- Atomic-batch-failure design fix (2026-08-17) ---
 # A real install attempt bundled ~8 missing packages (including paramiko,

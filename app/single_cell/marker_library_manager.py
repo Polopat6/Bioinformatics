@@ -58,10 +58,11 @@ in singlecell_workspace.py.
 import csv
 import json
 import os
+import app_paths
 from datetime import datetime
 
 
-MARKER_LIBRARY_ROOT = "data/marker_libraries"
+MARKER_LIBRARY_ROOT = app_paths.data_path("marker_libraries")
 
 
 # ---------------------------------------------------------------------------

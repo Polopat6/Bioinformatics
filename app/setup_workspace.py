@@ -133,6 +133,7 @@ import deployment_manager as dm
 import eggnog_manager as egm
 import whitelist_manager as wlm
 import reference_manager as rm
+import app_paths
 
 # ---------------------------------------------------------------------------
 # Environment & Dependency Check
@@ -587,7 +588,7 @@ def _render_eggnog_database_setup():
         )
         return
 
-    db_dir = os.path.join("data", "shared_resources", "eggnog_database")
+    db_dir = app_paths.data_path("shared_resources", "eggnog_database")
 
     if egm.eggnog_database_is_installed(db_dir):
         st.success(f"✅ The eggNOG database is already installed at `{db_dir}`.")

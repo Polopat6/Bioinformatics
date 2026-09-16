@@ -107,6 +107,7 @@ import os
 import subprocess
 import sys
 import time
+import app_paths
 from datetime import datetime
 
 import project_manager as pm
@@ -114,7 +115,7 @@ import ingestion_manager as ingest
 import advanced_mode_orchestrator as orch
 import notification_manager as notif
 
-MONITOR_ROOT = "data/monitor"
+MONITOR_ROOT = app_paths.data_path("monitor")
 FASTQ_EXTENSIONS = (".fastq", ".fastq.gz", ".fq", ".fq.gz")
 METADATA_EXTENSIONS = (".csv", ".txt", ".xlsx", ".xls")
 DEFAULT_SAMPLE_ID_COLUMN = "sample_id"

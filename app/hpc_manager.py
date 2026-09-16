@@ -42,7 +42,8 @@ existing environment that hasn't been re-synced against environment.yml.
 import json
 import os
 from datetime import datetime
-
+import app_paths
+import atomic_io
 try:
     import paramiko
     PARAMIKO_AVAILABLE = True
@@ -50,8 +51,7 @@ except ImportError:
     paramiko = None
     PARAMIKO_AVAILABLE = False
 
-CONNECTIONS_PATH = "data/hpc_connections.json"
-
+CONNECTIONS_PATH = app_paths.data_path("hpc_connections.json")
 AUTH_METHODS = ("key", "agent", "password")
 
 # Read-only remote commands used to build a quick "what does this cluster

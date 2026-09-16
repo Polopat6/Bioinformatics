@@ -65,13 +65,13 @@ import os
 import shutil
 import urllib.error
 import urllib.request
-
+import app_paths
 # Must exactly match chemistry_manager.SHARED_WHITELISTS_ROOT -- kept as
 # its own independent constant here (rather than importing
 # chemistry_manager just for this one string) to avoid this module
 # needing to import chemistry_manager at all; the two are kept in sync
 # manually since both values are simple, rarely-changed path strings.
-SHARED_WHITELISTS_ROOT = "data/shared_whitelists"
+SHARED_WHITELISTS_ROOT = app_paths.data_path("shared_whitelists")
 
 _MIRROR_BASE_URL = "https://raw.githubusercontent.com/noamteyssier/10x_whitelist_mirror/main"
 
