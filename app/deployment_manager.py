@@ -175,10 +175,7 @@ def build_github_r_install_command(github_repo):
 
 def get_install_status():
     "Returns the current/most recent install's status dict, or None if no install has ever been launched."
-    if not os.path.exists(INSTALL_STATUS_PATH):
-        return None
-    with open(INSTALL_STATUS_PATH) as f:
-        return json.load(f)
+    return atomic_io.read_json(INSTALL_STATUS_PATH, default=None, on_corrupt="default")
 
 
 def is_install_in_progress():
@@ -196,10 +193,7 @@ def read_install_log(n_lines=300):
 
 
 def _write_status(status_dict):
-    _ensure_parent_dir()
-    with open(INSTALL_STATUS_PATH, "w") as f:
-        json.dump(status_dict, f, indent=2)
-
+    atomic_io.atomic_write_json(INSTALL_STATUS_PATH, status_dict)
 
 def _run_and_log(command, log_f):
     "Run command to completion, streaming its combined stdout/stderr into the already-open log_f. Returns the process's exit code. Blocks -- only ever called from within the background watcher thread, never on the main/UI thread."

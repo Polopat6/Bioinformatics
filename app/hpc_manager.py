@@ -78,18 +78,11 @@ def list_connections():
     Return a list of saved connection profile dicts (never containing a
     password -- see module docstring), sorted by profile_name.
     """
-    if not os.path.exists(CONNECTIONS_PATH):
-        return []
-    with open(CONNECTIONS_PATH) as f:
-        data = json.load(f)
+    data = atomic_io.read_json(CONNECTIONS_PATH, default={}, on_corrupt="default")
     return sorted(data.values(), key=lambda c: c.get("profile_name", ""))
 
-
 def get_connection(profile_name):
-    if not os.path.exists(CONNECTIONS_PATH):
-        return None
-    with open(CONNECTIONS_PATH) as f:
-        data = json.load(f)
+    data = atomic_io.read_json(CONNECTIONS_PATH, default={}, on_corrupt="default")
     return data.get(profile_name)
 
 
@@ -107,28 +100,18 @@ def save_connection(profile):
     profile = dict(profile)
     profile.pop("password", None)
     profile["last_updated"] = datetime.now().isoformat(timespec="seconds")
-    _ensure_parent_dir()
-    data = {}
-    if os.path.exists(CONNECTIONS_PATH):
-        with open(CONNECTIONS_PATH) as f:
-            data = json.load(f)
+    data = atomic_io.read_json(CONNECTIONS_PATH, default={}, on_corrupt="default")
     data[profile["profile_name"]] = profile
-    with open(CONNECTIONS_PATH, "w") as f:
-        json.dump(data, f, indent=2)
+    atomic_io.atomic_write_json(CONNECTIONS_PATH, data, mode=0o600)
 
 
 def delete_connection(profile_name):
-    if not os.path.exists(CONNECTIONS_PATH):
-        return False
-    with open(CONNECTIONS_PATH) as f:
-        data = json.load(f)
+    data = atomic_io.read_json(CONNECTIONS_PATH, default={}, on_corrupt="default")
     if profile_name not in data:
         return False
     del data[profile_name]
-    with open(CONNECTIONS_PATH, "w") as f:
-        json.dump(data, f, indent=2)
+    atomic_io.atomic_write_json(CONNECTIONS_PATH, data, mode=0o600)
     return True
-
 
 def record_test_result(profile_name, success, message):
     """Update a saved profile's last-tested status, shown in the UI so a stale 'last known good' state is never displayed as current without being labeled with when it was actually checked."""

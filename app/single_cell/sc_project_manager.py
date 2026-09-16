@@ -307,19 +307,16 @@ def save_alignment_results(project_name, results):
     (those are now only required to actually re-run alignment).
     """
     info = load_info(project_name)
-    with open(alignment_results_path(project_name), "w") as f:
-        json.dump(results, f, indent=2)
+    atomic_io.atomic_write_json(alignment_results_path(project_name), results)
     info["alignment_results_saved"] = True
     save_info(project_name, info)
 
 
 def get_alignment_results(project_name):
     "Return the previously persisted per-sample alignment results (list of dicts), or None if never saved (e.g. a project whose alignment completed before this feature existed)."
-    path = alignment_results_path(project_name)
-    if not os.path.isfile(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(
+        alignment_results_path(project_name), default=None, on_corrupt="default",
+    )
 
 
 def save_reference_choice(project_name, reference_cfg):
@@ -520,17 +517,16 @@ def sc_deseq2_config_path(project_name, export_name):
 
 def save_sc_deseq2_config(project_name, export_name, config):
     "Persist this pseudobulk export's confirmed DESeq2 configuration -- see sc_deseq2_config_path()'s own docstring."
-    os.makedirs(sc_deseq2_dir(project_name, export_name), exist_ok=True)
-    with open(sc_deseq2_config_path(project_name, export_name), "w") as f:
-        json.dump(config, f, indent=2)
+    atomic_io.atomic_write_json(
+        sc_deseq2_config_path(project_name, export_name), config,
+    )
 
 def get_sc_deseq2_config(project_name, export_name):
     "Return this pseudobulk export's previously saved DESeq2 configuration, or None if DESeq2 has never been run for it."
-    path = sc_deseq2_config_path(project_name, export_name)
-    if not os.path.isfile(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(
+        sc_deseq2_config_path(project_name, export_name),
+        default=None, on_corrupt="default",
+    )
 
 def sc_ontology_dir(project_name, export_name):
     "Where Ontology Analysis (GO/KEGG/Reactome enrichment) inputs/outputs live for this pseudobulk export."
@@ -556,16 +552,12 @@ def save_sc_ontology_species(project_name, export_name, species_key):
     reference) is the safer, always-correct approach.
     """
     path = os.path.join(sc_ontology_dir(project_name, export_name), "species_choice.json")
-    os.makedirs(sc_ontology_dir(project_name, export_name), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump({"species_key": species_key}, f, indent=2)
+    atomic_io.atomic_write_json(path, {"species_key": species_key})
 
 def get_sc_ontology_species(project_name, export_name):
     path = os.path.join(sc_ontology_dir(project_name, export_name), "species_choice.json")
-    if not os.path.isfile(path):
-        return None
-    with open(path) as f:
-        return json.load(f).get("species_key")
+    saved = atomic_io.read_json(path, default=None, on_corrupt="default")
+    return saved.get("species_key") if saved else None
 # --- Step 10: Compositional analysis output/work directories ---
 #
 # Unlike pseudobulk exports above, compositional analysis results are
@@ -650,19 +642,13 @@ def load_downstream_recipe(project_name):
     been saved yet at all (e.g. a brand-new project, or one that hasn't
     started Phase 3).
     """
-    import json
-    path = downstream_recipe_path(project_name)
-    if not os.path.isfile(path):
-        return {}
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(
+        downstream_recipe_path(project_name), default={}, on_corrupt="default",
+    )
 
 
 def _save_downstream_recipe_file(project_name, recipe):
-    import json
-    os.makedirs(downstream_dir(project_name), exist_ok=True)
-    with open(downstream_recipe_path(project_name), "w") as f:
-        json.dump(recipe, f, indent=2)
+    atomic_io.atomic_write_json(downstream_recipe_path(project_name), recipe)
 
 
 def save_downstream_step_recipe(project_name, step_name, params):
@@ -870,18 +856,13 @@ def sc_gene_symbol_map_path(project_name, export_name):
 def get_sc_gene_id_mapping_meta(project_name, export_name):
     "Return this export's saved gene-ID-mapping metadata (which conversion was run, when), or None."
     path = os.path.join(sc_deseq2_dir(project_name, export_name), "gene_id_mapping_meta.json")
-    if not os.path.isfile(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+    return atomic_io.read_json(path, default=None, on_corrupt="default")
 
 
 def save_sc_gene_id_mapping_meta(project_name, export_name, meta):
     "Persist this export's gene-ID-mapping metadata."
-    os.makedirs(sc_deseq2_dir(project_name, export_name), exist_ok=True)
     path = os.path.join(sc_deseq2_dir(project_name, export_name), "gene_id_mapping_meta.json")
-    with open(path, "w") as f:
-        json.dump(meta, f, indent=2)
+    atomic_io.atomic_write_json(path, meta)
 
 
 def sc_gene_id_mapping_work_dir(project_name, export_name):
