@@ -141,6 +141,17 @@ def render():
     fastp_ok, multiqc_ok = fastp.tools_available()
     trimming_done = pm.has_completed_step(project, "trimming_complete")
 
+    # Bound BEFORE the fastp_ok branch below so this name always exists.
+    # Step 2's poly-tail re-trim handler also uses fastp_threads, and it
+    # runs whenever trimming_done is True -- which is read from
+    # project_info.json, so it can be True for a previously-trimmed
+    # project even when fastp is missing from the CURRENT environment
+    # (e.g. reopening an HPC project locally with the conda env
+    # inactive). Step 2 only returns early on a missing MultiQC, not a
+    # missing fastp, so without this the re-trim button raises NameError.
+    _, _recommended_threads = pm.get_recommended_thread_count(max_default=16)
+    fastp_threads = min(_recommended_threads, 16)
+
     if not fastp_ok:
         st.error(
             "⚠️ fastp was not found on this system. It needs to be "
@@ -156,7 +167,7 @@ def render():
         # CPU-bound past that point), so the slider is capped there
         # regardless of how many cores are detected.
         detected_cores, recommended_threads = pm.get_recommended_thread_count(max_default=16)
-        fastp_threads = st.slider(
+        fastp_threads = st.slider(   # rebinds the default set above
             "fastp threads (per sample):",
             min_value=1, max_value=16, value=min(recommended_threads, 16),
             help=(
@@ -440,7 +451,13 @@ def render():
                     "the same."
                 )
 
-                if st.button(
+                if not fastp_ok:
+                    st.caption(
+                        "⚠️ Auto re-trim is unavailable because fastp was not "
+                        "found in the current environment. Activate the "
+                        "project's conda environment and reload this page."
+                    )
+                if fastp_ok and st.button(
                     f"🔁 Auto Re-trim {len(affected_samples)} Flagged Sample(s)",
                     key="poly_tail_retrim_btn",
                 ):

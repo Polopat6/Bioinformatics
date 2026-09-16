@@ -193,26 +193,45 @@ def download_whitelist(filename, dest_dir=None, chunk_size=1024 * 1024, progress
         return False, f"Failed to decompress {filename}: {e}"
 
     os.remove(tmp_gz_path)
+
+    # --- Verify BEFORE promoting the temp file (2026-09-16) ---
+    # The download/decompress above is atomic, but nothing verified the
+    # CONTENT. A truncated-but-valid gzip stream, or a mirror that
+    # reorganizes and serves an HTML 404 page that happens to gunzip,
+    # would otherwise land at the real path and report success -- and
+    # chemistry_manager.whitelist_confirm_match() opens these with a
+    # plain open(), so a bad file degrades silently into "chemistry
+    # could only be confirmed by read length" much later, far from the
+    # real cause. approx_decompressed_mb was already in the catalog but
+    # only used for a progress message; it is a real expectation, so
+    # check against it.
+    actual_mb = os.path.getsize(tmp_txt_path) / (1024 * 1024)
+    expected_mb = spec["approx_decompressed_mb"]
+    if not (expected_mb * 0.8 <= actual_mb <= expected_mb * 1.2):
+        os.remove(tmp_txt_path)
+        return False, (
+            f"{filename} downloaded but looks wrong: {actual_mb:.1f}MB, "
+            f"expected about {expected_mb}MB. The mirror may have changed "
+            f"its files, or the download was truncated. Nothing was "
+            f"installed -- the previous file (if any) is untouched."
+        )
+
+    # A barcode whitelist is one fixed-length ACGT barcode per line.
+    # Anything else (HTML, an error page, a README) fails here.
+    with open(tmp_txt_path) as f:
+        first_line = f.readline().strip()
+    if not first_line or set(first_line) - set("ACGTN"):
+        os.remove(tmp_txt_path)
+        return False, (
+            f"{filename} does not look like a barcode list -- its first "
+            f"line is {first_line[:40]!r}, which is not a plain ACGT "
+            f"barcode. Nothing was installed."
+        )
+
     os.replace(tmp_txt_path, final_path)  # atomic rename into its final, real location
 
     size_mb = round(os.path.getsize(final_path) / (1024 * 1024), 1)
     return True, f"Downloaded and installed {filename} ({size_mb}MB)."
 
 
-def download_all_missing_whitelists(dest_dir=None, progress_callback=None):
-    """
-    Download every catalog whitelist file not already present.
 
-    Returns a dict {filename: (success: bool, message: str)} -- one
-    entry per file that was ATTEMPTED (files already present are
-    skipped entirely and not included in the return value, since
-    nothing was done for them).
-    """
-    results = {}
-    for filename in WHITELIST_CATALOG:
-        if whitelist_status(filename)["present"]:
-            continue
-        if progress_callback:
-            progress_callback(f"--- {filename} ---")
-        results[filename] = download_whitelist(filename, dest_dir=dest_dir, progress_callback=progress_callback)
-    return results
