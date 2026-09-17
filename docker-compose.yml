@@ -1,0 +1,126 @@
+# docker-compose.yml
+#
+# Preferred way to run the Pretty Awesome Transcriptomics Tool on a
+# persistent Linux server (home server, lab workstation, any always-on host).
+#
+#   docker compose up -d --build     # build + start in the background
+#   docker compose logs -f           # follow logs
+#   docker compose ps                # status + health
+#   docker compose down              # stop (./data on the host survives)
+#
+# Then open http://<server-ip>:<BIOPORTAL_HOST_PORT>   (default 8502)
+#
+# --- Why compose rather than a bare `docker run` ---
+# Four things this handles that a one-liner does not:
+#   1. The HOST PORT, without touching the Dockerfile (see below).
+#   2. The host/container UID mismatch on the mounted data volume -- the
+#      single most common cause of "permission denied" on a first run.
+#   3. restart: unless-stopped, so the portal returns after a reboot.
+#   4. SMTP environment variables for Advanced/Monitor Mode
+#      notifications, which notification_manager.py reads from the
+#      process environment.
+
+services:
+  bioportal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bioportal:latest
+    container_name: bioportal
+
+    ports:
+      # Format is HOST:CONTAINER.
+      #
+      # The container side is ALWAYS 8501 and must not change -- that is
+      # what streamlit is told to bind in the Dockerfile's ENTRYPOINT,
+      # and what the HEALTHCHECK probes. Each container has its own
+      # network namespace, so another container already using 8501
+      # internally is NOT a conflict.
+      #
+      # Only the HOST side has to be unique on this machine. Default is
+      # 8502 here precisely because 8501 is commonly already taken by
+      # another container. Override in .env:
+      #     BIOPORTAL_HOST_PORT=9000
+      - "${BIOPORTAL_HOST_PORT:-8502}:8501"
+      #
+      # For remote access, prefer binding to localhost only and reaching
+      # it over an SSH tunnel (see the security note at the bottom):
+      # - "127.0.0.1:${BIOPORTAL_HOST_PORT:-8502}:8501"
+
+    volumes:
+      # MUST match app_paths.DATA_ROOT inside the container, which
+      # app/app_paths.py anchors to the app/ directory. Get this path
+      # wrong and the app writes into the image's own filesystem --
+      # every project, reference genome, and index silently disappears
+      # on `docker compose down`.
+      #
+      # Holds: projects/, singlecell_projects/, shared_references/,
+      # shared_whitelists/, marker_libraries/, auth/, monitor/.
+      - ./data:/workspace/repo/app/data
+
+      # OPTIONAL: mount a large external drive for reference genomes and
+      # raw FASTQ/BAM files, which routinely run to hundreds of GB and
+      # often shouldn't live on the same disk as the repo. Uncomment and
+      # point at real paths if useful:
+      # - /mnt/bigdisk/references:/workspace/repo/app/data/shared_references
+      # - /mnt/bigdisk/rawdata:/data/raw:ro
+
+    # --- Host/container UID mismatch ---
+    # The micromamba base image runs as its own non-root user (UID 1000).
+    # If your host account is not also UID 1000, the container cannot
+    # write to ./data and every save fails with "permission denied".
+    #
+    # One-time setup, in this directory:
+    #     echo "UID=$(id -u)" >  .env
+    #     echo "GID=$(id -g)" >> .env
+    #
+    # The defaults below keep this working unchanged if you skip that.
+    user: "${UID:-1000}:${GID:-1000}"
+
+    environment:
+      # Advanced Mode / Monitor Mode notifications. All optional --
+      # without them, notification_manager.py logs and no-ops rather
+      # than erroring, so leaving these unset is a supported
+      # configuration, not a broken one.
+      PIPELINE_SMTP_HOST: "${PIPELINE_SMTP_HOST:-}"
+      PIPELINE_SMTP_PORT: "${PIPELINE_SMTP_PORT:-587}"
+      PIPELINE_SMTP_USER: "${PIPELINE_SMTP_USER:-}"
+      PIPELINE_SMTP_PASSWORD: "${PIPELINE_SMTP_PASSWORD:-}"
+      PIPELINE_SMTP_FROM_ADDRESS: "${PIPELINE_SMTP_FROM_ADDRESS:-}"
+      PIPELINE_SMTP_USE_TLS: "${PIPELINE_SMTP_USE_TLS:-true}"
+
+    restart: unless-stopped
+
+    # --- Resource limits ---
+    # STAR genome index generation is the memory ceiling for this app: a
+    # human genome index needs roughly 32GB+. Native Linux Docker has no
+    # default cap, so these are commented out -- uncomment and tune only
+    # if you want to stop the portal from consuming the whole machine
+    # (relevant if this server runs other containers alongside it).
+    #
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 48G
+    #     reservations:
+    #       memory: 8G
+
+    # Long-running STAR/Salmon subprocesses should not be killed abruptly
+    # mid-write. Rounds 1-3 made the app's own JSON state files atomic,
+    # so an interrupted run can no longer corrupt project tracking -- but
+    # a partially written BAM or index still has to be rebuilt, so a
+    # generous stop window is worth having.
+    stop_grace_period: 60s
+
+# -------------------------------------------------------------------
+# SECURITY NOTE
+# -------------------------------------------------------------------
+# Do not expose this port directly to the internet. The built-in login
+# is a deliberate-but-basic gate: no rate limiting, no account lockout,
+# no session expiry (see auth_manager.py's own docstring, which is
+# explicit about this). On a LAN behind a router it is fine. For remote
+# access, use the 127.0.0.1-bound ports line above and tunnel:
+#
+#     ssh -L 8502:localhost:8502 you@your-server
+#
+# ...then browse to http://localhost:8502 on your laptop.

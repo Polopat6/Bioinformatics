@@ -1,0 +1,96 @@
+# .dockerignore
+#
+# Controls what gets sent to the Docker daemon as build context when you
+# run `docker build .` from the repo root.
+#
+# --- Why this file matters more here than in a typical project ---
+# Without it, EVERY build uploads the entire repo root as context --
+# including data/, which for this app holds reference genomes, STAR
+# indices, downloaded FASTQ files, and BAMs. On a real deployment that is
+# routinely tens to hundreds of GB. The symptom is a build that appears
+# to hang for many minutes at "transferring context" before a single
+# instruction runs, on every rebuild, even for a one-line code change.
+#
+# Excluding data/ is also a correctness matter, not just speed: the
+# container gets its data directory from the volume mount at runtime (see
+# docker-compose.yml). Baking a stale copy into the image would shadow
+# nothing at runtime but would bloat the image by the full size of
+# whatever happened to be on disk at build time.
+
+# --- Runtime data (mounted at runtime, never baked into the image) ---
+data/
+**/data/projects/
+**/data/singlecell_projects/
+**/data/shared_references/
+**/data/shared_whitelists/
+**/data/marker_libraries/
+**/data/monitor/
+
+# --- Credentials: must never enter an image layer ---
+# Image layers are readable by anyone who can pull the image, and
+# deleting a file in a later layer does NOT remove it from the earlier
+# layer that added it.
+**/data/auth/
+.env
+*.pem
+*.key
+id_rsa*
+
+# --- Version control ---
+.git/
+.gitignore
+.gitattributes
+
+# --- Python bytecode / caches ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Virtual environments (the image builds its own from environment.yml) ---
+.venv/
+venv/
+env/
+miniforge3/
+miniconda3/
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
+
+# --- Local scratch that shouldn't ship (mirrors .gitignore) ---
+docs/
+recover_kang_bam.py
+
+# --- Logs and transient state ---
+*.log
+**/monitor.log
+**/monitor.pid
+**/setup_install_log.txt
+**/*.corrupt-*
+
+# --- Large bioinformatics artifacts that may be sitting in the tree ---
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.sam
+*.h5ad
+*.rds
+
+# --- R project cruft ---
+.Rproj.user/
+.Rhistory
+.RData
+
+# --- Docker's own files (not needed inside the image) ---
+Dockerfile
+.dockerignore
+docker-compose.yml

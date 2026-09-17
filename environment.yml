@@ -1,86 +1,102 @@
 # environment.yml
 #
-# SINGLE SOURCE OF TRUTH for every dependency the Multi-Omics Bioinformatics
-# Portal needs -- Python packages, R/Bioconductor packages, AND external CLI
-# bioinformatics tools -- so Docker, HPC (conda/mamba), and local installs
-# all build from exactly this one file instead of drifting out of sync.
+# SINGLE SOURCE OF TRUTH for every dependency the Pretty Awesome
+# Transcriptomics Tool needs -- Python packages, R/Bioconductor packages,
+# AND external CLI bioinformatics tools -- so Docker, HPC (conda/mamba),
+# and local installs all build from exactly this one file instead of
+# drifting out of sync.
 #
-# --- 10x_bamtofastq addition (2026-08-24) ---
-# Added to support recovering usable FASTQ (with intact cell barcode/UMI
-# sequences) from an original-format 10x Genomics BAM file, for SRA
+# ===================================================================
+# CHANGES 2026-09-16 (deployment-readiness audit)
+# ===================================================================
+#
+# --- samtools ADDED (was missing entirely) ---
+# bulk_bam_manager.py is built around `samtools fastq` and
+# `samtools sort` -- it is the ENTIRE BAM->FASTQ ingestion path for the
+# Bulk RNA-Seq pipeline, offered directly in that workspace's own UI.
+# It was never listed here, so a clean environment built from this file
+# could not run a documented, user-facing feature. (Distinct from
+# single-cell's 10x `bamtofastq` below, which solves a different
+# problem -- see bulk_bam_manager.py's own module docstring.)
+#
+# --- certifi ADDED (was only in requirements.txt) ---
+# Imported explicitly by reference_manager.py and sra_manager.py for
+# Ensembl/NCBI HTTPS downloads. It appeared ONLY in requirements.txt,
+# which also disagreed with this file on the pinned version of every
+# package the two shared (streamlit, duckdb, plotly, pandas, openpyxl).
+# requirements.txt has been deleted -- nothing referenced it (not the
+# Dockerfile, not the README, not deployment_guide.md), and keeping a
+# second, conflicting dependency list is exactly the drift this file
+# exists to prevent.
+#
+# --- bioconductor-reactomepa SPELLING CORRECTED ---
+# Previously listed as "bioconductor-reactompa" (missing the "e").
+# The Bioconductor package is ReactomePA. A wrong package name fails
+# `mamba env create` for the ENTIRE file, not just that one line.
+# VERIFY BEFORE YOUR FIRST BUILD:
+#     mamba search -c bioconda bioconductor-reactomepa
+#
+# ===================================================================
+#
+# --- Environment name ---
+# Deliberately still "bioportal" despite the app's rename to Pretty
+# Awesome Transcriptomics Tool. Renaming it would invalidate every
+# existing environment, and this name is referenced by start_portal.sh's
+# default, README.md, and deployment_guide.md. If you do want to rename
+# it, change it here and pass BIOPORTAL_ENV=<new_name> to
+# start_portal.sh (no file edit needed).
+#
+# --- 10x_bamtofastq (2026-08-24) ---
+# Supports recovering usable FASTQ (with intact cell barcode/UMI
+# sequences) from an original-format 10x Genomics BAM, for SRA
 # depositions whose standard FASTQ extraction has no usable barcode/UMI
-# information at all -- confirmed real, motivating case: Kang et al. 2018
-# (GSE96583), a v1-chemistry-era 10x deposition where the barcode/UMI
-# reads were never uploaded to SRA as FASTQ at all (only the cDNA read
-# was). See single_cell/sc_sra_manager.py's own module docstring,
-# "Original-format BAM recovery", for the full technical rationale,
-# including the confirmed, real limitation that NCBI increasingly serves
-# original-format submissions ONLY from AWS/GCP cloud storage requiring
-# the user's own paid cloud-billing account -- this tool is only useful
-# for the subset of (typically older) runs where a free, direct-HTTP
-# legacy copy still exists.
+# information at all -- confirmed real motivating case: Kang et al. 2018
+# (GSE96583), a v1-chemistry-era deposition where the barcode/UMI reads
+# were never uploaded to SRA as FASTQ (only the cDNA read was). See
+# single_cell/sc_sra_manager.py's "Original-format BAM recovery"
+# docstring for full rationale, including the confirmed limitation that
+# NCBI increasingly serves original-format submissions ONLY from AWS/GCP
+# cloud storage requiring the user's own paid cloud-billing account.
 #
-# Confirmed on bioconda as package name "10x_bamtofastq" (MIT licensed,
-# tiny footprint, cross-platform including linux-aarch64/osx-arm64) --
-# provides the `bamtofastq` executable this project's sc_sra_manager.py
-# invokes directly via subprocess.
-#
-# --- pigz addition (2026-08-25) ---
+# --- pigz (2026-08-25) ---
 # Added after a real, confirmed production bottleneck: compressing a
-# single 83.5GB FASTQ file (fasterq-dump's own uncompressed output) took
-# approximately 7 hours using Python's built-in gzip module at its
-# default compresslevel=9 -- the SLOWEST available setting (unlike
-# command-line gzip's own default of 6, for only marginal extra size
-# savings -- confirmed directly: ~1.86x slower for ~1.3% smaller output
-# on test data, with real biological sequence data typically showing an
-# even wider gap), running entirely single-threaded regardless of how
-# many CPU cores are actually available on the machine (e.g. a 32-core
-# HPC node). pigz (parallel gzip) fixes both problems at once -- it
-# supports the standard, faster compresslevel default AND spreads the
-# work across multiple threads. single_cell/sc_sra_manager.py's own
-# _gzip_and_remove() now prefers pigz via subprocess when it's
-# installed, falling back to Python's gzip module at compresslevel=6
-# (not 9) when it isn't -- either path produces a completely standard,
-# fully valid .gz file. No version pin needed: pigz is a small, stable,
-# long-unchanged utility where exact version has no bearing on
-# reproducibility, unlike e.g. star=2.7.11b or sra-tools=3.1.* above it,
-# where exact tool behavior/output format genuinely matters.
+# single 83.5GB FASTQ (fasterq-dump's uncompressed output) took ~7 hours
+# using Python's gzip module at its default compresslevel=9 -- the
+# SLOWEST setting (unlike command-line gzip's default of 6, for only
+# marginal extra size savings: ~1.86x slower for ~1.3% smaller output on
+# test data), running single-threaded regardless of available cores.
+# pigz fixes both at once. sc_sra_manager.py's _gzip_and_remove() now
+# prefers pigz when installed, falling back to Python gzip at
+# compresslevel=6 (not 9) when it isn't -- either path produces a
+# completely standard .gz file.
 #
-# --- seqkit addition (2026-09-01) ---
-# Added after a real, confirmed production bottleneck: single_cell/
-# singlecell_trim_manager.py's own R1/R2 resync step (re-syncing R1 down
-# to only the reads that survived fastp's R2-only trimming) originally
-# read both FASTQ files line-by-line in pure Python, building a Python
-# set() of surviving read IDs from R2 and checking every R1 read against
-# it. This is correct but does NOT scale to real single-cell run depths --
-# confirmed directly on SRR13734384 (~776 million reads), where this
-# pure-Python resync step alone took several HOURS for a single sample,
-# even though fastp's own R2 trimming (a real, multithreaded, compiled
-# C++ tool) finished quickly. Critically, the pipeline's own "threads"
-# slider had ZERO effect on this bottleneck, since that value is only
-# ever passed to fastp's own --thread flag -- the slow resync step is a
-# fully separate, single-threaded Python operation fastp's own
-# concurrency can't touch at all.
+# --- seqkit (2026-09-01) ---
+# Added after another confirmed bottleneck: singlecell_trim_manager.py's
+# R1/R2 resync step (re-syncing R1 down to reads surviving fastp's
+# R2-only trimming) originally read both FASTQs line-by-line in pure
+# Python, holding surviving read IDs in a set(). Correct, but does not
+# scale -- confirmed on SRR13734384 (~776M reads), where this step alone
+# took HOURS for a single sample while fastp's own trimming finished
+# quickly. Critically, the pipeline's "threads" slider had ZERO effect,
+# since that value only reaches fastp's --thread flag. seqkit's
+# `seq -n --only-id` + `grep -f` replace the two-pass Python approach
+# entirely. A pure-Python fallback remains, with a loud warning rather
+# than a silent slowdown.
 #
-# seqkit (a fast, single-binary, compiled Go tool) fixes this: two of its
-# own long-stable subcommands (`seqkit seq -n --only-id` to extract
-# surviving R2 read IDs, then `seqkit grep -f` to filter R1 by that same
-# list) replace the pure-Python two-pass approach entirely, avoiding ever
-# holding millions of read IDs in a Python set(). See single_cell/
-# singlecell_trim_manager.py's own module docstring, "R1/R2 resync
-# performance fix", for full detail, including the automatic (slower,
-# but still correct) pure-Python fallback this module now uses if seqkit
-# is not installed, with a loud, explicit warning surfaced rather than a
-# silent slowdown.
-#
-# No version pin needed: like pigz above, seqkit's core seq/grep
-# subcommands used here are small, stable, long-unchanged functionality
-# where exact version has no bearing on reproducibility.
+# --- On version pinning ---
+# Pinned where exact behavior/output format genuinely matters for
+# reproducibility (star=2.7.11b, sra-tools=3.1.*, the Python analysis
+# stack). Left unpinned for small, stable, long-unchanged utilities
+# (pigz, seqkit, gffread, samtools) where the exact version has no
+# bearing on results.
+
 name: bioportal
+
 channels:
   - conda-forge
   - bioconda
   - defaults
+
 dependencies:
   # -------------------------------------------------------------------
   # Core language runtimes
@@ -97,30 +113,28 @@ dependencies:
   - salmon=1.10.*
   - star=2.7.11b
   - sra-tools=3.1.*           # NCBI/SRA download (prefetch + fasterq-dump)
-  - pigz                      # Parallel gzip -- fast multi-threaded compression of
-                               # fasterq-dump's own uncompressed FASTQ output (Python's
-                               # single-threaded gzip module was confirmed, in real
-                               # production use, to take ~7 hours on one 83.5GB FASTQ
-                               # file at its default compresslevel=9; see
-                               # single_cell/sc_sra_manager.py's own _gzip_and_remove()
-                               # for the fix that prefers pigz here when available)
-  - seqkit                    # Fast R1/R2 resync in single_cell/singlecell_trim_manager.py --
-                               # replaces a pure-Python line-by-line implementation confirmed
-                               # to take multiple HOURS on a real, extreme-depth single-cell
-                               # run (SRR13734384, ~776M reads); see this file's own header
-                               # comment above and that module's own docstring for full detail
-  - gffread
-  - nextflow
-  - alevin-fry               # Single-cell RNA-Seq: optional faster alternate to STARsolo
+  - samtools                  # BAM -> FASTQ recovery in bulk_bam_manager.py
+                              #   (`samtools fastq` / `samtools sort`). A real,
+                              #   user-facing ingestion path in the Bulk RNA-Seq
+                              #   workspace -- NOT an optional extra. Added
+                              #   2026-09-16; see this file's header.
+  - pigz                      # Parallel gzip -- multi-threaded compression of
+                              #   fasterq-dump's uncompressed FASTQ output (see
+                              #   header: ~7 hours on one 83.5GB file with
+                              #   Python's single-threaded gzip module)
+  - seqkit                    # Fast R1/R2 resync in singlecell_trim_manager.py --
+                              #   replaces a pure-Python implementation confirmed
+                              #   to take HOURS on a real extreme-depth run
+                              #   (SRR13734384, ~776M reads)
+  - gffread                   # GFF3 -> GTF conversion in reference_manager.py's
+                              #   Ensembl fallback path, and protein extraction
+                              #   for eggnog_manager.py
+  - nextflow                  # Spatial Transcriptomics pipeline orchestration
+  - alevin-fry                # Single-cell: optional faster alternate to STARsolo
 
-  # --- Single-cell RNA-Seq: original-format BAM recovery (2026-08-24) ---
-  # See this file's own header comment above for the full rationale.
-  # Provides the `bamtofastq` executable, invoked by
-  # single_cell/sc_sra_manager.py's run_bamtofastq() for the subset of
-  # SRA runs whose standard FASTQ extraction lacks usable barcode/UMI
-  # data, but which still have a free, directly-downloadable
-  # original-format BAM (see find_original_format_bam_url()) rather than
-  # requiring the user's own AWS/GCP cloud-billing account.
+  # --- Single-cell: original-format BAM recovery (2026-08-24) ---
+  # Provides the `bamtofastq` executable invoked by sc_sra_manager.py's
+  # run_bamtofastq(). See this file's header for full rationale.
   - 10x_bamtofastq
 
   # -------------------------------------------------------------------
@@ -129,14 +143,22 @@ dependencies:
   - streamlit=1.37.*
   - pandas=2.2.*
   - plotly=5.22.*
-  - python-kaleido
-  - duckdb=1.0.*
-  - openpyxl=3.1.*
+  - python-kaleido            # PDF/image plot export. v1+ does NOT bundle
+                              #   Chrome -- a one-time
+                              #   `python -c "import kaleido; kaleido.get_chrome_sync()"`
+                              #   is required after env creation (the Docker
+                              #   image runs this at build time).
+  - duckdb=1.0.*              # Spatial module's R -> Python bridge
+  - openpyxl=3.1.*            # .xlsx metadata / marker panel uploads
   - scipy=1.13.*
-  - paramiko=3.4.*
+  - paramiko=3.4.*            # HPC SSH connections (hpc_manager.py)
   - requests=2.32.*
+  - certifi                   # TLS certificate bundle, imported explicitly by
+                              #   reference_manager.py and sra_manager.py for
+                              #   Ensembl/NCBI HTTPS downloads. Added 2026-09-16;
+                              #   see this file's header.
 
-  # --- Single-cell RNA-Seq: Python analysis layer (Phase 3) ---
+  # --- Single-cell: Python analysis layer (Phase 3) ---
   - scanpy
   - anndata
   - python-igraph
@@ -148,32 +170,37 @@ dependencies:
   # -------------------------------------------------------------------
   # R / Bioconductor packages
   # -------------------------------------------------------------------
-  # Left UNPINNED -- see "REPRODUCIBILITY NOTE" (full rationale in prior
-  # revisions of this file): Bioconductor's twice-yearly release cadence
-  # does not bump every package's version every cycle, and a hand-picked
-  # exact version can easily name a release that was never published.
+  # Left UNPINNED deliberately: Bioconductor's twice-yearly release
+  # cadence does not bump every package's version every cycle, so a
+  # hand-picked exact version can easily name a release that was never
+  # published.
   - bioconductor-deseq2
-  - r-jsonlite
+  - r-jsonlite                # Job-spec JSON hand-off between Python and R
   - bioconductor-tximport
   - bioconductor-clusterprofiler
-  - bioconductor-reactompa
-  - bioconductor-gosemsim
-  - bioconductor-limma
+  - bioconductor-reactomepa   # NOTE: spelling corrected 2026-09-16 (was
+                              #   "reactompa"). VERIFY with
+                              #   `mamba search -c bioconda bioconductor-reactomepa`
+                              #   before your first build -- a wrong name fails
+                              #   the ENTIRE env creation, not just this line.
+  - bioconductor-gosemsim     # GO term simplification in clusterProfiler::simplify()
+  - bioconductor-limma        # REQUIRED for DESeq2's batch-adjusted PCA -- not optional
   - r-duckdb
   - r-dbi
   - r-tidyr
 
-  # --- Single-cell RNA-Seq: R-based cell-level QC (Phase 2) ---
+  # --- Single-cell: R-based cell-level QC (Phase 2) ---
   - bioconductor-dropletutils
   - bioconductor-scuttle
   - bioconductor-scdblfinder
   - r-seurat
-  - r-remotes
-  - bioconductor-celda
+  - r-remotes                 # Included specifically so DoubletFinder (GitHub-only,
+                              #   see footer) can be installed post-creation
+  - bioconductor-celda        # DecontX ambient RNA correction
   - r-soupx
 
-  # --- Single-cell RNA-Seq: R-based compositional analysis (Phase 3.9) ---
-  - bioconductor-speckle
+  # --- Single-cell: R-based compositional analysis (Phase 3.9) ---
+  - bioconductor-speckle      # propeller cell-type proportion testing
 
   # --- eggNOG-mapper: shared orthology-based functional annotation ---
   # NOTE (2026-08-24): the bioconda "eggnog-mapper" package (2.1.x) has a
@@ -192,34 +219,48 @@ dependencies:
   # -------------------------------------------------------------------
   # Organism annotation packages (org.*.db), one per PRESET species
   # -------------------------------------------------------------------
-  - bioconductor-org.hs.eg.db
-  - bioconductor-org.mm.eg.db
-  - bioconductor-org.dm.eg.db
-  - bioconductor-org.sc.sgd.db
-  - bioconductor-org.ce.eg.db
-  - bioconductor-org.dr.eg.db
-  - bioconductor-org.eck12.eg.db
+  - bioconductor-org.hs.eg.db      # Human
+  - bioconductor-org.mm.eg.db      # Mouse
+  - bioconductor-org.dm.eg.db      # Drosophila
+  - bioconductor-org.sc.sgd.db     # S. cerevisiae
+  - bioconductor-org.ce.eg.db      # C. elegans
+  - bioconductor-org.dr.eg.db      # Zebrafish
+  - bioconductor-org.eck12.eg.db   # E. coli K12
 
   # -------------------------------------------------------------------
   # pip-only packages
   # -------------------------------------------------------------------
   - pip
   - pip:
-      - watchdog>=4.0,<5
+      - watchdog>=4.0,<5           # Monitor Mode watch-folder daemons
 
+# -------------------------------------------------------------------
+# Development-only (NOT installed by this file)
+# -------------------------------------------------------------------
+# - ruff -- linter used via a pre-commit hook to catch undefined names
+#   (F821) and duplicate definitions (F811). Deliberately excluded: it is
+#   a contributor tool, not a runtime dependency, and adding it here
+#   would install it into every user's analysis environment for no
+#   benefit. Install separately with `pip install ruff` if contributing.
+#
 # -------------------------------------------------------------------
 # NOT included here (intentionally, per current project roadmap):
 # -------------------------------------------------------------------
 # - scvi-tools -- optional, heavier alternative to Harmony for batch
-#   correction; add only once that specific path is actually implemented.
+#   correction; pulls in PyTorch. sc_downstream_manager.scvi_available()
+#   probes for it defensively inside a try/except and returns False when
+#   absent, so its exclusion is a supported configuration rather than a
+#   missing dependency. Add only once that specific path is actually
+#   implemented.
 # - DoubletFinder (R package) -- NOT available via conda-forge, bioconda,
 #   CRAN, or Bioconductor as of this writing (GitHub-only,
 #   chris-mcginnis-ucsf/DoubletFinder). r-remotes is included above so it
 #   CAN be installed as a one-time post-environment-creation step:
 #     Rscript -e 'remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")'
+#   The Docker image runs this automatically at build time.
+#   scDblFinder (the default doublet-detection method) needs no extra setup.
 # - AWS/GCP cloud SDK tooling (e.g. awscli, google-cloud-sdk) for
-#   retrieving original-format SRA submissions that have been moved to
-#   cloud-only storage -- deliberately NOT automated by this project (see
-#   this file's own "10x_bamtofastq addition" note above); retrieving
-#   those specific runs requires the user's own cloud-billing account
-#   and is treated as an out-of-scope, user-driven manual step.
+#   retrieving original-format SRA submissions moved to cloud-only
+#   storage -- deliberately NOT automated (see the 10x_bamtofastq note
+#   above); those runs require the user's own cloud-billing account and
+#   are treated as an out-of-scope, user-driven manual step.
