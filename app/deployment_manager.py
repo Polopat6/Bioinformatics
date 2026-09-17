@@ -49,7 +49,6 @@ is_install_in_progress() lock as the conda-based installer above, so a
 GitHub install and a conda install can never run concurrently and
 collide over the same status/log files.
 """
-import json
 import os
 import shutil
 import subprocess

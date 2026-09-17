@@ -98,7 +98,6 @@ change to that workspace's own scope or behavior.
 """
 import os
 import sys
-from functools import partial
 
 import streamlit as st
 

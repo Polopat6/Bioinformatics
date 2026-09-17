@@ -48,7 +48,6 @@ data/singlecell_projects/<project>/
     project_info.json           steps_completed, chemistry choice, aligner
                                  choice, reference choice, etc.
 """
-import json
 import os
 from datetime import datetime
 import app_paths
@@ -481,16 +480,6 @@ def delete_downstream_pseudobulk_export(project_name, export_name):
 # would never share one set of DESeq2 results.
 
 
-def sc_reference_gene_symbol_map_path(project_name):
-    """
-    Where this project's GTF-auto-derived gene_id -> gene_name map lives
-    (layer 1 of the SC gene-ID-mapping panel's 3-layer lookup, mirroring
-    the bulk pipeline's own layer 1 -- see sc_deseq2_workspace.py's
-    module docstring). Project-scoped (not export-scoped): this depends
-    only on the project's confirmed reference GTF, which is shared
-    across every pseudobulk export in this project.
-    """
-    return os.path.join(custom_reference_dir(project_name), "gene_symbol_map.csv")
 
 def sc_deseq2_dir(project_name, export_name):
     "Where DESeq2 analysis inputs/outputs live for ONE pseudobulk export of this single-cell project."

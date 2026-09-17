@@ -89,7 +89,6 @@ import gzip
 import os
 import re
 
-import numpy as np
 import pandas as pd
 from scipy import io as sio
 from scipy import sparse

@@ -129,7 +129,6 @@ falling back to its own "first appearance" default.
 import os
 import tempfile
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go

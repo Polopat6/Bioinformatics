@@ -20,7 +20,6 @@ ontology_workspace.py's module docstring for the full rationale.
 """
 
 import itertools
-import json
 import os
 import re
 import shutil

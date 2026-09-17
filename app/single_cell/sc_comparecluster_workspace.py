@@ -24,7 +24,6 @@ other two SC pages carries over here automatically.
 """
 import os
 
-import pandas as pd
 import streamlit as st
 
 import sc_project_manager as scpm

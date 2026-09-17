@@ -87,7 +87,6 @@ None of this changes DESeq2's actual statistical test in any way -- it
 only extracts and exposes data that DESeq2 already computes internally
 as part of a normal run, the same way the existing PCA/VST export does.
 """
-import csv
 import os
 import re
 import subprocess

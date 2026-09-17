@@ -56,13 +56,49 @@ override" pattern already used for e.g. mitochondrial gene resolution
 in singlecell_workspace.py.
 """
 import csv
-import json
 import os
+import re
 import app_paths
+import atomic_io
 from datetime import datetime
 
-
 MARKER_LIBRARY_ROOT = app_paths.data_path("marker_libraries")
+
+# --- Library-name sanitization (2026-09-16) ---
+# This module's own docstring originally stated that library_name is
+# "NOT sanitized here; the caller (UI layer) is expected to sanitize
+# user-provided names." No such caller exists yet -- nothing in the
+# repo imports this module at all -- so that contract was unenforced,
+# and _library_path() would happily resolve a name like
+# "../../app/project_manager" to a path completely outside
+# MARKER_LIBRARY_ROOT. delete_marker_library() calls os.remove() on
+# that path, so an unsanitized name could delete an arbitrary file.
+# Sanitizing HERE (in addition to whatever a future UI layer does)
+# mirrors the defense-in-depth pattern already used elsewhere in this
+# codebase, e.g. _render_eggnog_download_controls() re-checking its own
+# permission even though its caller already refused to invoke it.
+_SAFE_LIBRARY_NAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _sanitize_library_name(library_name):
+    """
+    Reduce a user-supplied library name to a safe single filename
+    component: every character outside [A-Za-z0-9._-] becomes "_", and
+    any leading "." is stripped (so a name can never produce a hidden
+    file, and "." / ".." can never survive as path components).
+
+    Raises ValueError if nothing usable remains -- a clear, immediate
+    failure rather than silently writing to a degenerate path like
+    "<root>/.json".
+    """
+    cleaned = _SAFE_LIBRARY_NAME_PATTERN.sub("_", (library_name or "").strip())
+    cleaned = cleaned.lstrip(".")
+    if not cleaned:
+        raise ValueError(
+            f"Invalid marker library name: {library_name!r}. A library name must "
+            "contain at least one letter, number, dash, or underscore."
+        )
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +116,7 @@ def list_marker_libraries():
 
 
 def _library_path(library_name):
-    return os.path.join(MARKER_LIBRARY_ROOT, f"{library_name}.json")
+    return os.path.join(MARKER_LIBRARY_ROOT, f"{_sanitize_library_name(library_name)}.json")
 
 
 def load_marker_library(library_name):
@@ -95,11 +131,13 @@ def load_marker_library(library_name):
         }
     Returns None if this library doesn't exist.
     """
-    path = _library_path(library_name)
-    if not os.path.isfile(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
+        # on_corrupt="default" -> a damaged library reads as None, exactly
+    # like a missing one, so the picker UI shows "library not found"
+    # instead of dying with a traceback. The damaged bytes are still
+    # preserved aside as <path>.corrupt-N by read_json(), so a
+    # hand-curated panel is never destroyed outright.
+    return atomic_io.read_json(_library_path(library_name), default=None, on_corrupt="default")
+
 
 
 def save_marker_library(library_name, marker_sets, description="", organism=""):
@@ -123,7 +161,15 @@ def save_marker_library(library_name, marker_sets, description="", organism=""):
     date.
     """
     existing = load_marker_library(library_name)
-    created_at = existing["metadata"]["created_at"] if existing else datetime.now().isoformat(timespec="seconds")
+    # Guard on metadata too, not just `existing` -- a library written by
+    # an older version (or recovered by hand) may lack the key entirely,
+    # and a KeyError here would block saving rather than just losing a
+    # timestamp.
+    created_at = (
+        existing["metadata"]["created_at"]
+        if existing and existing.get("metadata")
+        else datetime.now().isoformat(timespec="seconds")
+    )
 
     data = {
         "marker_sets": marker_sets,
@@ -134,9 +180,7 @@ def save_marker_library(library_name, marker_sets, description="", organism=""):
             "last_updated": datetime.now().isoformat(timespec="seconds"),
         },
     }
-    os.makedirs(MARKER_LIBRARY_ROOT, exist_ok=True)
-    with open(_library_path(library_name), "w") as f:
-        json.dump(data, f, indent=2)
+    atomic_io.atomic_write_json(_library_path(library_name), data)
     return data
 
 
@@ -305,9 +349,12 @@ def save_project_marker_overrides(project_info, marker_set_overrides, base_libra
     marker_set_overrides: dict {cell_type_label: [gene, ...]} -- the
         project's own additions/edits, layered on top of
         base_library_name (if any) by get_project_marker_sets() above.
-    base_library_name: name of the shared library this project's
-        overrides are based on, or None if this project uses no shared
-        library at all (entirely its own marker sets).
+    library_name: a name for this library (e.g. "killifish_liver_v1").
+        Sanitized automatically via _sanitize_library_name() -- unsafe
+        characters become "_", and a name that reduces to nothing
+        raises ValueError. A UI layer should still validate/normalize
+        names for a good user experience, but is no longer the only
+        thing standing between a typo and an arbitrary filesystem path
 
     Returns the modified project_info dict.
     """

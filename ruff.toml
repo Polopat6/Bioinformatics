@@ -1,0 +1,14 @@
+# Deliberately narrow. The goal is catching the specific bug class that
+# actually shipped in this codebase -- undefined names and duplicate
+# definitions that crash on a user-clickable path -- not enforcing
+# style. Widen later if it proves useful; starting broad would bury the
+# real findings under hundreds of cosmetic warnings.
+line-length = 120
+
+[lint]
+select = ["F821", "F811", "F401", "E9"]
+
+[lint.per-file-ignores]
+# Thin importlib re-export: names are attached dynamically via setattr,
+# so static analysis can't see them.
+"app/single_cell/gene_id_mapper.py" = ["F401"]

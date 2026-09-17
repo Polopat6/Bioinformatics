@@ -105,7 +105,6 @@ directly confirmed, not attempted here from assumption.
 import gzip
 import os
 import shutil
-import subprocess
 
 # ---------------------------------------------------------------------------
 # Availability + sort-order detection

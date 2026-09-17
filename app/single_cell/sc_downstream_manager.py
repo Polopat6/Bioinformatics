@@ -2271,7 +2271,6 @@ def run_propeller_analysis(adata, sample_key, cluster_key, group_column,
 
     Returns (success: bool, log: str).
     """
-    import json
     import subprocess
 
     if not compositional_tools_available():

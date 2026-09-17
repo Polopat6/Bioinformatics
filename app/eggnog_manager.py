@@ -85,8 +85,6 @@ parsed .emapper.annotations file) is what actually gets reused by both
 downstream consumers, not the raw protein FASTA or intermediate search
 files.
 """
-import csv
-import json
 import os
 import re
 import shutil

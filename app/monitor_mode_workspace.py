@@ -58,7 +58,6 @@ import reference_manager as ref
 import file_browser as fb
 import monitor_manager as mm
 import notification_manager as notif
-import advanced_mode_orchestrator as orch
 import project_actions as pa
 
 STATUS_ICONS = {"watching": "👀", "rejected": "⚠️", "launched": "🔄", "complete": "✅", "pipeline_error": "❌"}

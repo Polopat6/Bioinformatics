@@ -37,3 +37,12 @@ _current_module = sys.modules[__name__]
 for _name in dir(_real_module):
     if not _name.startswith("__"):
         setattr(_current_module, _name, getattr(_real_module, _name))
+# Fail loudly if the re-export above didn't actually work. This file has
+# regressed to a plain duplicate once already (see NOTE in the docstring);
+# without this check, that regression presents as "gene ID detection
+# silently stopped working in single-cell," miles from the real cause.
+if not hasattr(_current_module, "detect_id_type"):
+    raise ImportError(
+        f"single_cell/gene_id_mapper.py failed to re-export the real module "
+        f"from {_real_path}. Check that file exists and defines detect_id_type()."
+    )

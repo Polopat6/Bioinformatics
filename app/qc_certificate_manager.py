@@ -59,7 +59,6 @@ download timestamp, build parameters) instead of inferring timestamps
 from shared-directory file mtimes as it does today.
 """
 
-import json
 import os
 from datetime import datetime
 

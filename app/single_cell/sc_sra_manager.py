@@ -201,7 +201,6 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
-import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 

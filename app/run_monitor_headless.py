@@ -27,8 +27,16 @@ def main():
         sys.exit(2)
 
     import json
-    with open(sys.argv[1]) as f:
-        monitor_config = MonitorConfig.from_dict(json.load(f))
+    try:
+        with open(sys.argv[1]) as f:
+            monitor_config = MonitorConfig.from_dict(json.load(f))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        # This process is launched DETACHED, so an uncaught traceback
+        # here goes nowhere a user will ever see -- the monitor just
+        # silently never starts. Fail with an explicit message and a
+        # distinct exit code instead.
+        print(f"Could not load monitor config from {sys.argv[1]!r}: {e}", file=sys.stderr)
+        sys.exit(3)
 
     run_monitor_loop(monitor_config)  # runs forever until killed
 

@@ -39,7 +39,6 @@ ImportError at import time, so the rest of the app still works even in
 an environment where it genuinely isn't installed yet -- e.g. someone's
 existing environment that hasn't been re-synced against environment.yml.
 """
-import json
 import os
 from datetime import datetime
 import app_paths

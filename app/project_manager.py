@@ -41,7 +41,6 @@ button being hidden for non-permitted sessions in
 render_project_selector() below) as defense in depth.
 """
 
-import json
 import os
 import shutil
 from datetime import datetime

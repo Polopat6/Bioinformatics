@@ -97,7 +97,6 @@ the calling UI show a one-time "create the first admin account" form.
 Every subsequent account must be created by an existing admin.
 """
 import hashlib
-import json
 import os
 import secrets
 from datetime import datetime

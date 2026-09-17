@@ -121,7 +121,6 @@ standard FASTQ extraction lacks that data entirely).
 """
 import concurrent.futures
 import importlib.util
-import os
 import shutil
 import subprocess
 
