@@ -77,3 +77,7 @@ docs/site/
 # __pycache__/
 # *.pyc
 # .ipynb_checkpoints/
+
+# Local scratch — not part of the app
+docs/
+recover_kang_bam.py
