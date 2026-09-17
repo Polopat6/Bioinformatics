@@ -138,6 +138,8 @@ import streamlit as st
 import sc_project_manager as scpm
 import sc_downstream_manager as dsm
 import singlecell_workspace as scw
+import singlecell_ingestion_manager as ing
+
 import math
 import sc_marker_panel_io as mpio
 import sc_marker_confidence as mconf
@@ -2513,12 +2515,12 @@ def _render_pseudobulk_step(project, adata, cluster_key):
             "unreliable pseudobulk sample even if it clears the minimum-cell "
             "threshold."
         )
-     # --- NEW: respect Step 8e's excluded cell-type list (2026-09-09)
-     # -- see this file's own "excluded cell types" patch notes for the
-     # full rationale. Rebinding `adata` here is scoped to THIS
-     # function call only -- confirmed safe since this function never
-     # calls _save_adata_state(), so the caller's own combined
-     # AnnData object is never affected.
+    # --- NEW: respect Step 8e's excluded cell-type list (2026-09-09)
+    # -- see this file's own "excluded cell types" patch notes for the
+    # full rationale. Rebinding `adata` here is scoped to THIS
+    # function call only -- confirmed safe since this function never
+    # calls _save_adata_state(), so the caller's own combined
+    # AnnData object is never affected.
     excluded_cell_types = list(adata.uns.get(EXCLUDED_CELL_TYPES_UNS_KEY, []))
     if excluded_cell_types and "cell_type" in adata.obs.columns:
         n_before = adata.n_obs

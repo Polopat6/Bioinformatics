@@ -183,6 +183,24 @@ _CLI_TOOLS = {
     "bamtofastq": {"label": "bamtofastq (10x original-format BAM -> FASTQ recovery)", "conda_spec": "10x_bamtofastq"},
     "pigz": {"label": "pigz (parallel gzip -- fast FASTQ compression)","conda_spec": "pigz",},
     "seqkit": {"label": "seqkit (fast R1/R2 resync in single-cell trimming)","conda_spec": "seqkit",},
+    # --- Two confirmed detection gaps (2026-09-16), same root cause as
+    # the 2026-08-17 Phase 2 gap in this file's own docstring: both are
+    # real, hard dependencies declared in environment.yml but never
+    # added to this hand-maintained dict, so the Environment Check could
+    # never report them missing or offer to install them.
+    #
+    # gffread drives reference_manager._download_ensembl_annotation()'s
+    # GFF3->GTF fallback path (used whenever a species' direct Ensembl
+    # GTF is unavailable) AND eggnog_manager's protein extraction. Its
+    # absence currently surfaces as a confusing mid-reference-download
+    # failure -- reference_manager's own error message even says
+    # "gffread is part of this project's environment.yml" -- rather than
+    # a clean ❌ row here, before anything is attempted.
+    "gffread": {"label": "gffread (GFF3->GTF conversion; transcript/protein extraction)", "conda_spec": "gffread"},
+    # samtools underpins bulk_bam_manager.py's entire BAM->FASTQ
+    # recovery path (`samtools fastq`), which is a real, offered
+    # ingestion option in the Bulk RNA-Seq workspace.
+    "samtools": {"label": "samtools (BAM -> FASTQ recovery, bulk pipeline)", "conda_spec": "samtools"},
 }
 
 _R_PACKAGES = {
@@ -680,10 +698,7 @@ def _render_whitelist_setup():
 
     st.warning(f"**{len(missing)} whitelist file(s) missing.**")
 
-    if wlm_install_in_progress():
-        st.markdown("A whitelist download is currently running -- wait for it to finish before starting another.")
-        _render_whitelist_install_status_panel()
-        return
+
 
     col1, col2 = st.columns(2)
     with col1:
@@ -705,12 +720,7 @@ def _render_whitelist_setup():
 # in-process Python urllib calls with no subprocess involved at all, so
 # a lighter-weight session_state-based progress tracker is a better fit
 # here than forcing this into that subprocess-oriented pattern).
-def wlm_install_in_progress():
-    return st.session_state.get("setup_whitelist_download_running", False)
-
-
 def _run_whitelist_download(filenames):
-    st.session_state["setup_whitelist_download_running"] = True
     progress_lines = []
     progress_area = st.empty()
 
@@ -724,7 +734,6 @@ def _run_whitelist_download(filenames):
             success, message = wlm.download_whitelist(fname, progress_callback=_progress_cb)
             results[fname] = (success, message)
 
-    st.session_state["setup_whitelist_download_running"] = False
     st.session_state["setup_whitelist_last_results"] = results
     st.rerun()
 

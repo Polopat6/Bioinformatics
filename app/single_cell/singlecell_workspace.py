@@ -347,6 +347,215 @@ def _render_inline_bam_recovery_option(run, fastq_dir):
         else:
             st.error(f"❌ {result['message']}")
 
+def _render_bam_upload_source(project, fastq_dir):
+    """
+    Step 1's fourth FASTQ-source option: "🧬 Convert from a BAM file I
+    already have".
+
+    Converts a 10x BAM the user ALREADY has (downloaded themselves from
+    a cloud-billing SRA path, received from a collaborator, or produced
+    by their own earlier Cell Ranger run) into FASTQ via 10x's own
+    bamtofastq, then hands the result straight into the SAME "Confirm
+    File Roles Before Continuing" flow _render_sra_source() uses.
+
+    Distinct from _render_inline_bam_recovery_option() above: that one
+    fires when an SRA download's own classification comes back with a
+    bam_warning, and fetches the original BAM from SRA automatically.
+    This one takes a BAM that's already on hand and never touches NCBI.
+
+    Both converge on the same downstream functions, so a legacy
+    v1-chemistry BAM's 4-file-per-lane split is auto-resolved here
+    identically (see sc_sra_manager.resolve_bamtofastq_v1_split()), and
+    the resulting lane_map is threaded through to
+    finalize_role_assignment() exactly as the SRA path does.
+
+    Deliberately does NOT call scsra.mark_accessions_finalized() --
+    that registry is keyed by SRA accession, and this path lets the
+    user pick an arbitrary sample_name unrelated to any accession. See
+    sc_sra_manager.py's own docstring, "Already downloaded detection
+    gap fix", which calls out this exact exclusion.
+    """
+    st.markdown(
+        "Convert a 10x Genomics **BAM file you already have** into FASTQ using 10x's "
+        "own `bamtofastq` tool, then continue through this pipeline exactly as if "
+        "you'd provided FASTQ files directly."
+    )
+
+    if not scsra.bamtofastq_available():
+        st.error(
+            "⚠️ `bamtofastq` was not found on this system. It's required to convert a "
+            "10x BAM back into FASTQ. Install it from the ⚙️ Setup & Deployment page "
+            "(conda package `10x_bamtofastq`)."
+        )
+        return
+
+    st.info(
+        "ℹ️ **Why this exists:** a 10x BAM retains the cell barcode and UMI tags "
+        "(CB/CR/UB/UR) that a plain SRA FASTQ extraction can permanently lose. If an "
+        "accession's standard FASTQ download came back with only a cDNA read, the "
+        "original BAM is the only place that barcode/UMI data still exists. This "
+        "option is for a BAM you already have on hand -- if you want to check whether "
+        "SRA still hosts a recoverable original BAM for a given accession, use the "
+        "**🔎 Fetch from NCBI/SRA** option instead, which offers that check inline."
+    )
+
+    sample_name_raw = st.text_input(
+        "Sample name for this BAM:",
+        key="sc_bam_upload_sample_name",
+        help=(
+            "Becomes this sample's name for the rest of the pipeline, used in the "
+            "standard 10x file naming (e.g. `<sample>_S1_R1_001.fastq.gz`). Letters, "
+            "numbers, dashes, and underscores only."
+        ),
+    )
+    sample_name = "".join(
+        c for c in (sample_name_raw or "").strip() if c.isalnum() or c in ("-", "_")
+    )
+    if sample_name_raw and not sample_name:
+        st.error("⚠️ Please enter a valid sample name (letters, numbers, dashes, underscores only).")
+        return
+    if not sample_name:
+        st.info("Enter a sample name above to continue.")
+        return
+
+    chemistry_key = _render_bamtofastq_chemistry_picker(key_prefix="sc_bam_upload")
+
+    st.markdown("**Where is the BAM file?**")
+    bam_source = st.radio(
+        "BAM source:",
+        [
+            "📂 Browse a directory on this server (recommended for large BAMs)",
+            "📤 Upload from my computer",
+        ],
+        key="sc_bam_upload_source_radio",
+    )
+
+    bam_path = None
+    if bam_source.startswith("📂"):
+        st.caption(
+            "✅ **Recommended.** An original-format 10x BAM is frequently 10-30GB or "
+            "larger -- browsing to it here reads it directly from where it already "
+            "lives on this server, with no upload and no second copy on disk."
+        )
+        bam_path = fb.render_server_file_browser(
+            key_prefix="sc_bam_upload_browse",
+            file_extensions=[".bam"],
+            label="Browse for the BAM file already on this server/HPC:",
+        )
+    else:
+        st.caption(
+            "⚠️ Browser uploads are capped by this app's own upload limit (see "
+            "`.streamlit/config.toml`) and require a full second copy on disk. For a "
+            "large BAM, use the server-browse option above instead."
+        )
+        uploaded_bam = st.file_uploader(
+            "Upload a 10x BAM file:", type=["bam"], key="sc_bam_upload_file",
+        )
+        saved_key = f"sc_bam_uploaded_path_{sample_name}"
+        if uploaded_bam is not None and st.button("💾 Save Uploaded BAM", key="sc_bam_upload_save_btn"):
+            bam_work_dir = os.path.join(fastq_dir, "_sra_bam_work", sample_name)
+            with st.spinner("Saving uploaded BAM..."):
+                saved_path = scsra.save_uploaded_bam(uploaded_bam, bam_work_dir, sample_name)
+            st.session_state[saved_key] = saved_path
+            st.success(f"✅ Saved to `{saved_path}`.")
+            st.rerun()
+        bam_path = st.session_state.get(saved_key)
+        if bam_path:
+            st.success(f"✅ BAM on file: `{os.path.basename(bam_path)}`")
+
+    if not bam_path:
+        st.info("Provide a BAM file above to continue.")
+        return
+
+    if not os.path.isfile(bam_path):
+        st.error(f"⚠️ No file found at `{bam_path}` -- it may have been moved or deleted.")
+        return
+
+    size_gb = os.path.getsize(bam_path) / (1024 ** 3)
+    st.caption(f"📦 `{os.path.basename(bam_path)}` -- {size_gb:.1f} GB")
+
+    if st.button("🧬 Convert BAM → FASTQ", key="sc_bam_upload_convert_btn", type="primary"):
+        progress_area = st.empty()
+        progress_lines = []
+
+        def _on_progress(msg, _area=progress_area, _lines=progress_lines):
+            _lines.append(msg)
+            _area.markdown("\n\n".join(f"- {line}" for line in _lines))
+
+        with st.spinner(
+            "Converting BAM to FASTQ -- this can take a long time for a large file..."
+        ):
+            result = scsra.run_bam_recovery_from_uploaded_file(
+                bam_path, fastq_dir, sample_name,
+                chemistry_key=chemistry_key, progress_callback=_on_progress,
+            )
+
+        results = st.session_state.get("sc_bam_upload_results") or {}
+        results[sample_name] = result
+        st.session_state["sc_bam_upload_results"] = results
+        st.rerun()
+
+    # --- Confirm File Roles -- deliberately reads from session_state
+    # rather than the just-computed result, so a converted-but-unconfirmed
+    # sample survives a page reload, matching _render_sra_source()'s own
+    # behavior. Kept in its OWN session key (not sc_sra_download_results)
+    # because that one is merged into by scan_pending_unfinalized_runs(),
+    # which scans _sra_work/ for SRA accessions specifically.
+    results = st.session_state.get("sc_bam_upload_results")
+    if not results:
+        return
+
+    st.markdown("---")
+    st.markdown("**📋 Confirm File Roles Before Continuing**")
+    st.caption(
+        "Each converted file was classified by read length. **Please confirm or "
+        "correct these before continuing** -- an incorrect assignment here will break "
+        "every downstream step."
+    )
+
+    any_finalized = False
+    for name, result in list(results.items()):
+        with st.expander(f"Sample: {name}", expanded=True):
+            if not result["success"]:
+                st.error(f"❌ {result['message']}")
+                if st.button(f"🗑️ Clear this failed attempt ({name})", key=f"sc_bam_clear_btn_{name}"):
+                    del results[name]
+                    st.session_state["sc_bam_upload_results"] = results
+                    st.rerun()
+                continue
+
+            st.success(f"✅ {result['message']}")
+
+            overrides = {}
+            for path, info in result["classification"].items():
+                role_options = [scsra.ROLE_R1, scsra.ROLE_R2, scsra.ROLE_I1, scsra.ROLE_UNKNOWN]
+                default_role = info["role"] if info["role"] in role_options else scsra.ROLE_UNKNOWN
+                chosen_role = st.selectbox(
+                    f"`{os.path.basename(path)}` ({info['length']}bp):",
+                    options=role_options,
+                    index=role_options.index(default_role),
+                    key=f"sc_bam_role_{name}_{os.path.basename(path)}",
+                )
+                overrides[path] = chosen_role
+
+            if st.button(f"✅ Confirm & Use These Files ({name})", key=f"sc_bam_confirm_btn_{name}"):
+                destinations = scsra.finalize_role_assignment(
+                    overrides, fastq_dir, name, lane_map=result.get("lane_map"),
+                )
+                if scsra.ROLE_R1 in destinations and scsra.ROLE_R2 in destinations:
+                    st.success(
+                        f"✅ {name}: R1/R2 files moved into project -- ready for "
+                        "chemistry detection below."
+                    )
+                    any_finalized = True
+                else:
+                    st.error(
+                        f"⚠️ {name}: both an R1 and an R2 role must be assigned before "
+                        "this sample can be used."
+                    )
+
+    if any_finalized:
+        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Step 1 (NCBI/SRA source option)
@@ -2667,17 +2876,6 @@ def _check_batch_cellqc_status(align_dir, selected_samples):
     return rows
 
 
-def _list_completed_cellqc_samples(align_dir, sample_names):
-    """
-    Lightweight disk check: which of these samples already have
-    completed Cell-level QC output. Used to populate the inline
-    sample-switch dropdown (see _render_cellqc_results_for_sample()
-    below) without duplicating this check in every call site.
-    """
-    return [
-        s for s in sample_names
-        if cellqc.read_cell_qc_metrics(os.path.join(align_dir, s, "cellqc")) is not None
-    ]
 
 
 def _apply_pending_sample_switch(select_key):
@@ -2720,28 +2918,6 @@ def _apply_pending_sample_switch(select_key):
         st.session_state[select_key] = st.session_state.pop(pending_key)
 
 
-def _render_all_samples_overview(align_dir, sample_names):
-    """
-    Always-visible, at-a-glance summary of Cell-level QC status and key
-    metrics for EVERY sample in this project -- regardless of whether
-    the user is in "One sample at a time" or "Multiple samples" mode,
-    and without requiring them to select or run anything first.
-    """
-    rows = []
-    for sample_name in sample_names:
-        output_dir = os.path.join(align_dir, sample_name, "cellqc")
-        row = _summarize_cellqc_run_for_table(sample_name, output_dir)
-        if row is not None:
-            row["Status"] = "✅ Complete"
-        else:
-            row = {"Sample": sample_name, "Status": "⏳ Not yet run"}
-        rows.append(row)
-
-    n_complete = sum(1 for r in rows if r["Status"] == "✅ Complete")
-    with st.expander(f"📋 All Samples Overview ({n_complete}/{len(rows)} completed)", expanded=True):
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        if n_complete == 0:
-            st.caption("No samples have completed Cell-level QC yet -- run it below to populate this overview.")
 
 
 def _render_cellqc_results_for_sample(sample_name, output_dir, mito_gtf_path, doublet_method, ambient_method,
